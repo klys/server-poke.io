@@ -11,8 +11,9 @@ export default class World {
     projectiles:Map<number, Projectil>
     roomId:string;
     static socketServer:any;
-    static moveScale:number = 8;
+    static moveScale:number = 1;
     grid:Pathfinding.Grid;
+    objects: any[];
     //finder:Pathfinding.Finder;
     //grid_backup:Pathfinding.Grid;
     
@@ -25,6 +26,16 @@ export default class World {
         this.players = new Map<string, Player>();
         this.grid = new Pathfinding.Grid(this.width, this.height)
         this.projectiles = new Map<number, Projectil>();
+        this.objects = [
+            {
+                x:200,
+                y:200,
+                type:"rock0",
+                width:32,
+                height:32
+            }
+        ];
+
         //this.finder = new Pathfinding.AStarFinder({ diagonalMovement: 1 })
         //this.grid_backup = this.grid.clone()
         //setInterval(this.moveIn.bind(this), 1)
@@ -101,11 +112,21 @@ export default class World {
         return undefined;
     }
 
+    checkCollision(object1:any, object2:any) {
+        return (
+          object1.x < object2.x + object2.width &&
+          object1.x + object1.width > object2.x &&
+          object1.y < object2.y + object2.height &&
+          object1.y + object1.height > object2.y
+        );
+      }
+
     addPlayer(socketId:string):boolean {
         if (this.players.has(socketId) === true) return false;
         this.players.set(socketId, new Player(100,100,socketId));
         console.log("players in map: ", this.players.size);
         World.socketServer.emit("addPlayer", this.players.get(socketId)?.data());
+        this.presentObjectsTo(socketId);
         return true;
         
     }
@@ -113,6 +134,13 @@ export default class World {
     presentPlayersTo(socketId:string) {
         this.players.forEach( (player) => {
             (player.socketId != socketId) ? World.socketServer.in(socketId).emit("addPlayer", player.data()) : null;
+        })
+    }
+
+    presentObjectsTo(socketId:string) {
+        console.log("sending objects to client...")
+        this.objects.forEach( (object) => {
+            World.socketServer.in(socketId).emit("addObject", object)
         })
     }
 

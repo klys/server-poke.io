@@ -30,7 +30,10 @@ io.on("connection", (socket) => {
   console.log("Client connected!")
   
   socket.on("addPlayer", () => {
-    if (world.addPlayer(socket.id)) world.presentPlayersTo(socket.id);
+    if (world.addPlayer(socket.id)) {
+      world.presentPlayersTo(socket.id);
+      world.presentObjectsTo(socket.id);
+    }
   });
 
   socket.on("move", (data) => {
