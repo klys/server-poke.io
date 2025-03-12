@@ -17,12 +17,13 @@ export default class Player {
     death:boolean;
     waitTime:number;
     id:number;
+    world:World;
     /*mMap:Pathfinding.Grid
     mPath:number[][];
     sPath:number[][];
     sPath_pos:number;*/
 
-    constructor(x:number,y:number,socketId:string){
+    constructor(x:number,y:number,socketId:string, world:World){
         this.x = x;
         this.y = y;
         this.width = 32;
@@ -37,6 +38,7 @@ export default class Player {
         this.finder = new Pathfinding.AStarFinder({ diagonalMovement: 1 })
         this.waitTime = 15;
         this.id = Math.round(Math.random()*99999);
+        this.world = world;
 
         /*this.mMap = new Pathfinding.Grid(40,40)
         this.mPath = [];
@@ -55,14 +57,43 @@ export default class Player {
 
         const toX = this.path[this.path_pos][0]*World.moveScale;
         const toY = this.path[this.path_pos][1]*World.moveScale;
+
         
+        
+        
+        let colliding = false;
+        for (let i = 0; i < this.world.objects.length; i++) {
+            if (this.world.checkCollision({
+                x:toX,
+                y:toY,
+                width:this.width,
+                height:this.height
+            },
+            this.world.objects[i]
+            )) {
+                colliding = true;
+                break;
+            }
+        }
+
+        if (colliding) {
+            console.log("colliding: unable to move.")
+            return;
+        }
+
         this.angle = point_direction(this.x, this.y, toX, toY)+180
         this.x = toX;
         this.y = toY;
 
-
         this.path_pos = this.path_pos + 1;
-        World.socketServer.emit("move"+this.socketId, {x:this.x,y:this.y,angle:this.angle,playerId:this.socketId, id:this.id})
+        World.socketServer.emit("move"+this.socketId, {
+            x:this.x,
+            y:this.y,
+            angle:this.angle,
+            playerId:this.socketId, 
+            id:this.id
+        })
+
     }
 
     public findPath(world:World,x:number,y:number) {

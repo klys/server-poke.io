@@ -11,7 +11,7 @@ export default class World {
     projectiles:Map<number, Projectil>
     roomId:string;
     static socketServer:any;
-    static moveScale:number = 1;
+    static moveScale:number = 8;
     grid:Pathfinding.Grid;
     objects: any[];
     //finder:Pathfinding.Finder;
@@ -29,6 +29,20 @@ export default class World {
         this.objects = [
             {
                 x:200,
+                y:200,
+                type:"rock0",
+                width:32,
+                height:32
+            },
+            {
+                x:200,
+                y:300,
+                type:"rock0",
+                width:32,
+                height:32
+            },
+            {
+                x:400,
                 y:200,
                 type:"rock0",
                 width:32,
@@ -123,7 +137,7 @@ export default class World {
 
     addPlayer(socketId:string):boolean {
         if (this.players.has(socketId) === true) return false;
-        this.players.set(socketId, new Player(100,100,socketId));
+        this.players.set(socketId, new Player(100,100,socketId, this));
         console.log("players in map: ", this.players.size);
         World.socketServer.emit("addPlayer", this.players.get(socketId)?.data());
         this.presentObjectsTo(socketId);
