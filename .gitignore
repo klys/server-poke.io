@@ -1,3 +1,6 @@
 node_modules
 *.js
 yarn.lock
+*.env
+prompt
+dist

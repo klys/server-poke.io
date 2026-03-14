@@ -1,73 +1,47 @@
+import "@dotenvx/dotenvx/config";
+import Auth from "./components/Auth";
+import DBInit from "./components/DBInit";
+import MailService from "./components/MailService";
 import World from "./components/world"
 import {Server} from "socket.io"
-import express from "express";
 import { createServer } from "http";
 import ServerToClientEvents from "./Server/ServerToClientEvents";
 import ClientToServerEvents from "./Server/ClientToServerEvents";
 import InterServerEvents from "./Server/InterServerEvents";
+import registerSocketHandlers, { type SocketData } from "./Server/registerSocketHandlers";
 
-interface SocketData {
-  name: string;
-  age: number;
-}
+const PORT = Number(process.env.PORT || 3001);
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:3000";
 
-const app = express();
-const httpServer = createServer(app);
-
-const io = new Server<
-ClientToServerEvents, 
-ServerToClientEvents, 
-InterServerEvents, 
-SocketData>
-(httpServer,{ cors:{origin: "*"} });
-
-const world = new World(400,400);
-
-world.setSocketServer(io)
-//world.shotProjectil() // test
-
-io.on("connection", (socket) => {
-  console.log("Client connected!", socket)
-  
-  socket.on("addPlayer", () => {
-    console.log("addPlayer")
-    if (world.addPlayer(socket.id)) {
-      world.presentPlayersTo(socket.id);
-      world.presentObjectsTo(socket.id);
+async function bootstrap() {
+  const httpServer = createServer();
+  const io = new Server<
+    ClientToServerEvents,
+    ServerToClientEvents,
+    InterServerEvents,
+    SocketData
+  >(httpServer, {
+    cors: {
+      origin: CLIENT_ORIGIN,
+      credentials: true
     }
   });
+  const redis = await new DBInit().initialize();
+  const mailService = new MailService();
+  await mailService.initialize();
+  const auth = new Auth(redis, mailService);
+  const world = new World(400,400);
 
-  socket.on("move", (data) => {
-    // With strong types, we can be sure 'data' is an object with x and y.
-    const { x, y } = data;
-    const player = world.players.get(socket.id)
-      if (!player) return;
-      console.log(socket.id+" moving to "+x+" and "+y)
-        //world.grid_backup = world.grid.clone()
-        player.findPath(world, x,y)
-        //world.grid = world.grid_backup;
-        world.players.set(player.socketId, player)
-    })
+  await auth.initialize();
+  world.setSocketServer(io);
+  registerSocketHandlers(io, world, auth);
 
-    socket.on("shotProjectil", (data) => {
-      console.log("shotProjectil")
-      world.shotProjectil(data.mouse_x,data.mouse_y, socket.id)
-    })
-    
-    socket.on("disconnect", (reason) => {
-      // remove player from all instances
-      console.log(reason)
-      world.removePlayer(socket.id)
-    });
+  httpServer.listen(PORT, () => {
+    console.log("Listening on port "+PORT);
+  });
+}
 
-});  
-
-
-
-
-//io.listen(3001);
-
-const PORT = process.env.PORT || 3001;
-
-httpServer.listen(PORT);
-console.log("Listening on port "+PORT)
+void bootstrap().catch((error) => {
+  console.error("Unable to start server.", error);
+  process.exit(1);
+});
