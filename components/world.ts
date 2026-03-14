@@ -1,6 +1,6 @@
 import Player from "./player"
 import Projectil from "./projectil"
-import { collision_square, point_direction } from "./gameMath";
+import GameMath from "./gameMath";
 import Pathfinding = require("pathfinding")
 //pf = require("pathfinding");
 
@@ -14,7 +14,7 @@ export default class World {
     projectiles:Map<number, Projectil>
     roomId:string;
     static socketServer:any;
-    static moveScale:number = 1;
+    static moveScale:number = 4;
     grid:Pathfinding.Grid;
     objects: any[];
     //finder:Pathfinding.Finder;
@@ -76,7 +76,7 @@ export default class World {
         const player = this.players.get(ownerId);
         if (player === undefined) return;
         if (player.death === true) return;
-        const angle = point_direction(player.x,player.y,mouse_x,mouse_y)
+        const angle = GameMath.point_direction(player.x,player.y,mouse_x,mouse_y)
         const projectil = new Projectil(player.x,player.y,angle);
         projectil.ownerId = ownerId;
         this.projectiles.set(projectil.id, projectil);
@@ -142,9 +142,9 @@ export default class World {
             let player = current.value[1];
             console.log(player);
             console.log("checking IF colliding with "+player.socketId)
-            if (player.socketId !== element.ownerId)
-            if (player.death === false)
-            if (collision_square(player, element)) {console.log("COLLIDING!!!!"); return player;};
+            if (player.socketId !== element.ownerId &&
+                player.death === false &&
+                GameMath.collision_square(player, element)) {console.log("COLLIDING!!!!"); return player;};
             current = piterator.next();
         }
         console.log("NOT colliding.")

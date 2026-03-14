@@ -1,4 +1,4 @@
-import {polar_move} from "./gameMath"
+import GameMath from "./gameMath"
 import World from "./world"
 
 /**
@@ -34,7 +34,7 @@ export default class Projectil {
         this.width = 32;
         this.height = 32;
         this.angle = angle;
-        const maxDistance = polar_move(x,y,this.angle,1000);
+        const maxDistance = GameMath.polar_move(x,y,this.angle,1000);
         this.maxDistance = 300;
         this.distance = 0 ;
         this.toX = maxDistance.x;
@@ -84,7 +84,7 @@ export default class Projectil {
             // if we are not in the right position
             // move to it
             this.distance += this.speed;
-            const newPos = polar_move(this.x,this.y,this.angle,this.speed);
+            const newPos = GameMath.polar_move(this.x,this.y,this.angle,this.speed);
             this.x = newPos.x;
             this.y = newPos.y;
             console.log("projectil moving ... ("+this.x+", "+this.y+")")

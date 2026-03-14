@@ -38,17 +38,14 @@ io.on("connection", (socket) => {
   });
 
   socket.on("move", (data) => {
-    //console.log("move: ", data)
-    const dataO = ("string" == typeof data) ? JSON.parse(data) : data;
-    const x = dataO.x | data.x;
-    const y = dataO.y | data.y;
+    // With strong types, we can be sure 'data' is an object with x and y.
+    const { x, y } = data;
     const player = world.players.get(socket.id)
       if (!player) return;
       console.log(socket.id+" moving to "+x+" and "+y)
         //world.grid_backup = world.grid.clone()
         player.findPath(world, x,y)
         //world.grid = world.grid_backup;
-        
         world.players.set(player.socketId, player)
     })
 

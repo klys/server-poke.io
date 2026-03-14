@@ -1,6 +1,6 @@
 import Pathfinding = require("pathfinding")
 import World from "./world"
-import { point_direction } from "./gameMath";
+import GameMath from "./gameMath";
 
 /**
  * Represents a player entity in the game world.
@@ -10,7 +10,7 @@ export default class Player {
     y: number;
     width:number;
     height:number;
-    speed:number;
+    speed:number; 
     socketId:string;
     path:number[][];
     path_pos:number;
@@ -94,7 +94,8 @@ export default class Player {
             return;
         }
 
-        //this.angle = point_direction(this.x, this.y, toX, toY)+180
+        const direction = GameMath.point_direction(this.x, this.y, toX, toY) + 180;
+        this.angle = GameMath.roundToQuadrant(direction);
         this.x = toX;
         this.y = toY;
 
@@ -116,11 +117,21 @@ export default class Player {
      * @param y - Target y coordinate.
      */
     public findPath(world:World,x:number,y:number) {
-        
-        this.path = this.finder.findPath(Math.round(this.x/World.moveScale),Math.round(this.y/World.moveScale),
-                                        Math.round(x/World.moveScale),Math.round(y/World.moveScale),
-                                        world.grid.clone())
+        const maxGridX = Math.floor(world.width / World.moveScale) - 1;
+        const maxGridY = Math.floor(world.height / World.moveScale) - 1;
+
+        const fromX = this.normalizeGridCoordinate(this.x, maxGridX);
+        const fromY = this.normalizeGridCoordinate(this.y, maxGridY);
+        const toX = this.normalizeGridCoordinate(x, maxGridX);
+        const toY = this.normalizeGridCoordinate(y, maxGridY);
+
+        this.path = this.finder.findPath(fromX, fromY, toX, toY, world.grid.clone())
         this.path_pos = 0;
+    }
+
+    private normalizeGridCoordinate(value:number, max:number) {
+        const scaledValue = Math.floor(value / World.moveScale);
+        return Math.max(0, Math.min(scaledValue, max));
     }
 
     /*public mFinder() {
@@ -135,6 +146,14 @@ export default class Player {
      * @returns An object containing the current player details.
      */
     public data() {
+        const playerData = {
+            playerId:this.socketId,
+            x:this.x,
+            y:this.y,
+            angle:this.angle,
+            id:this.id
+        }
+        console.log("presenting existing player with data:", playerData)
         return{
             playerId:this.socketId,
             x:this.x,

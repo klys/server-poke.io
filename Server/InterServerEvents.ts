@@ -1,3 +1,3 @@
 export default interface InterServerEvents {
-    ping: () => void;
-  }
+  // Currently no server-to-server events
+}
