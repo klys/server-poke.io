@@ -1,6 +1,9 @@
 import {polar_move} from "./gameMath"
 import World from "./world"
 
+/**
+ * Represents a projectile fired by a player.
+ */
 export default class Projectil {
     x:number;
     y:number;
@@ -17,6 +20,12 @@ export default class Projectil {
     ownerId:string;
     damage:number;
 
+    /**
+     * Creates a new projectile.
+     * @param x - The starting x coordinate.
+     * @param y - The starting y coordinate.
+     * @param angle - The angle at which the projectile is fired.
+     */
     constructor(x:number, y:number, angle:number) {
         this.ownerId = '';
         this.explode = false;
@@ -36,10 +45,18 @@ export default class Projectil {
         this.id = Math.round(Math.random()*99999);
     }
 
+    /**
+     * Sets the owner ID of the projectile so players cannot hit themselves.
+     * @param id - The socket ID of the player who fired the projectile.
+     */
     setOwnership(id:string):void {
         this.ownerId = id;
     }
 
+    /**
+     * Retrieves the core data of the projectile for network transmission.
+     * @returns An object containing the projectile's basic state.
+     */
     data() {
         return {
             x:this.x,
@@ -49,11 +66,19 @@ export default class Projectil {
         }
     }
 
+    /**
+     * Sets the destination coordinates manually.
+     * @param x - The destination x coordinate.
+     * @param y - The destination y coordinate.
+     */
     setMove(x:number,y:number) {
         this.toX = x;
         this.toY = y;
     }
 
+    /**
+     * Updates the projectile's position based on its speed and angle.
+     */
     move() {
         if (this.distance < this.maxDistance) {
             // if we are not in the right position
@@ -66,6 +91,9 @@ export default class Projectil {
         } else this.trigger();
     }
 
+    /**
+     * Triggers the projectile to explode.
+     */
     trigger() {
         this.explode = true;
     }

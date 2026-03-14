@@ -2,6 +2,9 @@ import Pathfinding = require("pathfinding")
 import World from "./world"
 import { point_direction } from "./gameMath";
 
+/**
+ * Represents a player entity in the game world.
+ */
 export default class Player {
     x: number;
     y: number;
@@ -23,19 +26,26 @@ export default class Player {
     sPath:number[][];
     sPath_pos:number;*/
 
+    /**
+     * Creates a new player.
+     * @param x - The initial x coordinate.
+     * @param y - The initial y coordinate.
+     * @param socketId - The network socket ID of the player.
+     * @param world - Reference to the game world.
+     */
     constructor(x:number,y:number,socketId:string, world:World){
         this.x = x;
         this.y = y;
         this.width = 32;
         this.height = 32;
         this.life = 100;
-        this.angle = 0;
+        this.angle = 270;
         this.socketId = socketId;
-        this.speed = 3;
+        this.speed = 1;
         this.path = [];
         this.path_pos = 0;
         this.death = false;
-        this.finder = new Pathfinding.AStarFinder({ diagonalMovement: 1 })
+        this.finder = new Pathfinding.AStarFinder()
         this.waitTime = 15;
         this.id = Math.round(Math.random()*99999);
         this.world = world;
@@ -49,6 +59,9 @@ export default class Player {
         setInterval(this.move.bind(this), 1)
     }
 
+    /**
+     * Evaluates the current path segment and moves the player towards it.
+     */
     public move() {
         if (this.path.length === 0) return;
         if (this.path.length === this.path_pos) return;
@@ -77,11 +90,11 @@ export default class Player {
         }
 
         if (colliding) {
-            console.log("colliding: unable to move.")
+            console.log("colliding: unable to move." ,{x:toX,y:toY})
             return;
         }
 
-        this.angle = point_direction(this.x, this.y, toX, toY)+180
+        //this.angle = point_direction(this.x, this.y, toX, toY)+180
         this.x = toX;
         this.y = toY;
 
@@ -96,6 +109,12 @@ export default class Player {
 
     }
 
+    /**
+     * Computes a path from the current position to the specified coordinates.
+     * @param world - Reference to the game world for pathfinding grid cloning.
+     * @param x - Target x coordinate.
+     * @param y - Target y coordinate.
+     */
     public findPath(world:World,x:number,y:number) {
         
         this.path = this.finder.findPath(Math.round(this.x/World.moveScale),Math.round(this.y/World.moveScale),
@@ -111,6 +130,10 @@ export default class Player {
 
     }*/
 
+    /**
+     * Retrieves the basic state data of the player.
+     * @returns An object containing the current player details.
+     */
     public data() {
         return{
             playerId:this.socketId,
@@ -121,6 +144,10 @@ export default class Player {
         }
     }
 
+    /**
+     * Applies damage to the player and handles death logic if life reaches 0.
+     * @param damage - The amount of health to deduct.
+     */
     public hurt(damage:number) {
         this.life -= damage;
         if (this.life <= 0) {
@@ -132,6 +159,9 @@ export default class Player {
         } 
     }
 
+    /**
+     * Restores the player to full health and clears the death state.
+     */
     public reborn() {
         this.life = 100;
         this.death = false;
@@ -139,6 +169,9 @@ export default class Player {
         World.socketServer.emit("playerReborn", {playerId:this.socketId, id:this.id})
     }
 
+    /**
+     * Marks the player as dead and initiates the respawn wait timer.
+     */
     public die() {
         this.death = true;
         this.waitTime = 15;

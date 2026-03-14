@@ -1,6 +1,6 @@
 import World from "./components/world"
 import {Server} from "socket.io"
-import * as express from "express";
+import express from "express";
 import { createServer } from "http";
 import ServerToClientEvents from "./Server/ServerToClientEvents";
 import ClientToServerEvents from "./Server/ClientToServerEvents";
@@ -27,9 +27,10 @@ world.setSocketServer(io)
 //world.shotProjectil() // test
 
 io.on("connection", (socket) => {
-  console.log("Client connected!")
+  console.log("Client connected!", socket)
   
   socket.on("addPlayer", () => {
+    console.log("addPlayer")
     if (world.addPlayer(socket.id)) {
       world.presentPlayersTo(socket.id);
       world.presentObjectsTo(socket.id);

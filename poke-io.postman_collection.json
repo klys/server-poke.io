@@ -1,0 +1,26 @@
+{
+  "info": {
+    "name": "poke.io Socket API",
+    "description": "This collection outlines the Socket.IO events for the poke.io backend. Use Postman's **Socket.IO** feature to test it.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Socket.IO Connection Instructions",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://localhost:3001",
+          "protocol": "http",
+          "host": [
+            "localhost"
+          ],
+          "port": "3001"
+        },
+        "description": "### How to test using Postman:\n\n1. In Postman, click **New** -> **Socket.IO**.\n2. Enter the URL: `http://localhost:3001` (or `ws://localhost:3001`).\n3. Click **Connect**.\n\n### Events to Emit:\n\n#### 1. `addPlayer`\n* **Event Name:** `addPlayer`\n* **Message:** None\n\n#### 2. `move`\n* **Event Name:** `move`\n* **Message (JSON):**\n```json\n{\n  \"x\": 100,\n  \"y\": 200\n}\n```\n\n#### 3. `shotProjectil`\n* **Event Name:** `shotProjectil`\n* **Message (JSON):**\n```json\n{\n  \"mouse_x\": 150,\n  \"mouse_y\": 250\n}\n```\n\n### Events to Listen for:\nAdd these to the **Events** tab in Postman to see incoming messages:\n* `presentPlayersTo`\n* `presentObjectsTo`"
+      },
+      "response": []
+    }
+  ]
+}

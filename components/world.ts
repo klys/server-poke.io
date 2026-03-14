@@ -4,6 +4,9 @@ import { collision_square, point_direction } from "./gameMath";
 import Pathfinding = require("pathfinding")
 //pf = require("pathfinding");
 
+/**
+ * Main game world representing the environment, tracking players, objects, projectiles, and grid state.
+ */
 export default class World {
     public width:number;
     public height:number;
@@ -11,7 +14,7 @@ export default class World {
     projectiles:Map<number, Projectil>
     roomId:string;
     static socketServer:any;
-    static moveScale:number = 8;
+    static moveScale:number = 1;
     grid:Pathfinding.Grid;
     objects: any[];
     //finder:Pathfinding.Finder;
@@ -19,6 +22,11 @@ export default class World {
     
     
 
+    /**
+     * Creates a new game world instance.
+     * @param width - The width of the game world grid.
+     * @param height - The height of the game world grid.
+     */
     constructor(width:number, height:number) {
         this.height = height;
         this.width = width;
@@ -57,6 +65,12 @@ export default class World {
         setInterval(this.playerWaiting.bind(this),1000)
     }
 
+    /**
+     * Spawns a projectile originating from a player towards mouse coordinates.
+     * @param mouse_x - The target mouse x position.
+     * @param mouse_y - The target mouse y position.
+     * @param ownerId - The socket ID of the player shooting the projectile.
+     */
     shotProjectil(mouse_x:number,mouse_y:number, ownerId:string) {
         if (this.players.has(ownerId) === false) return;
         const player = this.players.get(ownerId);
@@ -69,6 +83,9 @@ export default class World {
         World.socketServer.emit("shotProjectil", projectil.data())
     }
 
+    /**
+     * Main loop tick for processing projectile movements, collisions, and explosions.
+     */
     livingProjectil () {
         this.projectiles.forEach((projectil) => {
             if (projectil.explode) {
@@ -89,6 +106,9 @@ export default class World {
         
     }
 
+    /**
+     * Loop tick for managing dead players waiting to respawn.
+     */
     playerWaiting() {
         const piterator = this.players.entries();
         let current = piterator.next();
@@ -107,6 +127,11 @@ export default class World {
         }
     }
 
+    /**
+     * Checks if a given element (like a projectile) is colliding with any alive player.
+     * @param element - The entity (usually projectile) checking collision against players.
+     * @returns The collided Player instance if found, undefined otherwise.
+     */
     collision_player(element:any):any {
         console.log("collision_player->element:",element)
         
@@ -126,6 +151,12 @@ export default class World {
         return undefined;
     }
 
+    /**
+     * Generic AABB bounding box collision check between two objects.
+     * @param object1 - The first rectangle.
+     * @param object2 - The second rectangle.
+     * @returns True if they overlap, otherwise false.
+     */
     checkCollision(object1:any, object2:any) {
         return (
           object1.x < object2.x + object2.width &&
@@ -135,6 +166,11 @@ export default class World {
         );
       }
 
+    /**
+     * Adds a new player to the game world map.
+     * @param socketId - The unique socket ID representing the player.
+     * @returns True if added successfully, false if the player already exists.
+     */
     addPlayer(socketId:string):boolean {
         if (this.players.has(socketId) === true) return false;
         this.players.set(socketId, new Player(100,100,socketId, this));
@@ -145,12 +181,20 @@ export default class World {
         
     }
 
+    /**
+     * Emits events to present all *other* players to a specific, newly connected player.
+     * @param socketId - The socket ID of the targeted client.
+     */
     presentPlayersTo(socketId:string) {
         this.players.forEach( (player) => {
             (player.socketId != socketId) ? World.socketServer.in(socketId).emit("addPlayer", player.data()) : null;
         })
     }
 
+    /**
+     * Broadcasts world objects (like rocks/environment elements) to a targeted client.
+     * @param socketId - The socket ID of the targeted client.
+     */
     presentObjectsTo(socketId:string) {
         console.log("sending objects to client...")
         this.objects.forEach( (object) => {
@@ -158,6 +202,10 @@ export default class World {
         })
     }
 
+    /**
+     * Removes a player from the world and notifies clients.
+     * @param socketId - The socket ID of the player to remove.
+     */
     removePlayer(socketId:string) {
         if (!this.players.has(socketId)) return;
         let id = this.players.get(socketId)?.id;
@@ -168,10 +216,17 @@ export default class World {
         
     }
 
+    /**
+     * Sets the static Socket.IO server instance for the World class to dispatch events.
+     * @param socket - The Socket.IO server instance.
+     */
     setSocketServer(socket:any) {
         World.socketServer = socket;
     }
 
+    /**
+     * Emits a test message to all connected players.
+     */
     testSocket() {
         console.log("test socket executed. ",this.players.size)
         this.players.forEach( (player) => {
