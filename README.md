@@ -91,6 +91,54 @@ Movement is not direct. When a client requests a `move` to (x, y):
 *   **Environment:** Players check collision against static objects (defined in `World.objects`) before moving.
 *   **Combat:** Projectiles check for collision with players every tick using a bounding box check (`collision_square`).
 
+## 🗄️ Redis Database Schema
+
+This project utilizes [Redis](https://redis.io/) as an in-memory data structure store. Below is the documentation of the key patterns, data types, and structures used across the application.
+
+### Key Naming Convention
+We follow a standard colon-separated namespace convention for our Redis keys to ensure logical grouping and easy querying: `object_type:id:sub_type`.
+
+### 1. User/Player Profiles
+Stores individual player data, settings, and current state.
+* **Key Pattern:** `player:{player_id}`
+* **Data Type:** `Hash`
+* **Fields:**
+  * `username` (String) - The display name of the player.
+  * `level` (Integer) - The current level of the player.
+  * `score` (Integer) - Total accumulated points.
+  * `last_login` (Timestamp) - Unix timestamp of the last active session.
+
+### 2. Global Leaderboard
+Maintains the high scores of all players in real-time.
+* **Key Pattern:** `leaderboard:global`
+* **Data Type:** `Sorted Set (ZSET)`
+* **Score:** Player's score/experience points.
+* **Value:** `{player_id}`
+
+### 3. Active Game Sessions
+Keeps track of which players are currently connected and active in a specific match/room.
+* **Key Pattern:** `room:{room_id}:players`
+* **Data Type:** `Set`
+* **Value:** `{player_id}`
+
+### 4. Rate Limiting / API Throttling
+Used to prevent API abuse and handle rate limits.
+* **Key Pattern:** `ratelimit:{ip_address}:{endpoint}`
+* **Data Type:** `String` (with TTL/Expiration)
+* **Value:** Current request count (Integer).
+
+### 5. Session Caching
+Stores ephemeral authentication tokens and session data.
+* **Key Pattern:** `session:{session_token}`
+* **Data Type:** `String` (JSON stringified)
+* **Value:** 
+  ```json
+  {
+    "playerId": "12345",
+    "createdAt": "2026-03-17T21:36:31Z"
+  }
+
+
 ## 📝 Development Notes
 
 *   **Scale:** The world uses a movement scale factor (default: 8) defined in `World.moveScale` for the pathfinding grid.

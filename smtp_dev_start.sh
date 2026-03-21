@@ -1,0 +1,1 @@
+sudo docker compose -f composer-smtp.yml up
