@@ -36,25 +36,25 @@ export default class World {
         this.projectiles = new Map<number, Projectil>();
         this.objects = [
             {
-                x:200,
-                y:200,
+                x:396,
+                y:180,
                 type:"rock0",
                 width:32,
-                height:32
+                height:30
             },
             {
-                x:200,
-                y:300,
+                x:216,
+                y:216,
                 type:"rock0",
                 width:32,
-                height:32
+                height:30
             },
             {
-                x:400,
-                y:200,
+                x:216,
+                y:288,
                 type:"rock0",
                 width:32,
-                height:32
+                height:30
             }
         ];
 
