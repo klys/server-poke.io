@@ -1,5 +1,6 @@
 import { type Server, type Socket } from "socket.io";
 import Auth, { type AuthenticatedUser } from "../components/Auth";
+import DesignerObjectsStore from "../components/DesignerObjectsStore";
 import World from "../components/world";
 import ClientToServerEvents from "./ClientToServerEvents";
 import InterServerEvents from "./InterServerEvents";
@@ -52,7 +53,21 @@ function readSocketToken(socket:ServerSocket) {
   return socket.data.token;
 }
 
-function createConnectionHandler(world:World, auth:Auth) {
+const DESIGNER_OBJECTS_ROOM = "designer:objects";
+
+function requireDesignerObjectsAccess(socket:ServerSocket) {
+  if (socket.data.authenticated) {
+    return true;
+  }
+
+  socket.emit("designer:objects:error", {
+    message: "You must be authenticated to use the map objects designer."
+  });
+
+  return false;
+}
+
+function createConnectionHandler(world:World, auth:Auth, designerObjectsStore:DesignerObjectsStore) {
   return (socket:ServerSocket) => {
     console.log("Client connected!", socket.id);
 
@@ -234,6 +249,52 @@ function createConnectionHandler(world:World, auth:Auth) {
       }
     });
 
+    socket.on("designer:objects:join", async (data) => {
+      if (!requireDesignerObjectsAccess(socket)) {
+        return;
+      }
+
+      socket.join(DESIGNER_OBJECTS_ROOM);
+
+      try {
+        const payload = await designerObjectsStore.getOrCreate(data?.seedState);
+        socket.emit("designer:objects:state", payload);
+      } catch (error) {
+        console.error("Unable to load designer objects state:", error);
+        socket.emit("designer:objects:error", {
+          message: "Unable to load the collaborative map objects state."
+        });
+      }
+    });
+
+    socket.on("designer:objects:leave", () => {
+      socket.leave(DESIGNER_OBJECTS_ROOM);
+    });
+
+    socket.on("designer:objects:update", async (data) => {
+      if (!requireDesignerObjectsAccess(socket)) {
+        return;
+      }
+
+      socket.join(DESIGNER_OBJECTS_ROOM);
+
+      try {
+        const payload = await designerObjectsStore.save(
+          data.state,
+          socket.data.userId ?? null,
+          socket.data.username ?? null
+        );
+
+        socket.emit("designer:objects:state", payload);
+        socket.broadcast.to(DESIGNER_OBJECTS_ROOM).emit("designer:objects:state", payload);
+      } catch (error) {
+        console.error("Unable to save designer objects state:", error);
+        socket.emit("designer:objects:error", {
+          message: "Unable to save the collaborative map objects state."
+        });
+      }
+    });
+
     socket.on("addPlayer", () => {
       console.log("addPlayer");
       if (world.addPlayer(socket.id)) {
@@ -263,6 +324,11 @@ function createConnectionHandler(world:World, auth:Auth) {
   };
 }
 
-export default function registerSocketHandlers(io:TypedSocketServer, world:World, auth:Auth) {
-  io.on("connection", createConnectionHandler(world, auth));
+export default function registerSocketHandlers(
+  io:TypedSocketServer,
+  world:World,
+  auth:Auth,
+  designerObjectsStore:DesignerObjectsStore
+) {
+  io.on("connection", createConnectionHandler(world, auth, designerObjectsStore));
 }

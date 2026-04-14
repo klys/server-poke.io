@@ -1,3 +1,8 @@
+import type {
+  DesignerObjectsJoinPayload,
+  DesignerObjectsUpdatePayload
+} from "../components/DesignerObjectsStore";
+
 interface AuthRegisterPayload {
   name: string;
   username: string;
@@ -96,4 +101,21 @@ export default interface ClientToServerEvents {
    * - `password`: new password using the same password rules as registration
    */
   "auth:reset-password": (data: AuthResetPasswordPayload) => void;
+
+  /**
+   * Joins the collaborative `/designer/objects` channel.
+   * - `seedState`: optional client snapshot used only when Redis has no saved state yet
+   */
+  "designer:objects:join": (data?: DesignerObjectsJoinPayload) => void;
+
+  /**
+   * Leaves the collaborative `/designer/objects` channel for the current socket.
+   */
+  "designer:objects:leave": () => void;
+
+  /**
+   * Replaces the shared map object editor state with the latest client snapshot.
+   * The server persists the payload in Redis and broadcasts it to everyone in the room.
+   */
+  "designer:objects:update": (data: DesignerObjectsUpdatePayload) => void;
 }

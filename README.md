@@ -61,6 +61,9 @@ The server listens on port **3001** by default.
 | `addPlayer` | `void` | Request to join the game world. |
 | `move` | `{ x: number, y: number }` | Request to move to specific coordinates. Triggers server-side pathfinding. |
 | `shotProjectil` | `{ mouse_x: number, mouse_y: number }` | Fire a projectile towards the mouse coordinates. |
+| `designer:objects:join` | `{ seedState?: DesignerObjectsSectionState }` | Join the collaborative `/designer/objects` room and hydrate the latest Redis-backed snapshot. The optional `seedState` is used only when Redis has no saved state yet. |
+| `designer:objects:update` | `{ state: DesignerObjectsSectionState }` | Replace the shared `/designer/objects` editor state, persist it to Redis, and broadcast it to all watchers immediately. |
+| `designer:objects:leave` | `void` | Leave the collaborative `/designer/objects` room when the client navigates away. |
 | `disconnect` | `void` | Standard socket event when a client drops connection. |
 
 ### Server -> Client Events
@@ -77,6 +80,8 @@ The server listens on port **3001** by default.
 | `playerHurt` | `{ playerId, life, id }` | Sent when a player takes damage. |
 | `playerDeath` | `{ playerId, id }` | Sent when a player's life reaches 0. |
 | `playerReborn` | `{ playerId, id }` | Sent when a player respawns after the wait time. |
+| `designer:objects:state` | `DesignerObjectsSyncPayload` | Full authoritative `/designer/objects` snapshot sent on join and after each collaborative update. |
+| `designer:objects:error` | `{ message: string }` | Non-fatal collaborative editor error for the `/designer/objects` experience. |
 
 ## ⚙️ Game Logic Details
 
@@ -137,6 +142,52 @@ Stores ephemeral authentication tokens and session data.
     "playerId": "12345",
     "createdAt": "2026-03-17T21:36:31Z"
   }
+  ```
+
+### 6. Designer Objects Snapshot
+Stores the authoritative state for the `/designer/objects` editor so all connected designers see the same data without refreshing.
+* **Key Pattern:** `designer:section:objects`
+* **Data Type:** `String` (JSON stringified)
+* **Value Shape:**
+  ```json
+  {
+    "state": {
+      "categories": ["Uncategorized", "Nature", "Buildings"],
+      "items": [
+        {
+          "id": "object-ancient-oak",
+          "name": "Ancient Oak",
+          "category": "Nature",
+          "details": [
+            { "label": "Type", "value": "obstacle" },
+            { "label": "Width", "value": "96 px" },
+            { "label": "Height", "value": "144 px" }
+          ],
+          "mapObjectAsset": {
+            "imageSrc": "data:image/png;base64,...",
+            "width": 96,
+            "height": 144,
+            "objectType": "obstacle"
+          }
+        }
+      ]
+    },
+    "updatedAt": "2026-04-14T16:00:00.000Z",
+    "updatedByUserId": 12,
+    "updatedByUsername": "designer-admin"
+  }
+  ```
+
+## 🤝 Designer Objects Collaboration
+
+The `/designer/objects` page now uses a dedicated real-time collaboration flow:
+
+1. The authenticated client emits `designer:objects:join` when the page opens.
+2. The server loads `designer:section:objects` from Redis, creating it from the provided seed state when it does not exist yet.
+3. The server returns the authoritative snapshot through `designer:objects:state`.
+4. Every create/edit/delete/category change emits `designer:objects:update` with the full editor state.
+5. The server persists the new snapshot in Redis and rebroadcasts `designer:objects:state` to every socket in the `designer:objects` room.
+6. Clients update instantly, so multiple users on `/designer/objects` stay in sync without refreshing.
 
 
 ## 📝 Development Notes
@@ -148,4 +199,3 @@ Stores ephemeral authentication tokens and session data.
     *   Movement interpolation happens on a faster interval (1ms) within the Player class.
 
 ---
-

@@ -1,3 +1,5 @@
+import type { DesignerObjectsSyncPayload } from "../components/DesignerObjectsStore";
+
 interface PlayerData {
   playerId: string;
   x: number;
@@ -69,6 +71,17 @@ export default interface ServerToClientEvents {
    * form-level error or toast message.
    */
   "auth:error": (data: { message: string }) => void;
+
+  /**
+   * Full authoritative `/designer/objects` editor snapshot loaded from Redis.
+   * The same event is used for the initial hydration and for live rebroadcasts after edits.
+   */
+  "designer:objects:state": (data: DesignerObjectsSyncPayload) => void;
+
+  /**
+   * Collaborative editor error for `/designer/objects`.
+   */
+  "designer:objects:error": (data: { message: string }) => void;
 
   // Dynamic events using template literal types
   [event: `move${string}`]: (data: { x: number; y: number; angle: number; playerId: string; id: number }) => void;
