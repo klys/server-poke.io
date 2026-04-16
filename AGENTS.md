@@ -1,5 +1,19 @@
 # AGENTS.md
 
+## Client-Server Contract
+
+In case of changes that require server side refactor use contracts.json to find the other side that require to be updated.
+- if contracts.json dont exists request to be created before doing any work that require server side refactor.
+- validate contracts.json to have the following format example:
+
+```
+{
+    "frontend_location": "<file/system/path>"
+}
+```
+
+Project Summary
+
 ## Purpose
 
 This repository is a TypeScript backend for a real-time multiplayer game. It combines:
