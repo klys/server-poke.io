@@ -36,9 +36,29 @@ interface AuthResetPasswordPayload {
   password: string;
 }
 
+interface AddPlayerMapDefinition {
+  mapId: string;
+  width: number;
+  height: number;
+  obstacles: Array<{
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }>;
+}
+
 export default interface ClientToServerEvents {
-  addPlayer: () => void;
+  addPlayer: (data?: {
+    initialMapId?: string;
+    initialX?: number;
+    initialY?: number;
+    mapDefinitions?: AddPlayerMapDefinition[];
+    token?: string;
+  }) => void;
+  "player:teleport": (data: { mapId: string; x: number; y: number }) => void;
   move: (data: { x: number; y: number }) => void;
+  stopMove: () => void;
   shotProjectil: (data: { mouse_x: number; mouse_y: number }) => void;
 
   /**

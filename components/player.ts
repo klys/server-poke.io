@@ -1,4 +1,3 @@
-import Pathfinding = require("pathfinding")
 import World from "./world"
 import GameMath from "./gameMath";
 
@@ -8,14 +7,16 @@ import GameMath from "./gameMath";
 export default class Player {
     x: number;
     y: number;
+    currentMapId:string;
     width:number;
     height:number;
     speed:number; 
     socketId:string;
+    socketConnections:Set<string>;
+    userId:number | null;
     path:number[][];
     path_pos:number;
     angle:number; 
-    finder:Pathfinding.Finder;
     life:number;
     death:boolean;
     waitTime:number;
@@ -33,19 +34,29 @@ export default class Player {
      * @param socketId - The network socket ID of the player.
      * @param world - Reference to the game world.
      */
-    constructor(x:number,y:number,socketId:string, world:World){
+    constructor(
+        x:number,
+        y:number,
+        playerId:string,
+        world:World,
+        currentMapId:string,
+        initialSocketId:string,
+        userId:number | null = null
+    ){
         this.x = x;
         this.y = y;
+        this.currentMapId = currentMapId;
         this.width = 32;
         this.height = 32;
         this.life = 100;
         this.angle = 270;
-        this.socketId = socketId;
+        this.socketId = playerId;
+        this.socketConnections = new Set<string>([initialSocketId]);
+        this.userId = userId;
         this.speed = 1;
         this.path = [];
         this.path_pos = 0;
         this.death = false;
-        this.finder = new Pathfinding.AStarFinder()
         this.waitTime = 15;
         this.id = Math.round(Math.random()*99999);
         this.world = world;
@@ -57,6 +68,18 @@ export default class Player {
         //setInterval(this.mFinder.bind(this), 1)
 
         setInterval(this.move.bind(this), 1)
+    }
+
+    public attachSocket(socketId:string) {
+        this.socketConnections.add(socketId);
+    }
+
+    public detachSocket(socketId:string) {
+        this.socketConnections.delete(socketId);
+    }
+
+    public hasActiveSockets() {
+        return this.socketConnections.size > 0;
     }
 
     /**
@@ -75,14 +98,15 @@ export default class Player {
         
         
         let colliding = false;
-        for (let i = 0; i < this.world.objects.length; i++) {
+        const mapObjects = this.world.getMapObjects(this.currentMapId);
+        for (let i = 0; i < mapObjects.length; i++) {
             if (this.world.checkCollision({
                 x:toX,
                 y:toY,
                 width:this.width,
                 height:this.height
             },
-            this.world.objects[i]
+            mapObjects[i]
             )) {
                 colliding = true;
                 break;
@@ -105,7 +129,8 @@ export default class Player {
             y:this.y,
             angle:this.angle,
             playerId:this.socketId, 
-            id:this.id
+            id:this.id,
+            currentMapId:this.currentMapId
         })
 
     }
@@ -117,21 +142,48 @@ export default class Player {
      * @param y - Target y coordinate.
      */
     public findPath(world:World,x:number,y:number) {
-        const maxGridX = Math.floor(world.width / World.moveScale) - 1;
-        const maxGridY = Math.floor(world.height / World.moveScale) - 1;
+        const mapBounds = world.getMapBounds(this.currentMapId);
+        const maxTravelX = Math.max(0, mapBounds.width - this.width);
+        const maxTravelY = Math.max(0, mapBounds.height - this.height);
+        const maxGridX = Math.max(0, Math.ceil(maxTravelX / World.moveScale));
+        const maxGridY = Math.max(0, Math.ceil(maxTravelY / World.moveScale));
 
         const fromX = this.normalizeGridCoordinate(this.x, maxGridX);
         const fromY = this.normalizeGridCoordinate(this.y, maxGridY);
         const toX = this.normalizeGridCoordinate(x, maxGridX);
         const toY = this.normalizeGridCoordinate(y, maxGridY);
 
-        this.path = this.finder.findPath(fromX, fromY, toX, toY, world.grid.clone())
+        this.path = this.createDirectPath(fromX, fromY, toX, toY);
         this.path_pos = 0;
     }
 
     private normalizeGridCoordinate(value:number, max:number) {
         const scaledValue = Math.floor(value / World.moveScale);
         return Math.max(0, Math.min(scaledValue, max));
+    }
+
+    private createDirectPath(fromX:number, fromY:number, toX:number, toY:number) {
+        const deltaX = toX - fromX;
+        const deltaY = toY - fromY;
+        const steps = Math.max(Math.abs(deltaX), Math.abs(deltaY));
+
+        if (steps === 0) {
+            return [];
+        }
+
+        const path:number[][] = [];
+
+        for (let step = 1; step <= steps; step += 1) {
+            const nextX = Math.round(fromX + (deltaX * step) / steps);
+            const nextY = Math.round(fromY + (deltaY * step) / steps);
+            const lastNode = path[path.length - 1];
+
+            if (!lastNode || lastNode[0] !== nextX || lastNode[1] !== nextY) {
+                path.push([nextX, nextY]);
+            }
+        }
+
+        return path;
     }
 
     /*public mFinder() {
@@ -148,6 +200,7 @@ export default class Player {
     public data() {
         const playerData = {
             playerId:this.socketId,
+            currentMapId:this.currentMapId,
             x:this.x,
             y:this.y,
             angle:this.angle,
@@ -156,11 +209,47 @@ export default class Player {
         console.log("presenting existing player with data:", playerData)
         return{
             playerId:this.socketId,
+            currentMapId:this.currentMapId,
             x:this.x,
             y:this.y,
             angle:this.angle,
             id:this.id
         }
+    }
+
+    public teleport(mapId:string, x:number, y:number) {
+        const nextPosition = this.world.clampPlayerPosition(mapId, x, y, this.width, this.height);
+
+        this.currentMapId = mapId;
+        this.x = nextPosition.x;
+        this.y = nextPosition.y;
+        this.path = [];
+        this.path_pos = 0;
+
+        World.socketServer.emit("move"+this.socketId, {
+            x:this.x,
+            y:this.y,
+            angle:this.angle,
+            playerId:this.socketId,
+            id:this.id,
+            currentMapId:this.currentMapId,
+            teleported:true
+        })
+    }
+
+    public stopMovement() {
+        this.path = [];
+        this.path_pos = 0;
+
+        World.socketServer.emit("move"+this.socketId, {
+            x:this.x,
+            y:this.y,
+            angle:this.angle,
+            playerId:this.socketId,
+            id:this.id,
+            currentMapId:this.currentMapId,
+            stopped:true
+        })
     }
 
     /**

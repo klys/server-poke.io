@@ -2,6 +2,22 @@ import Player from "./player"
 import Projectil from "./projectil"
 import GameMath from "./gameMath";
 import Pathfinding = require("pathfinding")
+
+const DEFAULT_PLAYER_MAP_ID = "default-world";
+const DEFAULT_PLAYER_X = 100;
+const DEFAULT_PLAYER_Y = 100;
+
+type MapObstacle = {
+    x:number;
+    y:number;
+    width:number;
+    height:number;
+};
+
+type MapBounds = {
+    width:number;
+    height:number;
+};
 //pf = require("pathfinding");
 
 /**
@@ -11,12 +27,14 @@ export default class World {
     public width:number;
     public height:number;
     players:Map<string, Player>;
+    socketToPlayerId: Map<string, string>;
     projectiles:Map<number, Projectil>
     roomId:string;
     static socketServer:any;
     static moveScale:number = 4;
     grid:Pathfinding.Grid;
-    objects: any[];
+    objectsByMapId: Map<string, MapObstacle[]>;
+    mapBoundsByMapId: Map<string, MapBounds>;
     //finder:Pathfinding.Finder;
     //grid_backup:Pathfinding.Grid;
     
@@ -32,31 +50,11 @@ export default class World {
         this.width = width;
         this.roomId = (Math.random()*999).toFixed(5).toString();
         this.players = new Map<string, Player>();
+        this.socketToPlayerId = new Map<string, string>();
         this.grid = new Pathfinding.Grid(this.width, this.height)
         this.projectiles = new Map<number, Projectil>();
-        this.objects = [
-            {
-                x:396,
-                y:180,
-                type:"rock0",
-                width:32,
-                height:30
-            },
-            {
-                x:216,
-                y:216,
-                type:"rock0",
-                width:32,
-                height:30
-            },
-            {
-                x:216,
-                y:288,
-                type:"rock0",
-                width:32,
-                height:30
-            }
-        ];
+        this.objectsByMapId = new Map<string, MapObstacle[]>();
+        this.mapBoundsByMapId = new Map<string, MapBounds>();
 
         //this.finder = new Pathfinding.AStarFinder({ diagonalMovement: 1 })
         //this.grid_backup = this.grid.clone()
@@ -72,13 +70,12 @@ export default class World {
      * @param ownerId - The socket ID of the player shooting the projectile.
      */
     shotProjectil(mouse_x:number,mouse_y:number, ownerId:string) {
-        if (this.players.has(ownerId) === false) return;
-        const player = this.players.get(ownerId);
+        const player = this.getPlayerBySocket(ownerId);
         if (player === undefined) return;
         if (player.death === true) return;
         const angle = GameMath.point_direction(player.x,player.y,mouse_x,mouse_y)
         const projectil = new Projectil(player.x,player.y,angle);
-        projectil.ownerId = ownerId;
+        projectil.ownerId = player.socketId;
         this.projectiles.set(projectil.id, projectil);
         World.socketServer.emit("shotProjectil", projectil.data())
     }
@@ -166,18 +163,166 @@ export default class World {
         );
       }
 
+    registerMapDefinitions(
+        mapDefinitions:Array<{
+            mapId:string;
+            width:number;
+            height:number;
+            obstacles:Array<{
+                x:number;
+                y:number;
+                width:number;
+                height:number;
+            }>;
+        }>
+    ) {
+        mapDefinitions.forEach((definition) => {
+            if (typeof definition.mapId !== "string" || definition.mapId.length === 0) {
+                return;
+            }
+
+            if (
+                typeof definition.width === "number" &&
+                Number.isFinite(definition.width) &&
+                definition.width > 0 &&
+                typeof definition.height === "number" &&
+                Number.isFinite(definition.height) &&
+                definition.height > 0
+            ) {
+                this.mapBoundsByMapId.set(definition.mapId, {
+                    width: Math.max(1, Math.round(definition.width)),
+                    height: Math.max(1, Math.round(definition.height))
+                });
+            }
+
+            const sanitizedObstacles = Array.isArray(definition.obstacles)
+                ? definition.obstacles
+                    .filter((obstacle) =>
+                        typeof obstacle?.x === "number" &&
+                        Number.isFinite(obstacle.x) &&
+                        typeof obstacle?.y === "number" &&
+                        Number.isFinite(obstacle.y) &&
+                        typeof obstacle?.width === "number" &&
+                        Number.isFinite(obstacle.width) &&
+                        obstacle.width > 0 &&
+                        typeof obstacle?.height === "number" &&
+                        Number.isFinite(obstacle.height) &&
+                        obstacle.height > 0
+                    )
+                    .map((obstacle) => ({
+                        x: Math.max(0, Math.round(obstacle.x)),
+                        y: Math.max(0, Math.round(obstacle.y)),
+                        width: Math.max(1, Math.round(obstacle.width)),
+                        height: Math.max(1, Math.round(obstacle.height))
+                    }))
+                : [];
+
+            this.objectsByMapId.set(definition.mapId, sanitizedObstacles);
+        });
+    }
+
+    getMapObjects(mapId:string) {
+        return this.objectsByMapId.get(mapId) ?? [];
+    }
+
+    getMapBounds(mapId:string) {
+        return this.mapBoundsByMapId.get(mapId) ?? {
+            width: this.width,
+            height: this.height
+        };
+    }
+
+    clampPlayerPosition(mapId:string, x:number, y:number, playerWidth:number, playerHeight:number) {
+        const mapBounds = this.getMapBounds(mapId);
+        const maxX = Math.max(0, mapBounds.width - playerWidth);
+        const maxY = Math.max(0, mapBounds.height - playerHeight);
+
+        return {
+            x: Math.max(0, Math.min(Math.round(x), maxX)),
+            y: Math.max(0, Math.min(Math.round(y), maxY))
+        };
+    }
+
+    createGridForMap(mapId:string) {
+        const mapBounds = this.getMapBounds(mapId);
+        const gridWidth = Math.max(1, Math.ceil(mapBounds.width / World.moveScale));
+        const gridHeight = Math.max(1, Math.ceil(mapBounds.height / World.moveScale));
+
+        return new Pathfinding.Grid(gridWidth, gridHeight);
+    }
+
     /**
      * Adds a new player to the game world map.
      * @param socketId - The unique socket ID representing the player.
      * @returns True if added successfully, false if the player already exists.
      */
-    addPlayer(socketId:string):boolean {
-        if (this.players.has(socketId) === true) return false;
-        this.players.set(socketId, new Player(100,100,socketId, this));
+    private getAuthenticatedPlayerId(userId:number) {
+        return `user:${userId}`;
+    }
+
+    private getGuestPlayerId(socketId:string) {
+        return `guest:${socketId}`;
+    }
+
+    getPlayerBySocket(socketId:string) {
+        const playerId = this.socketToPlayerId.get(socketId);
+        return playerId ? this.players.get(playerId) : undefined;
+    }
+
+    addPlayer(
+        socketId:string,
+        spawnState?: { mapId?: string; x?: number; y?: number },
+        userId?: number | null
+    ) {
+        const existingPlayerForSocket = this.getPlayerBySocket(socketId);
+        if (existingPlayerForSocket) {
+            return { player: existingPlayerForSocket, created: false };
+        }
+
+        const playerId =
+            typeof userId === "number"
+                ? this.getAuthenticatedPlayerId(userId)
+                : this.getGuestPlayerId(socketId);
+        const existingPlayer = this.players.get(playerId);
+
+        if (existingPlayer) {
+            existingPlayer.attachSocket(socketId);
+            this.socketToPlayerId.set(socketId, playerId);
+            World.socketServer.in(socketId).emit("addPlayer", existingPlayer.data());
+            this.presentObjectsTo(socketId);
+            return { player: existingPlayer, created: false };
+        }
+
+        const mapId =
+            typeof spawnState?.mapId === "string" && spawnState.mapId.length > 0
+                ? spawnState.mapId
+                : DEFAULT_PLAYER_MAP_ID;
+        const unclampedX =
+            typeof spawnState?.x === "number" && Number.isFinite(spawnState.x)
+                ? spawnState.x
+                : DEFAULT_PLAYER_X;
+        const unclampedY =
+            typeof spawnState?.y === "number" && Number.isFinite(spawnState.y)
+                ? spawnState.y
+                : DEFAULT_PLAYER_Y;
+        const spawnPosition = this.clampPlayerPosition(mapId, unclampedX, unclampedY, 32, 32);
+
+        const player = new Player(
+            spawnPosition.x,
+            spawnPosition.y,
+            playerId,
+            this,
+            mapId,
+            socketId,
+            typeof userId === "number" ? userId : null
+        );
+
+        this.players.set(playerId, player);
+        this.socketToPlayerId.set(socketId, playerId);
         console.log("players in map: ", this.players.size);
-        World.socketServer.emit("addPlayer", this.players.get(socketId)?.data());
+        World.socketServer.emit("addPlayer", player.data());
         this.presentObjectsTo(socketId);
-        return true;
+        return { player, created: true };
         
     }
 
@@ -186,8 +331,9 @@ export default class World {
      * @param socketId - The socket ID of the targeted client.
      */
     presentPlayersTo(socketId:string) {
+        const currentPlayerId = this.socketToPlayerId.get(socketId);
         this.players.forEach( (player) => {
-            (player.socketId != socketId) ? World.socketServer.in(socketId).emit("addPlayer", player.data()) : null;
+            (player.socketId != currentPlayerId) ? World.socketServer.in(socketId).emit("addPlayer", player.data()) : null;
         })
     }
 
@@ -197,7 +343,8 @@ export default class World {
      */
     presentObjectsTo(socketId:string) {
         console.log("sending objects to client...")
-        this.objects.forEach( (object) => {
+        const mapId = this.getPlayerBySocket(socketId)?.currentMapId ?? DEFAULT_PLAYER_MAP_ID;
+        this.getMapObjects(mapId).forEach( (object) => {
             World.socketServer.in(socketId).emit("addObject", object)
         })
     }
@@ -207,13 +354,28 @@ export default class World {
      * @param socketId - The socket ID of the player to remove.
      */
     removePlayer(socketId:string) {
-        if (!this.players.has(socketId)) return;
-        let id = this.players.get(socketId)?.id;
-        if (typeof id === "undefined") return;
-        World.socketServer.emit("removePlayer", {playerId: socketId, id:id})
-        this.players.delete(socketId);
-        
-        
+        const playerId = this.socketToPlayerId.get(socketId);
+        if (!playerId) {
+            return { player: null, removed: false };
+        }
+
+        const player = this.players.get(playerId);
+        if (!player) {
+            this.socketToPlayerId.delete(socketId);
+            return { player: null, removed: false };
+        }
+
+        player.detachSocket(socketId);
+        this.socketToPlayerId.delete(socketId);
+
+        if (player.hasActiveSockets()) {
+            return { player, removed: false };
+        }
+
+        World.socketServer.emit("removePlayer", {playerId: player.socketId, id:player.id})
+        this.players.delete(playerId);
+
+        return { player, removed: true };
     }
 
     /**
@@ -230,7 +392,9 @@ export default class World {
     testSocket() {
         console.log("test socket executed. ",this.players.size)
         this.players.forEach( (player) => {
-            World.socketServer.in(player.socketId).emit("test", {test:"hello test!"})
+            player.socketConnections.forEach((socketId) => {
+                World.socketServer.in(socketId).emit("test", {test:"hello test!"})
+            });
         })
         
     }

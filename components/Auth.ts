@@ -17,6 +17,12 @@ export interface AuthSessionState {
     token?:string;
 }
 
+export interface SavedPlayerLocation {
+    mapId:string;
+    x:number;
+    y:number;
+}
+
 interface AuthSuccessResult {
     session: AuthSessionState & {
         authenticated:true;
@@ -164,6 +170,40 @@ export default class Auth {
         return user
             ? { authenticated: true, user }
             : this.unauthenticatedSession();
+    }
+
+    public async getSavedPlayerLocation(userId:number) {
+        const storedLocation = await this.redis.hmGet(this.userKey(userId), [
+            "last_map_id",
+            "last_x",
+            "last_y"
+        ]);
+        const [mapId, x, y] = storedLocation;
+        const parsedX = x === null ? Number.NaN : Number.parseInt(x, 10);
+        const parsedY = y === null ? Number.NaN : Number.parseInt(y, 10);
+
+        if (
+            typeof mapId !== "string" ||
+            mapId.length === 0 ||
+            !Number.isFinite(parsedX) ||
+            !Number.isFinite(parsedY)
+        ) {
+            return null;
+        }
+
+        return {
+            mapId,
+            x: Math.round(parsedX),
+            y: Math.round(parsedY)
+        } satisfies SavedPlayerLocation;
+    }
+
+    public async savePlayerLocation(userId:number, location:SavedPlayerLocation) {
+        await this.redis.hSet(this.userKey(userId), {
+            last_map_id: location.mapId,
+            last_x: String(Math.round(location.x)),
+            last_y: String(Math.round(location.y))
+        });
     }
 
     public async requestPasswordRecovery(payload:RecoverPasswordPayload):Promise<AuthInfoResult | AuthErrorResult> {

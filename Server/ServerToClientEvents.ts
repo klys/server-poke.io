@@ -2,6 +2,7 @@ import type { DesignerObjectsSyncPayload } from "../components/DesignerObjectsSt
 
 interface PlayerData {
   playerId: string;
+  currentMapId: string;
   x: number;
   y: number;
   angle: number;
@@ -34,6 +35,7 @@ interface AuthUserData {
 export default interface ServerToClientEvents {
   addPlayer: (data: PlayerData) => void;
   removePlayer: (data: { playerId: string; id: number }) => void;
+  myPlayer: (data: { playerId: string }) => void;
 
   shotProjectil: (data: ProjectilData) => void;
   explodeProjectil: (data: ProjectilData) => void;
@@ -84,7 +86,16 @@ export default interface ServerToClientEvents {
   "designer:objects:error": (data: { message: string }) => void;
 
   // Dynamic events using template literal types
-  [event: `move${string}`]: (data: { x: number; y: number; angle: number; playerId: string; id: number }) => void;
+  [event: `move${string}`]: (data: {
+    x: number;
+    y: number;
+    angle: number;
+    playerId: string;
+    id: number;
+    currentMapId?: string;
+    teleported?: boolean;
+    stopped?: boolean;
+  }) => void;
   [event: `moveProjectil${string}`]: (data: ProjectilData) => void;
   [event: `playerReborn${string}`]: (data: { playerId: string; id: number }) => void;
   [event: `playerDeath${string}`]: (data: { playerId: string; id: number }) => void;

@@ -53,6 +53,30 @@ function readSocketToken(socket:ServerSocket) {
   return socket.data.token;
 }
 
+async function hydrateSocketAuth(socket:ServerSocket, auth:Auth) {
+  const session = await auth.resolveSession(readSocketToken(socket));
+
+  applySocketAuth(socket.data, session.user);
+
+  if (session.token) {
+    socket.data.token = session.token;
+  }
+
+  return session;
+}
+
+async function hydrateSocketAuthWithToken(
+  socket:ServerSocket,
+  auth:Auth,
+  token?:string
+) {
+  if (typeof token === "string" && token.length > 0) {
+    socket.data.token = token;
+  }
+
+  return hydrateSocketAuth(socket, auth);
+}
+
 const DESIGNER_OBJECTS_ROOM = "designer:objects";
 
 function requireDesignerObjectsAccess(socket:ServerSocket) {
@@ -71,12 +95,7 @@ function createConnectionHandler(world:World, auth:Auth, designerObjectsStore:De
   return (socket:ServerSocket) => {
     console.log("Client connected!", socket.id);
 
-    void auth.resolveSession(readSocketToken(socket)).then((session) => {
-      applySocketAuth(socket.data, session.user);
-      if (session.token) {
-        socket.data.token = session.token;
-      }
-    }).catch((error) => {
+    void hydrateSocketAuth(socket, auth).catch((error) => {
       console.error("Unable to hydrate socket auth state:", error);
     });
 
@@ -295,20 +314,84 @@ function createConnectionHandler(world:World, auth:Auth, designerObjectsStore:De
       }
     });
 
-    socket.on("addPlayer", () => {
+    socket.on("addPlayer", async (data) => {
       console.log("addPlayer");
-      if (world.addPlayer(socket.id)) {
+
+      if (Array.isArray(data?.mapDefinitions) && data.mapDefinitions.length > 0) {
+        world.registerMapDefinitions(data.mapDefinitions);
+      }
+
+      try {
+        if (!socket.data.authenticated && (readSocketToken(socket) || data?.token)) {
+          await hydrateSocketAuthWithToken(socket, auth, data?.token);
+        }
+      } catch (error) {
+        console.error("Unable to hydrate auth before addPlayer:", error);
+      }
+
+      const savedLocation =
+        typeof socket.data.userId === "number"
+          ? await auth.getSavedPlayerLocation(socket.data.userId)
+          : null;
+      const initialMapId =
+        typeof data?.initialMapId === "string" && data.initialMapId.length > 0
+          ? data.initialMapId
+          : undefined;
+      const initialX =
+        typeof data?.initialX === "number" && Number.isFinite(data.initialX)
+          ? Math.round(data.initialX)
+          : undefined;
+      const initialY =
+        typeof data?.initialY === "number" && Number.isFinite(data.initialY)
+          ? Math.round(data.initialY)
+          : undefined;
+      const spawnState = savedLocation ?? { mapId: initialMapId, x: initialX, y: initialY };
+
+      const playerRegistration = world.addPlayer(
+        socket.id,
+        spawnState,
+        socket.data.userId ?? null
+      );
+
+      if (playerRegistration.player) {
+        socket.emit("myPlayer", { playerId: playerRegistration.player.socketId });
         world.presentPlayersTo(socket.id);
-        world.presentObjectsTo(socket.id);
       }
     });
 
     socket.on("move", (data) => {
       const { x, y } = data;
-      const player = world.players.get(socket.id);
+      const player = world.getPlayerBySocket(socket.id);
       if (!player) return;
       console.log(socket.id+" moving to "+x+" and "+y);
       player.findPath(world, x,y);
+      world.players.set(player.socketId, player);
+    });
+
+    socket.on("stopMove", () => {
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player) return;
+
+      player.stopMovement();
+      world.players.set(player.socketId, player);
+    });
+
+    socket.on("player:teleport", (data) => {
+      const player = world.getPlayerBySocket(socket.id);
+
+      if (
+        !player ||
+        typeof data?.mapId !== "string" ||
+        data.mapId.length === 0 ||
+        typeof data?.x !== "number" ||
+        !Number.isFinite(data.x) ||
+        typeof data?.y !== "number" ||
+        !Number.isFinite(data.y)
+      ) {
+        return;
+      }
+
+      player.teleport(data.mapId, data.x, data.y);
       world.players.set(player.socketId, player);
     });
 
@@ -317,8 +400,28 @@ function createConnectionHandler(world:World, auth:Auth, designerObjectsStore:De
       world.shotProjectil(data.mouse_x,data.mouse_y, socket.id);
     });
 
-    socket.on("disconnect", (reason) => {
+    socket.on("disconnect", async (reason) => {
       console.log(reason);
+
+      const player = world.getPlayerBySocket(socket.id);
+      const shouldPersistLocation =
+        Boolean(player) &&
+        typeof socket.data.userId === "number" &&
+        player?.socketConnections.size === 1 &&
+        player.socketConnections.has(socket.id);
+
+      if (player && shouldPersistLocation && typeof socket.data.userId === "number") {
+        try {
+          await auth.savePlayerLocation(socket.data.userId, {
+            mapId: player.currentMapId,
+            x: player.x,
+            y: player.y
+          });
+        } catch (error) {
+          console.error("Unable to save player location on disconnect:", error);
+        }
+      }
+
       world.removePlayer(socket.id);
     });
   };
