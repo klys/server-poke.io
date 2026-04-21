@@ -2,6 +2,7 @@ import Player from "./player"
 import Projectil from "./projectil"
 import GameMath from "./gameMath";
 import Pathfinding = require("pathfinding")
+import type { PlayableMapsStateSnapshot } from "./PlayableMapsState";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -35,6 +36,7 @@ export default class World {
     grid:Pathfinding.Grid;
     objectsByMapId: Map<string, MapObstacle[]>;
     mapBoundsByMapId: Map<string, MapBounds>;
+    playableMapsState: PlayableMapsStateSnapshot | null;
     //finder:Pathfinding.Finder;
     //grid_backup:Pathfinding.Grid;
     
@@ -55,6 +57,7 @@ export default class World {
         this.projectiles = new Map<number, Projectil>();
         this.objectsByMapId = new Map<string, MapObstacle[]>();
         this.mapBoundsByMapId = new Map<string, MapBounds>();
+        this.playableMapsState = null;
 
         //this.finder = new Pathfinding.AStarFinder({ diagonalMovement: 1 })
         //this.grid_backup = this.grid.clone()
@@ -225,6 +228,14 @@ export default class World {
         return this.objectsByMapId.get(mapId) ?? [];
     }
 
+    setPlayableMapsState(playableMapsState: PlayableMapsStateSnapshot) {
+        this.playableMapsState = playableMapsState;
+    }
+
+    getPlayableMapsState() {
+        return this.playableMapsState;
+    }
+
     getMapBounds(mapId:string) {
         return this.mapBoundsByMapId.get(mapId) ?? {
             width: this.width,
@@ -335,6 +346,29 @@ export default class World {
         this.players.forEach( (player) => {
             (player.socketId != currentPlayerId) ? World.socketServer.in(socketId).emit("addPlayer", player.data()) : null;
         })
+    }
+
+    presentPlayersOnMapTo(socketId:string, mapId:string) {
+        const currentPlayerId = this.socketToPlayerId.get(socketId);
+        this.players.forEach((player) => {
+            if (player.socketId === currentPlayerId || player.currentMapId !== mapId) {
+                return;
+            }
+
+            World.socketServer.in(socketId).emit("addPlayer", player.data());
+        });
+    }
+
+    presentPlayerToMap(player:Player, mapId = player.currentMapId) {
+        this.players.forEach((targetPlayer) => {
+            if (targetPlayer.socketId === player.socketId || targetPlayer.currentMapId !== mapId) {
+                return;
+            }
+
+            targetPlayer.socketConnections.forEach((socketId) => {
+                World.socketServer.in(socketId).emit("addPlayer", player.data());
+            });
+        });
     }
 
     /**

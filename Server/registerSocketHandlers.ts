@@ -1,6 +1,13 @@
 import { type Server, type Socket } from "socket.io";
 import Auth, { type AuthenticatedUser } from "../components/Auth";
 import DesignerObjectsStore from "../components/DesignerObjectsStore";
+import PlayableMapsStore, {
+  applyPlayableMapsStateToWorld,
+  type PlayableMapsSyncPayload,
+} from "../components/PlayableMapsStore";
+import {
+  resolveInitialSpawnFromPlayableMapsState,
+} from "../components/PlayableMapsState";
 import World from "../components/world";
 import ClientToServerEvents from "./ClientToServerEvents";
 import InterServerEvents from "./InterServerEvents";
@@ -78,20 +85,77 @@ async function hydrateSocketAuthWithToken(
 }
 
 const DESIGNER_OBJECTS_ROOM = "designer:objects";
+const DESIGNER_MAPS_ROOM = "designer:maps";
 
-function requireDesignerObjectsAccess(socket:ServerSocket) {
+function requireDesignerAccess(
+  socket:ServerSocket,
+  errorEvent: "designer:objects:error" | "playableMaps:error",
+  message:string
+) {
   if (socket.data.authenticated) {
     return true;
   }
 
-  socket.emit("designer:objects:error", {
-    message: "You must be authenticated to use the map objects designer."
-  });
-
+  socket.emit(errorEvent, { message });
   return false;
 }
 
-function createConnectionHandler(world:World, auth:Auth, designerObjectsStore:DesignerObjectsStore) {
+function requireDesignerObjectsAccess(socket:ServerSocket) {
+  return requireDesignerAccess(
+    socket,
+    "designer:objects:error",
+    "You must be authenticated to use the map objects designer."
+  );
+}
+
+function requireDesignerMapsAccess(socket:ServerSocket) {
+  return requireDesignerAccess(
+    socket,
+    "playableMaps:error",
+    "You must be authenticated to use the map designer."
+  );
+}
+
+function emitPlayableMapsVersion(
+  ioOrSocket:TypedSocketServer | ServerSocket,
+  payload:PlayableMapsSyncPayload | null
+) {
+  ioOrSocket.emit("playableMaps:version", {
+    hasState: Boolean(payload),
+    version: payload?.version ?? null,
+    updatedAt: payload?.updatedAt ?? null
+  });
+}
+
+async function emitPlayableMapsSyncIfStale(
+  socket:ServerSocket,
+  playableMapsStore:PlayableMapsStore,
+  world:World,
+  clientVersion?:number | null
+) {
+  const payload = await playableMapsStore.read();
+
+  applyPlayableMapsStateToWorld(world, payload);
+
+  if (!payload) {
+    emitPlayableMapsVersion(socket, null);
+    return;
+  }
+
+  if (typeof clientVersion === "number" && clientVersion === payload.version) {
+    emitPlayableMapsVersion(socket, payload);
+    return;
+  }
+
+  socket.emit("playableMaps:state", payload);
+}
+
+function createConnectionHandler(
+  world:World,
+  auth:Auth,
+  designerObjectsStore:DesignerObjectsStore,
+  playableMapsStore:PlayableMapsStore
+) {
   return (socket:ServerSocket) => {
     console.log("Client connected!", socket.id);
 
@@ -314,14 +378,81 @@ function createConnectionHandler(world:World, auth:Auth, designerObjectsStore:De
       }
     });
 
+    socket.on("playableMaps:sync", async (data) => {
+      try {
+        await emitPlayableMapsSyncIfStale(socket, playableMapsStore, world, data?.version ?? null);
+      } catch (error) {
+        console.error("Unable to sync playable maps state:", error);
+        socket.emit("playableMaps:error", {
+          message: "Unable to sync playable maps state."
+        });
+      }
+    });
+
+    socket.on("designer:maps:join", async (data) => {
+      if (!requireDesignerMapsAccess(socket)) {
+        return;
+      }
+
+      socket.join(DESIGNER_MAPS_ROOM);
+
+      try {
+        const payload = await playableMapsStore.getOrCreate(data?.seedState);
+        applyPlayableMapsStateToWorld(world, payload);
+
+        if (!payload) {
+          socket.emit("playableMaps:error", {
+            message: "No playable map state has been saved on the server yet."
+          });
+          return;
+        }
+
+        socket.emit("playableMaps:state", payload);
+      } catch (error) {
+        console.error("Unable to load playable maps state:", error);
+        socket.emit("playableMaps:error", {
+          message: "Unable to load the playable maps state."
+        });
+      }
+    });
+
+    socket.on("designer:maps:leave", () => {
+      socket.leave(DESIGNER_MAPS_ROOM);
+    });
+
+    socket.on("designer:maps:update", async (data) => {
+      if (!requireDesignerMapsAccess(socket)) {
+        return;
+      }
+
+      socket.join(DESIGNER_MAPS_ROOM);
+
+      try {
+        const payload = await playableMapsStore.save(
+          data.state,
+          socket.data.userId ?? null,
+          socket.data.username ?? null
+        );
+
+        applyPlayableMapsStateToWorld(world, payload);
+        socket.emit("playableMaps:state", payload);
+        socket.broadcast.to(DESIGNER_MAPS_ROOM).emit("playableMaps:state", payload);
+        emitPlayableMapsVersion(World.socketServer, payload);
+      } catch (error) {
+        console.error("Unable to save playable maps state:", error);
+        socket.emit("playableMaps:error", {
+          message: "Unable to save the playable maps state."
+        });
+      }
+    });
+
     socket.on("addPlayer", async (data) => {
       console.log("addPlayer");
 
-      if (Array.isArray(data?.mapDefinitions) && data.mapDefinitions.length > 0) {
-        world.registerMapDefinitions(data.mapDefinitions);
-      }
-
       try {
+        const playableMapsPayload = await playableMapsStore.read();
+        applyPlayableMapsStateToWorld(world, playableMapsPayload);
+
         if (!socket.data.authenticated && (readSocketToken(socket) || data?.token)) {
           await hydrateSocketAuthWithToken(socket, auth, data?.token);
         }
@@ -333,19 +464,11 @@ function createConnectionHandler(world:World, auth:Auth, designerObjectsStore:De
         typeof socket.data.userId === "number"
           ? await auth.getSavedPlayerLocation(socket.data.userId)
           : null;
-      const initialMapId =
-        typeof data?.initialMapId === "string" && data.initialMapId.length > 0
-          ? data.initialMapId
-          : undefined;
-      const initialX =
-        typeof data?.initialX === "number" && Number.isFinite(data.initialX)
-          ? Math.round(data.initialX)
-          : undefined;
-      const initialY =
-        typeof data?.initialY === "number" && Number.isFinite(data.initialY)
-          ? Math.round(data.initialY)
-          : undefined;
-      const spawnState = savedLocation ?? { mapId: initialMapId, x: initialX, y: initialY };
+      const authoritativePlayableMapsState = world.getPlayableMapsState();
+      const sharedSpawnState = authoritativePlayableMapsState
+        ? resolveInitialSpawnFromPlayableMapsState(authoritativePlayableMapsState)
+        : null;
+      const spawnState = savedLocation ?? sharedSpawnState ?? undefined;
 
       const playerRegistration = world.addPlayer(
         socket.id,
@@ -393,6 +516,10 @@ function createConnectionHandler(world:World, auth:Auth, designerObjectsStore:De
 
       player.teleport(data.mapId, data.x, data.y);
       world.players.set(player.socketId, player);
+      world.presentPlayerToMap(player);
+      player.socketConnections.forEach((socketId) => {
+        world.presentPlayersOnMapTo(socketId, player.currentMapId);
+      });
     });
 
     socket.on("shotProjectil", (data) => {
@@ -431,7 +558,8 @@ export default function registerSocketHandlers(
   io:TypedSocketServer,
   world:World,
   auth:Auth,
-  designerObjectsStore:DesignerObjectsStore
+  designerObjectsStore:DesignerObjectsStore,
+  playableMapsStore:PlayableMapsStore
 ) {
-  io.on("connection", createConnectionHandler(world, auth, designerObjectsStore));
+  io.on("connection", createConnectionHandler(world, auth, designerObjectsStore, playableMapsStore));
 }

@@ -1,4 +1,8 @@
 import type { DesignerObjectsSyncPayload } from "../components/DesignerObjectsStore";
+import type {
+  PlayableMapsSyncPayload,
+  PlayableMapsVersionPayload
+} from "../components/PlayableMapsStore";
 
 interface PlayerData {
   playerId: string;
@@ -84,6 +88,22 @@ export default interface ServerToClientEvents {
    * Collaborative editor error for `/designer/objects`.
    */
   "designer:objects:error": (data: { message: string }) => void;
+
+  /**
+   * Latest authoritative playable map snapshot used by the multiplayer renderer.
+   */
+  "playableMaps:state": (data: PlayableMapsSyncPayload) => void;
+
+  /**
+   * Lightweight playable map cache metadata. Clients compare this with
+   * localStorage and request `playableMaps:sync` when it differs.
+   */
+  "playableMaps:version": (data: PlayableMapsVersionPayload) => void;
+
+  /**
+   * Playable map sync error for both game clients and the designer.
+   */
+  "playableMaps:error": (data: { message: string }) => void;
 
   // Dynamic events using template literal types
   [event: `move${string}`]: (data: {

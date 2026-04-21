@@ -3,6 +3,7 @@ import Auth from "./components/Auth";
 import DBInit from "./components/DBInit";
 import DesignerObjectsStore from "./components/DesignerObjectsStore";
 import MailService from "./components/MailService";
+import PlayableMapsStore from "./components/PlayableMapsStore";
 import World from "./components/world"
 import {Server} from "socket.io"
 import { createServer } from "http";
@@ -32,11 +33,12 @@ async function bootstrap() {
   await mailService.initialize();
   const auth = new Auth(redis, mailService);
   const designerObjectsStore = new DesignerObjectsStore(redis);
+  const playableMapsStore = new PlayableMapsStore(redis);
   const world = new World(400,400);
 
   await auth.initialize();
   world.setSocketServer(io);
-  registerSocketHandlers(io, world, auth, designerObjectsStore);
+  registerSocketHandlers(io, world, auth, designerObjectsStore, playableMapsStore);
 
   httpServer.listen(PORT, () => {
     console.log("Listening on port "+PORT);

@@ -2,6 +2,7 @@ import type {
   DesignerObjectsJoinPayload,
   DesignerObjectsUpdatePayload
 } from "../components/DesignerObjectsStore";
+import type { PlayableMapsStateSnapshot } from "../components/PlayableMapsState";
 
 interface AuthRegisterPayload {
   name: string;
@@ -36,24 +37,12 @@ interface AuthResetPasswordPayload {
   password: string;
 }
 
-interface AddPlayerMapDefinition {
-  mapId: string;
-  width: number;
-  height: number;
-  obstacles: Array<{
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  }>;
+interface PlayableMapsSyncRequestPayload {
+  version?: number | null;
 }
 
 export default interface ClientToServerEvents {
   addPlayer: (data?: {
-    initialMapId?: string;
-    initialX?: number;
-    initialY?: number;
-    mapDefinitions?: AddPlayerMapDefinition[];
     token?: string;
   }) => void;
   "player:teleport": (data: { mapId: string; x: number; y: number }) => void;
@@ -138,4 +127,26 @@ export default interface ClientToServerEvents {
    * The server persists the payload in Redis and broadcasts it to everyone in the room.
    */
   "designer:objects:update": (data: DesignerObjectsUpdatePayload) => void;
+
+  /**
+   * Requests the authoritative playable map state if the server version differs
+   * from the client's cached version.
+   */
+  "playableMaps:sync": (data?: PlayableMapsSyncRequestPayload) => void;
+
+  /**
+   * Joins the authenticated map designer sync channel.
+   * `seedState` is only used to bootstrap Redis when no server map state exists yet.
+   */
+  "designer:maps:join": (data?: { seedState?: PlayableMapsStateSnapshot }) => void;
+
+  /**
+   * Leaves the authenticated map designer sync channel.
+   */
+  "designer:maps:leave": () => void;
+
+  /**
+   * Persists the full playable maps snapshot to Redis and publishes a new version.
+   */
+  "designer:maps:update": (data: { state: PlayableMapsStateSnapshot }) => void;
 }

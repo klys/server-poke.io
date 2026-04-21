@@ -1,0 +1,63 @@
+{
+    "emeraldwalk.runonsave": {
+        "commands": [
+            {
+                "match": "\\\\core\\\\",
+                "cmd": "syncdir C:\\Users\\a3073318\\Dev\\nodejs\\Frontend_BBFB_Sys\\src\\core C:\\Users\\a3073318\\Dev\\nodejs\\voy5_desktop_electron\\src\\renderer\\core"
+            },
+            {
+                "match": "\\\\global\\\\",
+                "cmd": "syncdir C:\\Users\\a3073318\\Dev\\nodejs\\Frontend_BBFB_Sys\\src\\global C:\\Users\\a3073318\\Dev\\nodejs\\voy5_desktop_electron\\src\\renderer\\global"
+            },
+            {
+                "match": "\\\\inventory\\\\",
+                "cmd": "syncdir C:\\Users\\a3073318\\Dev\\nodejs\\Frontend_BBFB_Sys\\src\\inventory C:\\Users\\a3073318\\Dev\\nodejs\\voy5_desktop_electron\\src\\renderer\\inventory"
+            },
+            {
+                "match": "\\\\main\\\\",
+                "cmd": "syncdir C:\\Users\\a3073318\\Dev\\nodejs\\Frontend_BBFB_Sys\\src\\main C:\\Users\\a3073318\\Dev\\nodejs\\voy5_desktop_electron\\src\\renderer\\main"
+            },
+            {
+                "match": "\\\\support\\\\",
+                "cmd": "syncdir C:\\Users\\a3073318\\Dev\\nodejs\\Frontend_BBFB_Sys\\src\\support C:\\Users\\a3073318\\Dev\\nodejs\\voy5_desktop_electron\\src\\renderer\\support"
+            },
+            {
+                "match": "\\\\weather\\\\",
+                "cmd": "syncdir C:\\Users\\a3073318\\Dev\\nodejs\\Frontend_BBFB_Sys\\src\\weather C:\\Users\\a3073318\\Dev\\nodejs\\voy5_desktop_electron\\src\\renderer\\weather"
+            },
+            {
+                "match": "\\\\biz\\\\",
+                "cmd": "syncdir C:\\Users\\a3073318\\Dev\\nodejs\\Frontend_BBFB_Sys\\src\\biz C:\\Users\\a3073318\\Dev\\nodejs\\voy5_desktop_electron\\src\\renderer\\biz"
+            }
+        ]
+    },
+    "workbench.colorCustomizations": {
+        "activityBar.activeBackground": "#fa1b49",
+        "activityBar.background": "#fa1b49",
+        "activityBar.foreground": "#e7e7e7",
+        "activityBar.inactiveForeground": "#e7e7e799",
+        "activityBarBadge.background": "#155e02",
+        "activityBarBadge.foreground": "#e7e7e7",
+        "commandCenter.border": "#e7e7e799",
+        "sash.hoverBorder": "#fa1b49",
+        "statusBar.background": "#dd0531",
+        "statusBar.foreground": "#e7e7e7",
+        "statusBarItem.hoverBackground": "#fa1b49",
+        "statusBarItem.remoteBackground": "#dd0531",
+        "statusBarItem.remoteForeground": "#e7e7e7",
+        "titleBar.activeBackground": "#dd0531",
+        "titleBar.activeForeground": "#e7e7e7",
+        "titleBar.inactiveBackground": "#dd053199",
+        "titleBar.inactiveForeground": "#e7e7e799"
+    },
+    "[javascript]": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "vscode.typescript-language-features"
+    },
+    "[typescript]": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "esbenp.prettier-vscode"
+    },
+    "peacock.remoteColor": "#dd0531",
+    "prettier.configPath": ".prettierrc.mjs"
+}
