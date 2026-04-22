@@ -1,6 +1,8 @@
 import World from "./world"
 import GameMath from "./gameMath";
 
+const PLAYER_MOVE_INTERVAL_MS = 28;
+
 /**
  * Represents a player entity in the game world.
  */
@@ -67,7 +69,7 @@ export default class Player {
         this.sPath_pos = 0;*/
         //setInterval(this.mFinder.bind(this), 1)
 
-        setInterval(this.move.bind(this), 1)
+        setInterval(this.move.bind(this), PLAYER_MOVE_INTERVAL_MS)
     }
 
     public attachSocket(socketId:string) {
