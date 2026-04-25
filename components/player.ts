@@ -117,6 +117,17 @@ export default class Player {
 
         if (colliding) {
             console.log("colliding: unable to move." ,{x:toX,y:toY})
+            this.path = [];
+            this.path_pos = 0;
+            World.socketServer.emit("move"+this.socketId, {
+                x:this.x,
+                y:this.y,
+                angle:this.angle,
+                playerId:this.socketId,
+                id:this.id,
+                currentMapId:this.currentMapId,
+                stopped:true
+            })
             return;
         }
 
@@ -220,7 +231,7 @@ export default class Player {
     }
 
     public teleport(mapId:string, x:number, y:number) {
-        const nextPosition = this.world.clampPlayerPosition(mapId, x, y, this.width, this.height);
+        const nextPosition = this.world.resolveOpenPlayerPosition(mapId, x, y, this.width, this.height);
 
         this.currentMapId = mapId;
         this.x = nextPosition.x;

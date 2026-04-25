@@ -254,6 +254,83 @@ export default class World {
         };
     }
 
+    private isPlayerPositionBlocked(
+        mapId:string,
+        x:number,
+        y:number,
+        playerWidth:number,
+        playerHeight:number
+    ) {
+        const playerBounds = {
+            x,
+            y,
+            width: playerWidth,
+            height: playerHeight
+        };
+
+        return this.getMapObjects(mapId).some((object) => this.checkCollision(playerBounds, object));
+    }
+
+    resolveOpenPlayerPosition(
+        mapId:string,
+        x:number,
+        y:number,
+        playerWidth:number,
+        playerHeight:number
+    ) {
+        const mapBounds = this.getMapBounds(mapId);
+        const maxX = Math.max(0, mapBounds.width - playerWidth);
+        const maxY = Math.max(0, mapBounds.height - playerHeight);
+        const requestedPosition = this.clampPlayerPosition(mapId, x, y, playerWidth, playerHeight);
+
+        if (!this.isPlayerPositionBlocked(
+            mapId,
+            requestedPosition.x,
+            requestedPosition.y,
+            playerWidth,
+            playerHeight
+        )) {
+            return requestedPosition;
+        }
+
+        const stepSize = Math.max(1, Math.min(playerWidth, playerHeight));
+        const maxRadius = Math.ceil(Math.max(maxX, maxY) / stepSize);
+
+        for (let radius = 1; radius <= maxRadius; radius += 1) {
+            for (let offsetX = -radius; offsetX <= radius; offsetX += 1) {
+                for (let offsetY = -radius; offsetY <= radius; offsetY += 1) {
+                    if (Math.max(Math.abs(offsetX), Math.abs(offsetY)) !== radius) {
+                        continue;
+                    }
+
+                    const candidateX = Math.max(
+                        0,
+                        Math.min(requestedPosition.x + offsetX * stepSize, maxX)
+                    );
+                    const candidateY = Math.max(
+                        0,
+                        Math.min(requestedPosition.y + offsetY * stepSize, maxY)
+                    );
+
+                    if (!this.isPlayerPositionBlocked(
+                        mapId,
+                        candidateX,
+                        candidateY,
+                        playerWidth,
+                        playerHeight
+                    )) {
+                        return {
+                            x: candidateX,
+                            y: candidateY
+                        };
+                    }
+                }
+            }
+        }
+
+        return requestedPosition;
+    }
+
     createGridForMap(mapId:string) {
         const mapBounds = this.getMapBounds(mapId);
         const gridWidth = Math.max(1, Math.ceil(mapBounds.width / World.moveScale));
@@ -316,7 +393,7 @@ export default class World {
             typeof spawnState?.y === "number" && Number.isFinite(spawnState.y)
                 ? spawnState.y
                 : DEFAULT_PLAYER_Y;
-        const spawnPosition = this.clampPlayerPosition(mapId, unclampedX, unclampedY, 32, 32);
+        const spawnPosition = this.resolveOpenPlayerPosition(mapId, unclampedX, unclampedY, 32, 32);
 
         const player = new Player(
             spawnPosition.x,
