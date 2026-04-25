@@ -22,6 +22,7 @@ export interface DesignerSectionItem {
   category: string;
   details: DesignerItemDetail[];
   mapObjectAsset?: unknown;
+  skillGfxProfile?: unknown;
   pokemonProfile?: unknown;
   pokemonSkillProfile?: unknown;
 }
