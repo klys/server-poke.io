@@ -1,4 +1,7 @@
-import type { DesignerObjectsSyncPayload } from "../components/DesignerObjectsStore";
+import type {
+  DesignerSectionSyncPayload,
+  DesignerSectionVersionPayload
+} from "../components/DesignerSectionStore";
 import type {
   PlayableMapsSyncPayload,
   PlayableMapsVersionPayload
@@ -79,15 +82,20 @@ export default interface ServerToClientEvents {
   "auth:error": (data: { message: string }) => void;
 
   /**
-   * Full authoritative `/designer/objects` editor snapshot loaded from Redis.
+   * Full authoritative designer section snapshot loaded from Redis.
    * The same event is used for the initial hydration and for live rebroadcasts after edits.
    */
-  "designer:objects:state": (data: DesignerObjectsSyncPayload) => void;
+  "designer:section:state": (data: DesignerSectionSyncPayload) => void;
 
   /**
-   * Collaborative editor error for `/designer/objects`.
+   * Lightweight designer section cache metadata.
    */
-  "designer:objects:error": (data: { message: string }) => void;
+  "designer:section:version": (data: DesignerSectionVersionPayload) => void;
+
+  /**
+   * Collaborative editor error for designer sections.
+   */
+  "designer:section:error": (data: { message: string }) => void;
 
   /**
    * Latest authoritative playable map snapshot used by the multiplayer renderer.

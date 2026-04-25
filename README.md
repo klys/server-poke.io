@@ -61,9 +61,9 @@ The server listens on port **3001** by default.
 | `addPlayer` | `void` | Request to join the game world. |
 | `move` | `{ x: number, y: number }` | Request to move to specific coordinates. Triggers server-side pathfinding. |
 | `shotProjectil` | `{ mouse_x: number, mouse_y: number }` | Fire a projectile towards the mouse coordinates. |
-| `designer:objects:join` | `{ seedState?: DesignerObjectsSectionState }` | Join the collaborative `/designer/objects` room and hydrate the latest Redis-backed snapshot. The optional `seedState` is used only when Redis has no saved state yet. |
-| `designer:objects:update` | `{ state: DesignerObjectsSectionState }` | Replace the shared `/designer/objects` editor state, persist it to Redis, and broadcast it to all watchers immediately. |
-| `designer:objects:leave` | `void` | Leave the collaborative `/designer/objects` room when the client navigates away. |
+| `designer:section:join` | `{ sectionKey, version?, seedState? }` | Join a collaborative designer section room and hydrate the latest Redis-backed snapshot when the client cache is stale. |
+| `designer:section:update` | `{ sectionKey, state }` | Replace a shared designer section state, persist it to Redis with a new version, and broadcast it to all watchers immediately. |
+| `designer:section:leave` | `{ sectionKey }` | Leave a collaborative designer section room when the client navigates away. |
 | `disconnect` | `void` | Standard socket event when a client drops connection. |
 
 ### Server -> Client Events
@@ -80,8 +80,9 @@ The server listens on port **3001** by default.
 | `playerHurt` | `{ playerId, life, id }` | Sent when a player takes damage. |
 | `playerDeath` | `{ playerId, id }` | Sent when a player's life reaches 0. |
 | `playerReborn` | `{ playerId, id }` | Sent when a player respawns after the wait time. |
-| `designer:objects:state` | `DesignerObjectsSyncPayload` | Full authoritative `/designer/objects` snapshot sent on join and after each collaborative update. |
-| `designer:objects:error` | `{ message: string }` | Non-fatal collaborative editor error for the `/designer/objects` experience. |
+| `designer:section:state` | `DesignerSectionSyncPayload` | Full authoritative designer section snapshot sent on join and after each collaborative update. |
+| `designer:section:version` | `DesignerSectionVersionPayload` | Lightweight cache metadata when the client already has the current section state. |
+| `designer:section:error` | `{ message: string }` | Non-fatal collaborative editor error for designer sections. |
 
 ## ⚙️ Game Logic Details
 
@@ -178,16 +179,16 @@ Stores the authoritative state for the `/designer/objects` editor so all connect
   }
   ```
 
-## 🤝 Designer Objects Collaboration
+## 🤝 Designer Section Collaboration
 
-The `/designer/objects` page now uses a dedicated real-time collaboration flow:
+Designer sections such as Pokemons, Objects, Regions, Items, Skills, Players, and NPCs use a shared real-time collaboration flow:
 
-1. The authenticated client emits `designer:objects:join` when the page opens.
-2. The server loads `designer:section:objects` from Redis, creating it from the provided seed state when it does not exist yet.
-3. The server returns the authoritative snapshot through `designer:objects:state`.
-4. Every create/edit/delete/category change emits `designer:objects:update` with the full editor state.
-5. The server persists the new snapshot in Redis and rebroadcasts `designer:objects:state` to every socket in the `designer:objects` room.
-6. Clients update instantly, so multiple users on `/designer/objects` stay in sync without refreshing.
+1. The authenticated client emits `designer:section:join` with a `sectionKey` and cached `version` when the page opens.
+2. The server loads `designer:section:{sectionKey}` from Redis, creating an empty section or migrating a provided seed state only when no server state exists yet.
+3. The server returns `designer:section:state` when the cache is stale, or `designer:section:version` when the client is already current.
+4. Every create/edit/delete/category change emits `designer:section:update` with the full editor state.
+5. The server persists the new snapshot in Redis with an incremented version and rebroadcasts `designer:section:state` to every socket in the section room.
+6. Clients update instantly, so multiple users on the same designer section stay in sync without refreshing.
 
 
 ## 📝 Development Notes

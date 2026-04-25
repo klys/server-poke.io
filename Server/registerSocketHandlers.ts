@@ -1,6 +1,10 @@
 import { type Server, type Socket } from "socket.io";
 import Auth, { type AuthenticatedUser } from "../components/Auth";
-import DesignerObjectsStore from "../components/DesignerObjectsStore";
+import DesignerSectionStore, {
+  isDesignerSectionKey,
+  type DesignerSectionKey,
+  type DesignerSectionSyncPayload,
+} from "../components/DesignerSectionStore";
 import PlayableMapsStore, {
   applyPlayableMapsStateToWorld,
   type PlayableMapsSyncPayload,
@@ -84,12 +88,11 @@ async function hydrateSocketAuthWithToken(
   return hydrateSocketAuth(socket, auth);
 }
 
-const DESIGNER_OBJECTS_ROOM = "designer:objects";
 const DESIGNER_MAPS_ROOM = "designer:maps";
 
 function requireDesignerAccess(
   socket:ServerSocket,
-  errorEvent: "designer:objects:error" | "playableMaps:error",
+  errorEvent: "designer:section:error" | "playableMaps:error",
   message:string
 ) {
   if (socket.data.authenticated) {
@@ -100,11 +103,11 @@ function requireDesignerAccess(
   return false;
 }
 
-function requireDesignerObjectsAccess(socket:ServerSocket) {
+function requireDesignerSectionAccess(socket:ServerSocket) {
   return requireDesignerAccess(
     socket,
-    "designer:objects:error",
-    "You must be authenticated to use the map objects designer."
+    "designer:section:error",
+    "You must be authenticated to use the designer."
   );
 }
 
@@ -121,6 +124,23 @@ function emitPlayableMapsVersion(
   payload:PlayableMapsSyncPayload | null
 ) {
   ioOrSocket.emit("playableMaps:version", {
+    hasState: Boolean(payload),
+    version: payload?.version ?? null,
+    updatedAt: payload?.updatedAt ?? null
+  });
+}
+
+function getDesignerSectionRoom(sectionKey:DesignerSectionKey) {
+  return `designer:section:${sectionKey}`;
+}
+
+function emitDesignerSectionVersion(
+  socket:ServerSocket,
+  payload:DesignerSectionSyncPayload | null,
+  sectionKey:DesignerSectionKey
+) {
+  socket.emit("designer:section:version", {
+    sectionKey,
     hasState: Boolean(payload),
     version: payload?.version ?? null,
     updatedAt: payload?.updatedAt ?? null
@@ -153,7 +173,7 @@ async function emitPlayableMapsSyncIfStale(
 function createConnectionHandler(
   world:World,
   auth:Auth,
-  designerObjectsStore:DesignerObjectsStore,
+  designerSectionStore:DesignerSectionStore,
   playableMapsStore:PlayableMapsStore
 ) {
   return (socket:ServerSocket) => {
@@ -332,48 +352,76 @@ function createConnectionHandler(
       }
     });
 
-    socket.on("designer:objects:join", async (data) => {
-      if (!requireDesignerObjectsAccess(socket)) {
+    socket.on("designer:section:join", async (data) => {
+      if (!requireDesignerSectionAccess(socket)) {
         return;
       }
 
-      socket.join(DESIGNER_OBJECTS_ROOM);
+      if (!isDesignerSectionKey(data?.sectionKey)) {
+        socket.emit("designer:section:error", {
+          message: "Unknown designer section."
+        });
+        return;
+      }
+
+      const sectionKey = data.sectionKey;
+      socket.join(getDesignerSectionRoom(sectionKey));
 
       try {
-        const payload = await designerObjectsStore.getOrCreate(data?.seedState);
-        socket.emit("designer:objects:state", payload);
+        const payload = await designerSectionStore.getOrCreate(sectionKey, data?.seedState);
+
+        if (typeof data?.version === "number" && data.version === payload.version) {
+          emitDesignerSectionVersion(socket, payload, sectionKey);
+          return;
+        }
+
+        socket.emit("designer:section:state", payload);
       } catch (error) {
-        console.error("Unable to load designer objects state:", error);
-        socket.emit("designer:objects:error", {
-          message: "Unable to load the collaborative map objects state."
+        console.error(`Unable to load designer ${sectionKey} state:`, error);
+        socket.emit("designer:section:error", {
+          message: "Unable to load the collaborative designer state."
         });
       }
     });
 
-    socket.on("designer:objects:leave", () => {
-      socket.leave(DESIGNER_OBJECTS_ROOM);
-    });
-
-    socket.on("designer:objects:update", async (data) => {
-      if (!requireDesignerObjectsAccess(socket)) {
+    socket.on("designer:section:leave", (data) => {
+      if (!isDesignerSectionKey(data?.sectionKey)) {
         return;
       }
 
-      socket.join(DESIGNER_OBJECTS_ROOM);
+      socket.leave(getDesignerSectionRoom(data.sectionKey));
+    });
+
+    socket.on("designer:section:update", async (data) => {
+      if (!requireDesignerSectionAccess(socket)) {
+        return;
+      }
+
+      if (!isDesignerSectionKey(data?.sectionKey)) {
+        socket.emit("designer:section:error", {
+          message: "Unknown designer section."
+        });
+        return;
+      }
+
+      const sectionKey = data.sectionKey;
+      const room = getDesignerSectionRoom(sectionKey);
+      socket.join(room);
 
       try {
-        const payload = await designerObjectsStore.save(
+        const payload = await designerSectionStore.save(
+          sectionKey,
           data.state,
           socket.data.userId ?? null,
           socket.data.username ?? null
         );
 
-        socket.emit("designer:objects:state", payload);
-        socket.broadcast.to(DESIGNER_OBJECTS_ROOM).emit("designer:objects:state", payload);
+        socket.emit("designer:section:state", payload);
+        socket.broadcast.to(room).emit("designer:section:state", payload);
       } catch (error) {
-        console.error("Unable to save designer objects state:", error);
-        socket.emit("designer:objects:error", {
-          message: "Unable to save the collaborative map objects state."
+        console.error(`Unable to save designer ${sectionKey} state:`, error);
+        socket.emit("designer:section:error", {
+          message: "Unable to save the collaborative designer state."
         });
       }
     });
@@ -404,6 +452,11 @@ function createConnectionHandler(
           socket.emit("playableMaps:error", {
             message: "No playable map state has been saved on the server yet."
           });
+          return;
+        }
+
+        if (typeof data?.version === "number" && data.version === payload.version) {
+          emitPlayableMapsVersion(socket, payload);
           return;
         }
 
@@ -558,8 +611,8 @@ export default function registerSocketHandlers(
   io:TypedSocketServer,
   world:World,
   auth:Auth,
-  designerObjectsStore:DesignerObjectsStore,
+  designerSectionStore:DesignerSectionStore,
   playableMapsStore:PlayableMapsStore
 ) {
-  io.on("connection", createConnectionHandler(world, auth, designerObjectsStore, playableMapsStore));
+  io.on("connection", createConnectionHandler(world, auth, designerSectionStore, playableMapsStore));
 }

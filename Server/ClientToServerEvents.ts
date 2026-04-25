@@ -1,7 +1,7 @@
 import type {
-  DesignerObjectsJoinPayload,
-  DesignerObjectsUpdatePayload
-} from "../components/DesignerObjectsStore";
+  DesignerSectionJoinPayload,
+  DesignerSectionUpdatePayload
+} from "../components/DesignerSectionStore";
 import type { PlayableMapsStateSnapshot } from "../components/PlayableMapsState";
 
 interface AuthRegisterPayload {
@@ -112,21 +112,22 @@ export default interface ClientToServerEvents {
   "auth:reset-password": (data: AuthResetPasswordPayload) => void;
 
   /**
-   * Joins the collaborative `/designer/objects` channel.
-   * - `seedState`: optional client snapshot used only when Redis has no saved state yet
+   * Joins a collaborative designer section channel.
+   * - `version`: client's cached Redis version, if any
+   * - `seedState`: optional snapshot used only when Redis has no saved state yet
    */
-  "designer:objects:join": (data?: DesignerObjectsJoinPayload) => void;
+  "designer:section:join": (data?: DesignerSectionJoinPayload) => void;
 
   /**
-   * Leaves the collaborative `/designer/objects` channel for the current socket.
+   * Leaves a collaborative designer section channel for the current socket.
    */
-  "designer:objects:leave": () => void;
+  "designer:section:leave": (data?: { sectionKey?: string }) => void;
 
   /**
-   * Replaces the shared map object editor state with the latest client snapshot.
+   * Replaces a shared designer section state with the latest client snapshot.
    * The server persists the payload in Redis and broadcasts it to everyone in the room.
    */
-  "designer:objects:update": (data: DesignerObjectsUpdatePayload) => void;
+  "designer:section:update": (data: DesignerSectionUpdatePayload) => void;
 
   /**
    * Requests the authoritative playable map state if the server version differs
@@ -138,7 +139,10 @@ export default interface ClientToServerEvents {
    * Joins the authenticated map designer sync channel.
    * `seedState` is only used to bootstrap Redis when no server map state exists yet.
    */
-  "designer:maps:join": (data?: { seedState?: PlayableMapsStateSnapshot }) => void;
+  "designer:maps:join": (data?: {
+    version?: number | null;
+    seedState?: PlayableMapsStateSnapshot;
+  }) => void;
 
   /**
    * Leaves the authenticated map designer sync channel.
