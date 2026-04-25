@@ -6,6 +6,7 @@ export type DesignerSectionKey =
   | "objects"
   | "items"
   | "skills"
+  | "passiveStates"
   | "players"
   | "regions"
   | "npcs";
@@ -22,6 +23,7 @@ export interface DesignerSectionItem {
   details: DesignerItemDetail[];
   mapObjectAsset?: unknown;
   pokemonProfile?: unknown;
+  pokemonSkillProfile?: unknown;
 }
 
 export interface DesignerSectionState {
@@ -63,6 +65,7 @@ const VALID_SECTION_KEYS: DesignerSectionKey[] = [
   "objects",
   "items",
   "skills",
+  "passiveStates",
   "players",
   "regions",
   "npcs"

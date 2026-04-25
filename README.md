@@ -181,7 +181,7 @@ Stores the authoritative state for the `/designer/objects` editor so all connect
 
 ## 🤝 Designer Section Collaboration
 
-Designer sections such as Pokemons, Objects, Regions, Items, Skills, Players, and NPCs use a shared real-time collaboration flow:
+Designer sections such as Pokemons, Objects, Regions, Items, Skills, Passive States, Players, and NPCs use a shared real-time collaboration flow:
 
 1. The authenticated client emits `designer:section:join` with a `sectionKey` and cached `version` when the page opens.
 2. The server loads `designer:section:{sectionKey}` from Redis, creating an empty section or migrating a provided seed state only when no server state exists yet.
