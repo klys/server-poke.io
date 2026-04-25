@@ -21,6 +21,7 @@ export interface DesignerSectionItem {
   name: string;
   category: string;
   details: DesignerItemDetail[];
+  itemProfile?: unknown;
   mapObjectAsset?: unknown;
   skillGfxProfile?: unknown;
   pokemonProfile?: unknown;
