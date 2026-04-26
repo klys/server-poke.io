@@ -1,0 +1,41 @@
+name: Deploy and Run on Self-Hosted
+
+on:
+  push:
+    branches:
+      - main # Change this to match your default branch if needed
+
+jobs:
+  run-app:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Create .env file
+        env:
+          ENV_SECRET: ${{ secrets.ENV_SECRET }}
+        run: |
+          # Securely write the secret to the .env file
+          echo "$ENV_SECRET" > .env
+
+      - name: Check and start Redis Docker container
+        run: |
+          # Check if a container named 'redis' is actively running
+          if [ "$(docker ps -q -f name=redis)" ]; then
+            echo "Redis is already running."
+          else
+            echo "Redis is not running. Starting Redis via bash script..."
+            # Replace 'start-redis.sh' with the actual name of your bash script
+            bash ./start-redis.sh
+          fi
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Start Application
+        # NOTE: If `npm run start` runs a long-living server (like Express), 
+        # this step will block the GitHub runner indefinitely. 
+        # See the recommendations below to run it in the background if necessary.
+        run: npm run start
