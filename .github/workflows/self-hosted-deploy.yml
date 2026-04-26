@@ -20,17 +20,6 @@ jobs:
           # Securely write the secret to the .env file
           echo "$ENV_SECRET" > .env
 
-      - name: Check and start Redis Docker container
-        run: |
-          # Check if a container named 'redis' is actively running
-          if [ "$(docker ps -q -f name=redis-dev)" ]; then
-            echo "Redis is already running."
-          else
-            echo "Redis is not running. Starting Redis via bash script..."
-            # Replace 'start-redis.sh' with the actual name of your bash script
-            bash ./redis_dev_start.sh
-          fi
-
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
