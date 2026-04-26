@@ -9,6 +9,10 @@ jobs:
   run-app:
     runs-on: self-hosted
 
+    env:
+      IMAGE_NAME: server-poke-io
+      CONTAINER_NAME: server-poke-io
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -20,17 +24,26 @@ jobs:
           # Securely write the secret to the .env file
           echo "$ENV_SECRET" > .env
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22' # Adjust to match your project's target Node version
-          cache: 'npm'
+      - name: Build Docker image
+        run: docker build -t "$IMAGE_NAME:${{ github.sha }}" -t "$IMAGE_NAME:latest" .
 
-      - name: Install Dependencies
-        run: npm install
+      - name: Replace running container
+        run: |
+          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-      - name: Start Application
-        # NOTE: If `npm run start` runs a long-living server (like Express), 
-        # this step will block the GitHub runner indefinitely. 
-        # See the recommendations below to run it in the background if necessary.
-        run: npm run start
+          docker run -d \
+            --name "$CONTAINER_NAME" \
+            --restart unless-stopped \
+            --env-file .env \
+            --network host \
+            "$IMAGE_NAME:${{ github.sha }}"
+
+      - name: Show container status
+        run: |
+          sleep 3
+          docker ps --filter "name=$CONTAINER_NAME"
+
+          if ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" --format '{{.Names}}' | grep -q "^$CONTAINER_NAME$"; then
+            docker logs "$CONTAINER_NAME"
+            exit 1
+          fi

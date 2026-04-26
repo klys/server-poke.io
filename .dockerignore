@@ -1,0 +1,11 @@
+.env
+.git
+.github
+.vscode
+data
+dist
+node_modules
+npm-debug.log*
+README.md
+RESOURCES.md
+SMTP_DEV.md
