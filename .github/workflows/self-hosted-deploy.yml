@@ -31,6 +31,12 @@ jobs:
             bash ./redis_dev_start.sh
           fi
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22' # Adjust to match your project's target Node version
+          cache: 'npm'
+
       - name: Install Dependencies
         run: npm install
 
