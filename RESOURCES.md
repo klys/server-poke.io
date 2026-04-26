@@ -117,3 +117,5 @@ Redis memory can be checked through the Node dependency:
 ```bash
 node -e "const {createClient}=require('redis'); const client=createClient({url:process.env.REDIS_URL||'redis://127.0.0.1:6379'}); client.connect().then(()=>client.info('memory')).then(info=>{console.log(info.split('\n').filter(l=>/^used_memory_human:|^used_memory_rss_human:|^maxmemory_human:/.test(l)).join('\n')); return client.quit();}).catch(e=>{console.error(e.message); process.exitCode=1;});"
 ```
+
+# Resources
