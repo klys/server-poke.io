@@ -13,11 +13,13 @@ export default class MailService {
     private readonly smtpUser:string;
     private readonly smtpPass:string;
     private readonly smtpFrom:string;
+    private readonly smtpEnabled:boolean;
     private readonly appPublicUrl:string;
     private readonly emailValidationPath:string;
     private readonly passwordResetPath:string;
 
     constructor() {
+        this.smtpEnabled = this.parseSmtpEnabled(process.env.SMTP_ENABLED);
         this.smtpHost = process.env.SMTP_HOST || "";
         this.smtpPort = Number(process.env.SMTP_PORT || 587);
         this.smtpSecure = (process.env.SMTP_SECURE || "false").toLowerCase() === "true";
@@ -124,12 +126,21 @@ export default class MailService {
 
     private isConfigured() {
         return Boolean(
+            this.smtpEnabled &&
             this.smtpHost &&
             this.smtpPort &&
             this.smtpUser &&
             this.smtpPass &&
             this.smtpFrom
         );
+    }
+
+    private parseSmtpEnabled(value:string | undefined) {
+        if (value === undefined || value.trim() === "") {
+            return true;
+        }
+
+        return ["true", "1", "yes", "on"].includes(value.trim().toLowerCase());
     }
 
     private buildAppUrl(path:string, token:string) {

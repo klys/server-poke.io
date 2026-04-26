@@ -56,6 +56,12 @@ SMTP_FROM=no-reply@ethereal.email
 
 ## Disabling email entirely
 
+Set `SMTP_ENABLED=false` to force the server to start without SMTP, even when the other `SMTP_*` values are present:
+
+```env
+SMTP_ENABLED=false
+```
+
 If you leave any of `SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`, or `SMTP_FROM` empty, the server starts without SMTP and logs a warning:
 
 ```
