@@ -9,6 +9,10 @@ export interface AuthenticatedUser {
     username:string;
     email:string;
     emailVerified:boolean;
+    profileImage:string;
+    description:string;
+    inventory:InventoryItem[];
+    pokemonParty:PokemonSummary[];
 }
 
 export interface AuthSessionState {
@@ -45,6 +49,24 @@ interface StoredUser extends AuthenticatedUser {
     created_at:string;
 }
 
+export interface InventoryItem {
+    id:string;
+    name:string;
+    category:"usable" | "berries" | "moves" | "quest";
+    quantity:number;
+    description:string;
+}
+
+export interface PokemonSummary {
+    id:string;
+    name:string;
+    level:number;
+    types:string[];
+    hp:number;
+    maxHp:number;
+    moves:string[];
+}
+
 interface SessionTokenPayload extends JwtPayload {
     sid:string;
     sub:string;
@@ -78,6 +100,52 @@ interface ResetPasswordPayload {
     token:string;
     password:string;
 }
+
+interface ChangePasswordPayload {
+    currentPassword:string;
+    newPassword:string;
+}
+
+interface UpdateProfilePayload {
+    profileImage?:string;
+    description?:string;
+}
+
+const DEFAULT_INVENTORY:InventoryItem[] = [
+    {
+        id: "potion",
+        name: "Potion",
+        category: "usable",
+        quantity: 3,
+        description: "Restores a small amount of HP."
+    },
+    {
+        id: "oran-berry",
+        name: "Oran Berry",
+        category: "berries",
+        quantity: 2,
+        description: "A bright berry used by Pokemon in a pinch."
+    },
+    {
+        id: "town-map",
+        name: "Town Map",
+        category: "quest",
+        quantity: 1,
+        description: "A handy map for tracking discovered regions."
+    }
+];
+
+const DEFAULT_POKEMON_PARTY:PokemonSummary[] = [
+    {
+        id: "starter-001",
+        name: "Sprigatito",
+        level: 5,
+        types: ["Grass"],
+        hp: 20,
+        maxHp: 20,
+        moves: ["Scratch", "Leafage"]
+    }
+];
 
 export default class Auth {
     private readonly redis:RedisClientType;
@@ -308,6 +376,73 @@ export default class Auth {
         };
     }
 
+    public async changePassword(token:string | undefined, payload:ChangePasswordPayload):Promise<AuthInfoResult | AuthErrorResult> {
+        const authenticatedUser = await this.getAuthenticatedUserFromToken(token);
+        if (!authenticatedUser) {
+            return { error: "You must be authenticated to change your password." };
+        }
+
+        const storedUser = await this.getStoredUserById(String(authenticatedUser.id));
+        const currentPassword = typeof payload.currentPassword === "string" ? payload.currentPassword : "";
+        const newPassword = typeof payload.newPassword === "string" ? payload.newPassword : "";
+
+        if (!storedUser || !this.verifyPassword(currentPassword, storedUser.password_salt, storedUser.password_hash)) {
+            return { error: "Current password is incorrect." };
+        }
+
+        const passwordValidation = this.validatePassword(newPassword);
+        if (passwordValidation) {
+            return { error: passwordValidation };
+        }
+
+        const passwordSalt = crypto.randomBytes(16).toString("hex");
+        const passwordHash = this.hashPassword(newPassword, passwordSalt);
+
+        await this.redis.hSet(this.userKey(authenticatedUser.id), {
+            password_hash: passwordHash,
+            password_salt: passwordSalt
+        });
+
+        return { message: "Password updated successfully." };
+    }
+
+    public async updateProfile(token:string | undefined, payload:UpdateProfilePayload):Promise<AuthSuccessResult | AuthErrorResult> {
+        const authenticatedUser = await this.getAuthenticatedUserFromToken(token);
+        if (!authenticatedUser) {
+            return { error: "You must be authenticated to update your profile." };
+        }
+
+        const profileImage = typeof payload.profileImage === "string" ? payload.profileImage.trim() : authenticatedUser.profileImage;
+        const description = typeof payload.description === "string" ? payload.description.trim() : authenticatedUser.description;
+
+        if (description.length > 50) {
+            return { error: "Description must be 50 characters or less." };
+        }
+
+        if (profileImage.length > 2000) {
+            return { error: "Profile image URL is too long." };
+        }
+
+        await this.redis.hSet(this.userKey(authenticatedUser.id), {
+            profile_image: profileImage,
+            description
+        });
+
+        const user = await this.getUserById(String(authenticatedUser.id));
+        if (!user) {
+            return { error: "Unable to refresh account details." };
+        }
+
+        const tokenValue = token ?? await this.createSession(user);
+        return {
+            session: {
+                authenticated: true,
+                user,
+                token: tokenValue
+            }
+        };
+    }
+
     private async sendPostRegistrationEmails(user:AuthenticatedUser) {
         const results = await Promise.allSettled([
             this.mailService.sendWelcomeEmail(user),
@@ -401,6 +536,10 @@ export default class Auth {
                     password_hash: passwordHash,
                     password_salt: passwordSalt,
                     email_verified: "0",
+                    profile_image: "",
+                    description: "",
+                    inventory: JSON.stringify(DEFAULT_INVENTORY),
+                    pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
                     created_at: createdAt
                 })
                 .set(usernameKey, String(userId))
@@ -413,7 +552,11 @@ export default class Auth {
                     name,
                     username,
                     email: normalizedEmail,
-                    emailVerified: false
+                    emailVerified: false,
+                    profileImage: "",
+                    description: "",
+                    inventory: DEFAULT_INVENTORY,
+                    pokemonParty: DEFAULT_POKEMON_PARTY
                 };
             }
         }
@@ -525,6 +668,24 @@ export default class Auth {
             return null;
         }
 
+        const defaultFields:Record<string, string> = {};
+        if (typeof user.profile_image !== "string") {
+            defaultFields.profile_image = "";
+        }
+        if (typeof user.description !== "string") {
+            defaultFields.description = "";
+        }
+        if (typeof user.inventory !== "string") {
+            defaultFields.inventory = JSON.stringify(DEFAULT_INVENTORY);
+        }
+        if (typeof user.pokemon_party !== "string") {
+            defaultFields.pokemon_party = JSON.stringify(DEFAULT_POKEMON_PARTY);
+        }
+
+        if (Object.keys(defaultFields).length > 0) {
+            await this.redis.hSet(this.userKey(userId), defaultFields);
+        }
+
         return {
             id: Number(user.id),
             name: user.name,
@@ -533,6 +694,10 @@ export default class Auth {
             emailVerified: user.email_verified === "1",
             password_hash: user.password_hash,
             password_salt: user.password_salt,
+            profileImage: user.profile_image ?? "",
+            description: (user.description ?? "").slice(0, 50),
+            inventory: this.parseInventory(user.inventory),
+            pokemonParty: this.parsePokemonParty(user.pokemon_party),
             created_at: user.created_at
         } satisfies StoredUser;
     }
@@ -543,8 +708,79 @@ export default class Auth {
             name: user.name,
             username: user.username,
             email: user.email,
-            emailVerified: user.emailVerified
+            emailVerified: user.emailVerified,
+            profileImage: user.profileImage,
+            description: user.description,
+            inventory: user.inventory,
+            pokemonParty: user.pokemonParty
         };
+    }
+
+    private parseInventory(value:string | undefined) {
+        if (!value) {
+            return DEFAULT_INVENTORY;
+        }
+
+        try {
+            const parsed = JSON.parse(value);
+            if (!Array.isArray(parsed)) {
+                return DEFAULT_INVENTORY;
+            }
+
+            return parsed
+                .filter((item): item is InventoryItem =>
+                    typeof item?.id === "string" &&
+                    typeof item?.name === "string" &&
+                    ["usable", "berries", "moves", "quest"].includes(item?.category) &&
+                    typeof item?.quantity === "number" &&
+                    Number.isFinite(item.quantity) &&
+                    typeof item?.description === "string"
+                )
+                .map((item) => ({
+                    ...item,
+                    quantity: Math.max(0, Math.round(item.quantity))
+                }));
+        } catch {
+            return DEFAULT_INVENTORY;
+        }
+    }
+
+    private parsePokemonParty(value:string | undefined) {
+        if (!value) {
+            return DEFAULT_POKEMON_PARTY;
+        }
+
+        try {
+            const parsed = JSON.parse(value);
+            if (!Array.isArray(parsed)) {
+                return DEFAULT_POKEMON_PARTY;
+            }
+
+            return parsed
+                .filter((pokemon): pokemon is PokemonSummary =>
+                    typeof pokemon?.id === "string" &&
+                    typeof pokemon?.name === "string" &&
+                    typeof pokemon?.level === "number" &&
+                    Number.isFinite(pokemon.level) &&
+                    Array.isArray(pokemon?.types) &&
+                    typeof pokemon?.hp === "number" &&
+                    Number.isFinite(pokemon.hp) &&
+                    typeof pokemon?.maxHp === "number" &&
+                    Number.isFinite(pokemon.maxHp) &&
+                    Array.isArray(pokemon?.moves)
+                )
+                .slice(0, 6)
+                .map((pokemon) => ({
+                    ...pokemon,
+                    level: Math.max(1, Math.round(pokemon.level)),
+                    hp: Math.max(0, Math.round(pokemon.hp)),
+                    maxHp: Math.max(1, Math.round(pokemon.maxHp)),
+                    types: pokemon.types.filter((type): type is string => typeof type === "string"),
+                    moves: pokemon.moves.filter((move): move is string => typeof move === "string")
+                }));
+        } catch {
+            return DEFAULT_POKEMON_PARTY;
+        }
     }
 
     private unauthenticatedSession():AuthSessionState {

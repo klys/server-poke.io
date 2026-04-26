@@ -322,6 +322,42 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("auth:change-password", async (data) => {
+      try {
+        const result = await auth.changePassword(socket.data.token, data);
+        if ("error" in result) {
+          socket.emit("auth:error", { message: result.error });
+          return;
+        }
+
+        socket.emit("auth:info", { message: result.message });
+      } catch (error) {
+        console.error("Auth change password event failed:", error);
+        socket.emit("auth:error", {
+          message: "Unable to change the password right now."
+        });
+      }
+    });
+
+    socket.on("auth:update-profile", async (data) => {
+      try {
+        const result = await auth.updateProfile(socket.data.token, data);
+        if (!("session" in result)) {
+          socket.emit("auth:error", { message: result.error });
+          return;
+        }
+
+        applySocketAuth(socket.data, result.session.user);
+        socket.emit("auth:session", result.session);
+        socket.emit("auth:info", { message: "Profile updated successfully." });
+      } catch (error) {
+        console.error("Auth update profile event failed:", error);
+        socket.emit("auth:error", {
+          message: "Unable to update profile right now."
+        });
+      }
+    });
+
     socket.on("auth:logout", async () => {
       try {
         const session = await auth.logout(socket.data.token);

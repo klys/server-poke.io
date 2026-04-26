@@ -37,6 +37,24 @@ interface AuthUserData {
   username: string;
   email: string;
   emailVerified: boolean;
+  profileImage: string;
+  description: string;
+  inventory: Array<{
+    id: string;
+    name: string;
+    category: "usable" | "berries" | "moves" | "quest";
+    quantity: number;
+    description: string;
+  }>;
+  pokemonParty: Array<{
+    id: string;
+    name: string;
+    level: number;
+    types: string[];
+    hp: number;
+    maxHp: number;
+    moves: string[];
+  }>;
 }
 
 export default interface ServerToClientEvents {

@@ -37,6 +37,16 @@ interface AuthResetPasswordPayload {
   password: string;
 }
 
+interface AuthChangePasswordPayload {
+  currentPassword: string;
+  newPassword: string;
+}
+
+interface AuthUpdateProfilePayload {
+  profileImage?: string;
+  description?: string;
+}
+
 interface PlayableMapsSyncRequestPayload {
   version?: number | null;
 }
@@ -110,6 +120,16 @@ export default interface ClientToServerEvents {
    * - `password`: new password using the same password rules as registration
    */
   "auth:reset-password": (data: AuthResetPasswordPayload) => void;
+
+  /**
+   * Updates the authenticated user's password from the Account window.
+   */
+  "auth:change-password": (data: AuthChangePasswordPayload) => void;
+
+  /**
+   * Updates lightweight trainer profile data used by account windows and trainer card.
+   */
+  "auth:update-profile": (data: AuthUpdateProfilePayload) => void;
 
   /**
    * Joins a collaborative designer section channel.
