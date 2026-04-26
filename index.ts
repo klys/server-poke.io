@@ -13,7 +13,7 @@ import InterServerEvents from "./Server/InterServerEvents";
 import registerSocketHandlers, { type SocketData } from "./Server/registerSocketHandlers";
 
 const PORT = Number(process.env.PORT || 3001);
-const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || "http://localhost:3000";
+const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || ["http://localhost:3000","https://pokecraft.klys.dev"];
 
 async function bootstrap() {
   const httpServer = createServer();
