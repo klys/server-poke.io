@@ -107,7 +107,7 @@ export default class PlayableMapsStore {
     const sanitizedState = sanitizePlayableMapsStateSnapshot(state);
 
     if (!sanitizedState) {
-      throw new Error("Playable maps state must include at least one valid map.");
+      throw new Error("Playable maps state is invalid.");
     }
 
     const payload: PlayableMapsSyncPayload = {

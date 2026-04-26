@@ -287,7 +287,7 @@ export function sanitizePlayableMapsStateSnapshot(value: unknown): PlayableMapsS
   const candidate = value as Partial<PlayableMapsStateSnapshot>;
   const items = sanitizePlayableMapItems(candidate.items);
 
-  if (items.length === 0) {
+  if (!Array.isArray(candidate.items)) {
     return null;
   }
 
