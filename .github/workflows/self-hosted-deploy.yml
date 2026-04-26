@@ -3,7 +3,7 @@ name: Deploy and Run on Self-Hosted
 on:
   push:
     branches:
-      - main # Change this to match your default branch if needed
+      - master # Change this to match your default branch if needed
 
 jobs:
   run-app:
