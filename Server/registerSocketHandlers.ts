@@ -147,6 +147,63 @@ function emitDesignerSectionVersion(
   });
 }
 
+function getStarterPokemonDefinition(item: unknown) {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+
+  const candidate = item as {
+    id?: unknown;
+    name?: unknown;
+    pokemonProfile?: {
+      isInitialPokemon?: unknown;
+      elements?: unknown;
+      hp?: unknown;
+      skills?: unknown;
+      iconImageSrc?: unknown;
+    };
+  };
+  const profile = candidate.pokemonProfile;
+
+  if (
+    typeof candidate.id !== "string" ||
+    typeof candidate.name !== "string" ||
+    profile?.isInitialPokemon !== true ||
+    !Array.isArray(profile.elements) ||
+    typeof profile.hp !== "number" ||
+    !Number.isFinite(profile.hp)
+  ) {
+    return null;
+  }
+
+  const skills = Array.isArray(profile.skills)
+    ? profile.skills
+        .filter((skill): skill is { skillId:string; skillName:string; level:number } => {
+          const candidateSkill = skill as { skillId?: unknown; skillName?: unknown; level?: unknown };
+          return (
+            typeof candidateSkill.skillId === "string" &&
+            typeof candidateSkill.skillName === "string" &&
+            typeof candidateSkill.level === "number" &&
+            Number.isFinite(candidateSkill.level)
+          );
+        })
+        .map((skill) => ({
+          skillId: skill.skillId,
+          skillName: skill.skillName,
+          level: Math.max(1, Math.round(skill.level))
+        }))
+    : [];
+
+  return {
+    id: candidate.id,
+    name: candidate.name,
+    elements: profile.elements.filter((element): element is string => typeof element === "string"),
+    hp: Math.max(1, Math.round(profile.hp)),
+    skills,
+    iconImageSrc: typeof profile.iconImageSrc === "string" ? profile.iconImageSrc : ""
+  };
+}
+
 async function emitPlayableMapsSyncIfStale(
   socket:ServerSocket,
   playableMapsStore:PlayableMapsStore,
@@ -358,6 +415,44 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("auth:choose-starter", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (typeof data?.pokemonId !== "string" || data.pokemonId.length === 0) {
+          socket.emit("auth:error", { message: "Select a starter Pokemon." });
+          return;
+        }
+
+        const pokemonPayload = await designerSectionStore.read("pokemons");
+        const starterPokemon = pokemonPayload?.state.items
+          .map(getStarterPokemonDefinition)
+          .find((pokemon) => pokemon?.id === data.pokemonId) ?? null;
+
+        if (!starterPokemon) {
+          socket.emit("auth:error", { message: "Selected starter Pokemon is unavailable." });
+          return;
+        }
+
+        const result = await auth.chooseStarter(readSocketToken(socket), data, starterPokemon);
+        if (!("session" in result)) {
+          socket.emit("auth:error", { message: result.error });
+          return;
+        }
+
+        applySocketAuth(socket.data, result.session.user);
+        socket.emit("auth:session", result.session);
+        socket.emit("auth:info", { message: `${starterPokemon.name} joined your team.` });
+      } catch (error) {
+        console.error("Auth choose starter event failed:", error);
+        socket.emit("auth:error", {
+          message: "Unable to choose starter Pokemon right now."
+        });
+      }
+    });
+
     socket.on("auth:logout", async () => {
       try {
         const session = await auth.logout(socket.data.token);
@@ -389,6 +484,10 @@ function createConnectionHandler(
     });
 
     socket.on("designer:section:join", async (data) => {
+      if (!socket.data.authenticated && readSocketToken(socket)) {
+        await hydrateSocketAuth(socket, auth);
+      }
+
       if (!requireDesignerSectionAccess(socket)) {
         return;
       }
@@ -544,6 +643,13 @@ function createConnectionHandler(
 
         if (!socket.data.authenticated && (readSocketToken(socket) || data?.token)) {
           await hydrateSocketAuthWithToken(socket, auth, data?.token);
+        }
+
+        const session = await auth.resolveSession(socket.data.token);
+        if (session.authenticated && session.user && session.user.pokemonParty.length === 0) {
+          applySocketAuth(socket.data, session.user);
+          socket.emit("auth:session", session);
+          return;
         }
       } catch (error) {
         console.error("Unable to hydrate auth before addPlayer:", error);

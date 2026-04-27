@@ -13,6 +13,7 @@ export interface AuthenticatedUser {
     description:string;
     inventory:InventoryItem[];
     pokemonParty:PokemonSummary[];
+    trainerGender:string;
 }
 
 export interface AuthSessionState {
@@ -59,12 +60,16 @@ export interface InventoryItem {
 
 export interface PokemonSummary {
     id:string;
+    sourcePokemonId?:string;
     name:string;
     level:number;
     types:string[];
     hp:number;
     maxHp:number;
     moves:string[];
+    experience:number;
+    experienceCurve:"fast" | "medium" | "slow";
+    nextLevelExperience:number;
 }
 
 interface SessionTokenPayload extends JwtPayload {
@@ -111,6 +116,23 @@ interface UpdateProfilePayload {
     description?:string;
 }
 
+interface ChooseStarterPayload {
+    gender:string;
+}
+
+interface StarterPokemonDefinition {
+    id:string;
+    name:string;
+    elements:string[];
+    hp:number;
+    skills:Array<{
+        skillId:string;
+        skillName:string;
+        level:number;
+    }>;
+    iconImageSrc:string;
+}
+
 const DEFAULT_INVENTORY:InventoryItem[] = [
     {
         id: "potion",
@@ -135,17 +157,8 @@ const DEFAULT_INVENTORY:InventoryItem[] = [
     }
 ];
 
-const DEFAULT_POKEMON_PARTY:PokemonSummary[] = [
-    {
-        id: "starter-001",
-        name: "Sprigatito",
-        level: 5,
-        types: ["Grass"],
-        hp: 20,
-        maxHp: 20,
-        moves: ["Scratch", "Leafage"]
-    }
-];
+const DEFAULT_POKEMON_PARTY:PokemonSummary[] = [];
+const LEGACY_DEMO_POKEMON_PARTY_IDS = new Set(["starter-001"]);
 
 export default class Auth {
     private readonly redis:RedisClientType;
@@ -443,6 +456,63 @@ export default class Auth {
         };
     }
 
+    public async chooseStarter(
+        token:string | undefined,
+        payload:ChooseStarterPayload,
+        starterPokemon:StarterPokemonDefinition
+    ):Promise<AuthSuccessResult | AuthErrorResult> {
+        const authenticatedUser = await this.getAuthenticatedUserFromToken(token);
+        if (!authenticatedUser) {
+            return { error: "You must be authenticated to choose a starter Pokemon." };
+        }
+
+        if (authenticatedUser.pokemonParty.length > 0) {
+            return { error: "You already have Pokemon in hand." };
+        }
+
+        const gender = typeof payload.gender === "string" ? payload.gender.trim() : "";
+        if (!["female", "male", "nonbinary"].includes(gender)) {
+            return { error: "Select a trainer gender before choosing a Pokemon." };
+        }
+
+        const starter:PokemonSummary = {
+            id: crypto.randomUUID(),
+            sourcePokemonId: starterPokemon.id,
+            name: starterPokemon.name,
+            level: 1,
+            types: starterPokemon.elements,
+            hp: Math.max(1, Math.round(starterPokemon.hp)),
+            maxHp: Math.max(1, Math.round(starterPokemon.hp)),
+            moves: starterPokemon.skills
+                .filter((skill) => skill.level <= 1)
+                .slice(0, 4)
+                .map((skill) => skill.skillName)
+                .filter(Boolean),
+            experience: 0,
+            experienceCurve: "medium",
+            nextLevelExperience: 100
+        };
+
+        await this.redis.hSet(this.userKey(authenticatedUser.id), {
+            trainer_gender: gender,
+            pokemon_party: JSON.stringify([starter])
+        });
+
+        const user = await this.getUserById(String(authenticatedUser.id));
+        if (!user) {
+            return { error: "Unable to refresh account details." };
+        }
+
+        return {
+            session: {
+                authenticated: true,
+                user,
+                token: token ?? await this.createSession(user)
+            }
+        };
+    }
+
+
     private async sendPostRegistrationEmails(user:AuthenticatedUser) {
         const results = await Promise.allSettled([
             this.mailService.sendWelcomeEmail(user),
@@ -540,6 +610,7 @@ export default class Auth {
                     description: "",
                     inventory: JSON.stringify(DEFAULT_INVENTORY),
                     pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
+                    trainer_gender: "",
                     created_at: createdAt
                 })
                 .set(usernameKey, String(userId))
@@ -556,7 +627,8 @@ export default class Auth {
                     profileImage: "",
                     description: "",
                     inventory: DEFAULT_INVENTORY,
-                    pokemonParty: DEFAULT_POKEMON_PARTY
+                    pokemonParty: DEFAULT_POKEMON_PARTY,
+                    trainerGender: ""
                 };
             }
         }
@@ -680,6 +752,11 @@ export default class Auth {
         }
         if (typeof user.pokemon_party !== "string") {
             defaultFields.pokemon_party = JSON.stringify(DEFAULT_POKEMON_PARTY);
+        } else if (this.isLegacyDemoPokemonPartyJson(user.pokemon_party)) {
+            defaultFields.pokemon_party = JSON.stringify(DEFAULT_POKEMON_PARTY);
+        }
+        if (typeof user.trainer_gender !== "string") {
+            defaultFields.trainer_gender = "";
         }
 
         if (Object.keys(defaultFields).length > 0) {
@@ -698,6 +775,7 @@ export default class Auth {
             description: (user.description ?? "").slice(0, 50),
             inventory: this.parseInventory(user.inventory),
             pokemonParty: this.parsePokemonParty(user.pokemon_party),
+            trainerGender: user.trainer_gender ?? "",
             created_at: user.created_at
         } satisfies StoredUser;
     }
@@ -712,7 +790,8 @@ export default class Auth {
             profileImage: user.profileImage,
             description: user.description,
             inventory: user.inventory,
-            pokemonParty: user.pokemonParty
+            pokemonParty: user.pokemonParty,
+            trainerGender: user.trainerGender
         };
     }
 
@@ -756,6 +835,10 @@ export default class Auth {
                 return DEFAULT_POKEMON_PARTY;
             }
 
+            if (this.isLegacyDemoPokemonParty(parsed)) {
+                return DEFAULT_POKEMON_PARTY;
+            }
+
             return parsed
                 .filter((pokemon): pokemon is PokemonSummary =>
                     typeof pokemon?.id === "string" &&
@@ -772,14 +855,68 @@ export default class Auth {
                 .slice(0, 6)
                 .map((pokemon) => ({
                     ...pokemon,
+                    sourcePokemonId:
+                        typeof pokemon.sourcePokemonId === "string" ? pokemon.sourcePokemonId : undefined,
                     level: Math.max(1, Math.round(pokemon.level)),
                     hp: Math.max(0, Math.round(pokemon.hp)),
                     maxHp: Math.max(1, Math.round(pokemon.maxHp)),
                     types: pokemon.types.filter((type): type is string => typeof type === "string"),
-                    moves: pokemon.moves.filter((move): move is string => typeof move === "string")
+                    moves: pokemon.moves.filter((move): move is string => typeof move === "string").slice(0, 4),
+                    experience:
+                        typeof pokemon.experience === "number" && Number.isFinite(pokemon.experience)
+                            ? Math.max(0, Math.round(pokemon.experience))
+                            : 0,
+                    experienceCurve:
+                        pokemon.experienceCurve === "fast" ||
+                        pokemon.experienceCurve === "medium" ||
+                        pokemon.experienceCurve === "slow"
+                            ? pokemon.experienceCurve
+                            : "medium",
+                    nextLevelExperience:
+                        typeof pokemon.nextLevelExperience === "number" &&
+                        Number.isFinite(pokemon.nextLevelExperience)
+                            ? Math.max(1, Math.round(pokemon.nextLevelExperience))
+                            : 100
                 }));
         } catch {
             return DEFAULT_POKEMON_PARTY;
+        }
+    }
+
+    private isLegacyDemoPokemonParty(value:unknown[]) {
+        if (value.length !== 1) {
+            return false;
+        }
+
+        const [pokemon] = value;
+        if (!pokemon || typeof pokemon !== "object") {
+            return false;
+        }
+
+        const candidate = pokemon as {
+            id?: unknown;
+            sourcePokemonId?: unknown;
+            name?: unknown;
+            level?: unknown;
+            moves?: unknown;
+        };
+
+        return (
+            typeof candidate.id === "string" &&
+            LEGACY_DEMO_POKEMON_PARTY_IDS.has(candidate.id) &&
+            typeof candidate.sourcePokemonId === "undefined" &&
+            candidate.name === "Sprigatito" &&
+            candidate.level === 5 &&
+            Array.isArray(candidate.moves)
+        );
+    }
+
+    private isLegacyDemoPokemonPartyJson(value:string) {
+        try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed) && this.isLegacyDemoPokemonParty(parsed);
+        } catch {
+            return false;
         }
     }
 

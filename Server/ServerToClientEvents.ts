@@ -39,6 +39,7 @@ interface AuthUserData {
   emailVerified: boolean;
   profileImage: string;
   description: string;
+  trainerGender: string;
   inventory: Array<{
     id: string;
     name: string;
@@ -48,12 +49,16 @@ interface AuthUserData {
   }>;
   pokemonParty: Array<{
     id: string;
+    sourcePokemonId?: string;
     name: string;
     level: number;
     types: string[];
     hp: number;
     maxHp: number;
     moves: string[];
+    experience: number;
+    experienceCurve: "fast" | "medium" | "slow";
+    nextLevelExperience: number;
   }>;
 }
 

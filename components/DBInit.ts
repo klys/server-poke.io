@@ -25,7 +25,7 @@ export default class DBInit {
                 await this.redis.connect();
             }
 
-            await this.redis.set("auth:meta:schema-version", "2");
+            await this.redis.set("auth:meta:schema-version", "3");
             await this.redis.setNX("auth:meta:initialized-at", new Date().toISOString());
             await this.redis.setNX("auth:user:id:sequence", "0");
 

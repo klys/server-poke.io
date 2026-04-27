@@ -47,6 +47,11 @@ interface AuthUpdateProfilePayload {
   description?: string;
 }
 
+interface AuthChooseStarterPayload {
+  gender: string;
+  pokemonId: string;
+}
+
 interface PlayableMapsSyncRequestPayload {
   version?: number | null;
 }
@@ -130,6 +135,11 @@ export default interface ClientToServerEvents {
    * Updates lightweight trainer profile data used by account windows and trainer card.
    */
   "auth:update-profile": (data: AuthUpdateProfilePayload) => void;
+
+  /**
+   * Grants one initial level-1 Pokemon to authenticated users with an empty party.
+   */
+  "auth:choose-starter": (data: AuthChooseStarterPayload) => void;
 
   /**
    * Joins a collaborative designer section channel.
