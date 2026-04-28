@@ -1,4 +1,7 @@
 import type {
+  BattlePublicState
+} from "../components/BattleManager";
+import type {
   DesignerSectionSyncPayload,
   DesignerSectionVersionPayload
 } from "../components/DesignerSectionStore";
@@ -14,6 +17,10 @@ interface PlayerData {
   y: number;
   angle: number;
   id: number;
+  username?: string;
+  name?: string;
+  profileImage?: string;
+  description?: string;
 }
 
 interface ProjectilData {
@@ -40,6 +47,7 @@ interface AuthUserData {
   profileImage: string;
   description: string;
   trainerGender: string;
+  money: number;
   inventory: Array<{
     id: string;
     name: string;
@@ -56,6 +64,7 @@ interface AuthUserData {
     hp: number;
     maxHp: number;
     moves: string[];
+    movePp?: Record<string, number>;
     experience: number;
     experienceCurve: "fast" | "medium" | "slow";
     nextLevelExperience: number;
@@ -76,6 +85,18 @@ export default interface ServerToClientEvents {
 
   addObject: (data: ObjectData) => void;
   test: (data: { test: string }) => void;
+  "battle:state": (data: BattlePublicState) => void;
+  "battle:ended": (data: { battleId: string }) => void;
+  "battle:error": (data: { message: string }) => void;
+  "battle:challenge-received": (data: { challengeId: string; fromPlayerId: string; fromUsername: string }) => void;
+  "battle:challenge-sent": (data: { challengeId: string; targetPlayerId: string; targetUsername: string }) => void;
+  "battle:challenge-declined": (data: { challengeId: string; targetPlayerId: string }) => void;
+  "battle:challenge-expired": (data: { challengeId: string }) => void;
+  "battle:trade-request-received": (data: { requestId: string; fromPlayerId: string; fromUsername: string }) => void;
+  "battle:trade-request-sent": (data: { requestId: string; targetPlayerId: string; targetUsername: string }) => void;
+  "battle:trade-accepted": (data: { requestId: string; targetPlayerId: string }) => void;
+  "battle:trade-declined": (data: { requestId: string; targetPlayerId: string }) => void;
+  "battle:trade-expired": (data: { requestId: string }) => void;
 
   /**
    * Main auth state response emitted after:

@@ -1,4 +1,11 @@
 import type {
+  BattleActionRequest,
+  BattleChallengePayload,
+  BattleChallengeResponsePayload,
+  BattleTradeRequestPayload,
+  BattleTradeResponsePayload
+} from "../components/BattleManager";
+import type {
   DesignerSectionJoinPayload,
   DesignerSectionUpdatePayload
 } from "../components/DesignerSectionStore";
@@ -64,6 +71,11 @@ export default interface ClientToServerEvents {
   move: (data: { x: number; y: number }) => void;
   stopMove: () => void;
   shotProjectil: (data: { mouse_x: number; mouse_y: number }) => void;
+  "battle:challenge-player": (data: BattleChallengePayload) => void;
+  "battle:challenge-response": (data: BattleChallengeResponsePayload) => void;
+  "battle:trade-request": (data: BattleTradeRequestPayload) => void;
+  "battle:trade-response": (data: BattleTradeResponsePayload) => void;
+  "battle:action": (data: BattleActionRequest) => void;
 
   /**
    * Registers a new player account and starts an authenticated socket session.

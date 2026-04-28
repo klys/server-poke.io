@@ -1,5 +1,6 @@
 import { type Server, type Socket } from "socket.io";
 import Auth, { type AuthenticatedUser } from "../components/Auth";
+import BattleManager from "../components/BattleManager";
 import DesignerSectionStore, {
   isDesignerSectionKey,
   type DesignerSectionKey,
@@ -231,7 +232,8 @@ function createConnectionHandler(
   world:World,
   auth:Auth,
   designerSectionStore:DesignerSectionStore,
-  playableMapsStore:PlayableMapsStore
+  playableMapsStore:PlayableMapsStore,
+  battleManager:BattleManager
 ) {
   return (socket:ServerSocket) => {
     console.log("Client connected!", socket.id);
@@ -655,6 +657,7 @@ function createConnectionHandler(
         console.error("Unable to hydrate auth before addPlayer:", error);
       }
 
+      const session = await auth.resolveSession(socket.data.token);
       const savedLocation =
         typeof socket.data.userId === "number"
           ? await auth.getSavedPlayerLocation(socket.data.userId)
@@ -668,7 +671,15 @@ function createConnectionHandler(
       const playerRegistration = world.addPlayer(
         socket.id,
         spawnState,
-        socket.data.userId ?? null
+        socket.data.userId ?? null,
+        session.user
+          ? {
+              username: session.user.username,
+              name: session.user.name,
+              profileImage: session.user.profileImage,
+              description: session.user.description
+            }
+          : undefined
       );
 
       if (playerRegistration.player) {
@@ -681,6 +692,7 @@ function createConnectionHandler(
       const { x, y } = data;
       const player = world.getPlayerBySocket(socket.id);
       if (!player) return;
+      if (player.inBattle) return;
       console.log(socket.id+" moving to "+x+" and "+y);
       player.findPath(world, x,y);
       world.players.set(player.socketId, player);
@@ -722,6 +734,26 @@ function createConnectionHandler(
       world.shotProjectil(data.mouse_x,data.mouse_y, socket.id);
     });
 
+    socket.on("battle:challenge-player", (data) => {
+      battleManager.requestChallenge(socket.id, data);
+    });
+
+    socket.on("battle:challenge-response", (data) => {
+      battleManager.respondToChallenge(socket.id, data);
+    });
+
+    socket.on("battle:trade-request", (data) => {
+      battleManager.requestTrade(socket.id, data);
+    });
+
+    socket.on("battle:trade-response", (data) => {
+      battleManager.respondToTrade(socket.id, data);
+    });
+
+    socket.on("battle:action", (data) => {
+      battleManager.submitAction(socket.id, data);
+    });
+
     socket.on("disconnect", async (reason) => {
       console.log(reason);
 
@@ -756,5 +788,7 @@ export default function registerSocketHandlers(
   designerSectionStore:DesignerSectionStore,
   playableMapsStore:PlayableMapsStore
 ) {
-  io.on("connection", createConnectionHandler(world, auth, designerSectionStore, playableMapsStore));
+  const battleManager = new BattleManager(io, world, auth, designerSectionStore);
+  world.setBattleManager(battleManager);
+  io.on("connection", createConnectionHandler(world, auth, designerSectionStore, playableMapsStore, battleManager));
 }

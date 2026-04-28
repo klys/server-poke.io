@@ -16,6 +16,11 @@ export default class Player {
     socketId:string;
     socketConnections:Set<string>;
     userId:number | null;
+    username:string;
+    name:string;
+    profileImage:string;
+    description:string;
+    inBattle:boolean;
     path:number[][];
     path_pos:number;
     angle:number; 
@@ -43,7 +48,13 @@ export default class Player {
         world:World,
         currentMapId:string,
         initialSocketId:string,
-        userId:number | null = null
+        userId:number | null = null,
+        trainerProfile?: {
+            username?: string;
+            name?: string;
+            profileImage?: string;
+            description?: string;
+        }
     ){
         this.x = x;
         this.y = y;
@@ -55,6 +66,11 @@ export default class Player {
         this.socketId = playerId;
         this.socketConnections = new Set<string>([initialSocketId]);
         this.userId = userId;
+        this.username = trainerProfile?.username ?? "";
+        this.name = trainerProfile?.name ?? "";
+        this.profileImage = trainerProfile?.profileImage ?? "";
+        this.description = trainerProfile?.description ?? "";
+        this.inBattle = false;
         this.speed = 1;
         this.path = [];
         this.path_pos = 0;
@@ -88,6 +104,8 @@ export default class Player {
      * Evaluates the current path segment and moves the player towards it.
      */
     public move() {
+        if (this.inBattle) return;
+        if (this.relocateInsideMapIfNeeded()) return;
         if (this.path.length === 0) return;
         if (this.path.length === this.path_pos) return;
 
@@ -145,7 +163,45 @@ export default class Player {
             id:this.id,
             currentMapId:this.currentMapId
         })
+        this.world.handlePlayerStep(this);
 
+    }
+
+    private relocateInsideMapIfNeeded() {
+        if (this.world.isOpenPlayerPosition(
+            this.currentMapId,
+            this.x,
+            this.y,
+            this.width,
+            this.height
+        )) {
+            return false;
+        }
+
+        const nextPosition = this.world.resolveOpenPlayerPosition(
+            this.currentMapId,
+            this.x,
+            this.y,
+            this.width,
+            this.height
+        );
+
+        this.x = nextPosition.x;
+        this.y = nextPosition.y;
+        this.path = [];
+        this.path_pos = 0;
+
+        World.socketServer.emit("move"+this.socketId, {
+            x:this.x,
+            y:this.y,
+            angle:this.angle,
+            playerId:this.socketId,
+            id:this.id,
+            currentMapId:this.currentMapId,
+            teleported:true
+        })
+
+        return true;
     }
 
     /**
@@ -217,7 +273,11 @@ export default class Player {
             x:this.x,
             y:this.y,
             angle:this.angle,
-            id:this.id
+            id:this.id,
+            username:this.username,
+            name:this.name,
+            profileImage:this.profileImage,
+            description:this.description
         }
         console.log("presenting existing player with data:", playerData)
         return{
@@ -226,7 +286,11 @@ export default class Player {
             x:this.x,
             y:this.y,
             angle:this.angle,
-            id:this.id
+            id:this.id,
+            username:this.username,
+            name:this.name,
+            profileImage:this.profileImage,
+            description:this.description
         }
     }
 
@@ -263,6 +327,15 @@ export default class Player {
             currentMapId:this.currentMapId,
             stopped:true
         })
+    }
+
+    public enterBattle() {
+        this.inBattle = true;
+        this.stopMovement();
+    }
+
+    public leaveBattle() {
+        this.inBattle = false;
     }
 
     /**

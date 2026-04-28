@@ -3,6 +3,7 @@ import Projectil from "./projectil"
 import GameMath from "./gameMath";
 import Pathfinding = require("pathfinding")
 import type { PlayableMapsStateSnapshot } from "./PlayableMapsState";
+import type BattleManager from "./BattleManager";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -37,6 +38,7 @@ export default class World {
     objectsByMapId: Map<string, MapObstacle[]>;
     mapBoundsByMapId: Map<string, MapBounds>;
     playableMapsState: PlayableMapsStateSnapshot | null;
+    battleManager: BattleManager | null;
     //finder:Pathfinding.Finder;
     //grid_backup:Pathfinding.Grid;
     
@@ -58,6 +60,7 @@ export default class World {
         this.objectsByMapId = new Map<string, MapObstacle[]>();
         this.mapBoundsByMapId = new Map<string, MapBounds>();
         this.playableMapsState = null;
+        this.battleManager = null;
 
         //this.finder = new Pathfinding.AStarFinder({ diagonalMovement: 1 })
         //this.grid_backup = this.grid.clone()
@@ -232,6 +235,14 @@ export default class World {
         this.playableMapsState = playableMapsState;
     }
 
+    setBattleManager(battleManager: BattleManager) {
+        this.battleManager = battleManager;
+    }
+
+    handlePlayerStep(player: Player) {
+        this.battleManager?.handlePlayerStep(player);
+    }
+
     getPlayableMapsState() {
         return this.playableMapsState;
     }
@@ -247,10 +258,12 @@ export default class World {
         const mapBounds = this.getMapBounds(mapId);
         const maxX = Math.max(0, mapBounds.width - playerWidth);
         const maxY = Math.max(0, mapBounds.height - playerHeight);
+        const safeX = Number.isFinite(x) ? x : 0;
+        const safeY = Number.isFinite(y) ? y : 0;
 
         return {
-            x: Math.max(0, Math.min(Math.round(x), maxX)),
-            y: Math.max(0, Math.min(Math.round(y), maxY))
+            x: Math.max(0, Math.min(Math.round(safeX), maxX)),
+            y: Math.max(0, Math.min(Math.round(safeY), maxY))
         };
     }
 
@@ -269,6 +282,28 @@ export default class World {
         };
 
         return this.getMapObjects(mapId).some((object) => this.checkCollision(playerBounds, object));
+    }
+
+    isOpenPlayerPosition(
+        mapId:string,
+        x:number,
+        y:number,
+        playerWidth:number,
+        playerHeight:number
+    ) {
+        const mapBounds = this.getMapBounds(mapId);
+        const maxX = Math.max(0, mapBounds.width - playerWidth);
+        const maxY = Math.max(0, mapBounds.height - playerHeight);
+
+        return (
+            Number.isFinite(x) &&
+            Number.isFinite(y) &&
+            x >= 0 &&
+            y >= 0 &&
+            x <= maxX &&
+            y <= maxY &&
+            !this.isPlayerPositionBlocked(mapId, x, y, playerWidth, playerHeight)
+        );
     }
 
     resolveOpenPlayerPosition(
@@ -360,7 +395,13 @@ export default class World {
     addPlayer(
         socketId:string,
         spawnState?: { mapId?: string; x?: number; y?: number },
-        userId?: number | null
+        userId?: number | null,
+        trainerProfile?: {
+            username?: string;
+            name?: string;
+            profileImage?: string;
+            description?: string;
+        }
     ) {
         const existingPlayerForSocket = this.getPlayerBySocket(socketId);
         if (existingPlayerForSocket) {
@@ -402,7 +443,8 @@ export default class World {
             this,
             mapId,
             socketId,
-            typeof userId === "number" ? userId : null
+            typeof userId === "number" ? userId : null,
+            trainerProfile
         );
 
         this.players.set(playerId, player);

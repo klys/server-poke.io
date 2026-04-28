@@ -14,6 +14,7 @@ export interface AuthenticatedUser {
     inventory:InventoryItem[];
     pokemonParty:PokemonSummary[];
     trainerGender:string;
+    money:number;
 }
 
 export interface AuthSessionState {
@@ -67,6 +68,7 @@ export interface PokemonSummary {
     hp:number;
     maxHp:number;
     moves:string[];
+    movePp?:Record<string, number>;
     experience:number;
     experienceCurve:"fast" | "medium" | "slow";
     nextLevelExperience:number;
@@ -158,6 +160,7 @@ const DEFAULT_INVENTORY:InventoryItem[] = [
 ];
 
 const DEFAULT_POKEMON_PARTY:PokemonSummary[] = [];
+const DEFAULT_MONEY = 1000;
 const LEGACY_DEMO_POKEMON_PARTY_IDS = new Set(["starter-001"]);
 
 export default class Auth {
@@ -285,6 +288,61 @@ export default class Auth {
             last_x: String(Math.round(location.x)),
             last_y: String(Math.round(location.y))
         });
+    }
+
+    public async getUserForBattle(userId:number) {
+        return this.getUserById(String(userId));
+    }
+
+    public async saveBattleState(
+        userId:number,
+        state:{
+            pokemonParty?:PokemonSummary[];
+            inventory?:InventoryItem[];
+            money?:number;
+        }
+    ) {
+        const fields:Record<string, string> = {};
+
+        if (state.pokemonParty) {
+            fields.pokemon_party = JSON.stringify(this.sanitizePokemonPartyForStorage(state.pokemonParty));
+        }
+
+        if (state.inventory) {
+            fields.inventory = JSON.stringify(this.sanitizeInventoryForStorage(state.inventory));
+        }
+
+        if (typeof state.money === "number" && Number.isFinite(state.money)) {
+            fields.money = String(Math.max(0, Math.round(state.money)));
+        }
+
+        if (Object.keys(fields).length > 0) {
+            await this.redis.hSet(this.userKey(userId), fields);
+        }
+
+        return this.getUserById(String(userId));
+    }
+
+    public async transferMoney(loserUserId:number, winnerUserId:number, amount:number) {
+        const loser = await this.getUserForBattle(loserUserId);
+        const winner = await this.getUserForBattle(winnerUserId);
+
+        if (!loser || !winner) {
+            return null;
+        }
+
+        const transferAmount = Math.max(0, Math.min(Math.round(amount), loser.money));
+
+        await Promise.all([
+            this.saveBattleState(loserUserId, { money: loser.money - transferAmount }),
+            this.saveBattleState(winnerUserId, { money: winner.money + transferAmount })
+        ]);
+
+        return {
+            transferAmount,
+            loser: await this.getUserForBattle(loserUserId),
+            winner: await this.getUserForBattle(winnerUserId)
+        };
     }
 
     public async requestPasswordRecovery(payload:RecoverPasswordPayload):Promise<AuthInfoResult | AuthErrorResult> {
@@ -488,6 +546,7 @@ export default class Auth {
                 .slice(0, 4)
                 .map((skill) => skill.skillName)
                 .filter(Boolean),
+            movePp: {},
             experience: 0,
             experienceCurve: "medium",
             nextLevelExperience: 100
@@ -611,6 +670,7 @@ export default class Auth {
                     inventory: JSON.stringify(DEFAULT_INVENTORY),
                     pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
                     trainer_gender: "",
+                    money: String(DEFAULT_MONEY),
                     created_at: createdAt
                 })
                 .set(usernameKey, String(userId))
@@ -628,7 +688,8 @@ export default class Auth {
                     description: "",
                     inventory: DEFAULT_INVENTORY,
                     pokemonParty: DEFAULT_POKEMON_PARTY,
-                    trainerGender: ""
+                    trainerGender: "",
+                    money: DEFAULT_MONEY
                 };
             }
         }
@@ -758,6 +819,9 @@ export default class Auth {
         if (typeof user.trainer_gender !== "string") {
             defaultFields.trainer_gender = "";
         }
+        if (typeof user.money !== "string") {
+            defaultFields.money = String(DEFAULT_MONEY);
+        }
 
         if (Object.keys(defaultFields).length > 0) {
             await this.redis.hSet(this.userKey(userId), defaultFields);
@@ -776,6 +840,7 @@ export default class Auth {
             inventory: this.parseInventory(user.inventory),
             pokemonParty: this.parsePokemonParty(user.pokemon_party),
             trainerGender: user.trainer_gender ?? "",
+            money: this.parseMoney(user.money),
             created_at: user.created_at
         } satisfies StoredUser;
     }
@@ -791,8 +856,25 @@ export default class Auth {
             description: user.description,
             inventory: user.inventory,
             pokemonParty: user.pokemonParty,
-            trainerGender: user.trainerGender
+            trainerGender: user.trainerGender,
+            money: user.money
         };
+    }
+
+    private sanitizeInventoryForStorage(inventory:InventoryItem[]) {
+        return inventory
+            .filter((item): item is InventoryItem =>
+                typeof item?.id === "string" &&
+                typeof item?.name === "string" &&
+                ["usable", "berries", "moves", "quest"].includes(item?.category) &&
+                typeof item?.quantity === "number" &&
+                Number.isFinite(item.quantity) &&
+                typeof item?.description === "string"
+            )
+            .map((item) => ({
+                ...item,
+                quantity: Math.max(0, Math.round(item.quantity))
+            }));
     }
 
     private parseInventory(value:string | undefined) {
@@ -806,22 +888,69 @@ export default class Auth {
                 return DEFAULT_INVENTORY;
             }
 
-            return parsed
-                .filter((item): item is InventoryItem =>
-                    typeof item?.id === "string" &&
-                    typeof item?.name === "string" &&
-                    ["usable", "berries", "moves", "quest"].includes(item?.category) &&
-                    typeof item?.quantity === "number" &&
-                    Number.isFinite(item.quantity) &&
-                    typeof item?.description === "string"
-                )
-                .map((item) => ({
-                    ...item,
-                    quantity: Math.max(0, Math.round(item.quantity))
-                }));
+            return this.sanitizeInventoryForStorage(parsed);
         } catch {
             return DEFAULT_INVENTORY;
         }
+    }
+
+    private sanitizePokemonPartyForStorage(party:PokemonSummary[]) {
+        return party
+            .filter((pokemon): pokemon is PokemonSummary =>
+                typeof pokemon?.id === "string" &&
+                typeof pokemon?.name === "string" &&
+                typeof pokemon?.level === "number" &&
+                Number.isFinite(pokemon.level) &&
+                Array.isArray(pokemon?.types) &&
+                typeof pokemon?.hp === "number" &&
+                Number.isFinite(pokemon.hp) &&
+                typeof pokemon?.maxHp === "number" &&
+                Number.isFinite(pokemon.maxHp) &&
+                Array.isArray(pokemon?.moves)
+            )
+            .slice(0, 6)
+            .map((pokemon) => {
+                const moves = pokemon.moves
+                    .filter((move): move is string => typeof move === "string")
+                    .slice(0, 4);
+                const movePp =
+                    pokemon.movePp && typeof pokemon.movePp === "object"
+                        ? moves.reduce<Record<string, number>>((accumulator, move) => {
+                            const currentPp = pokemon.movePp?.[move];
+                            if (typeof currentPp === "number" && Number.isFinite(currentPp)) {
+                                accumulator[move] = Math.max(0, Math.round(currentPp));
+                            }
+                            return accumulator;
+                        }, {})
+                        : {};
+
+                return {
+                    ...pokemon,
+                    sourcePokemonId:
+                        typeof pokemon.sourcePokemonId === "string" ? pokemon.sourcePokemonId : undefined,
+                    level: Math.max(1, Math.round(pokemon.level)),
+                    hp: Math.max(0, Math.round(pokemon.hp)),
+                    maxHp: Math.max(1, Math.round(pokemon.maxHp)),
+                    types: pokemon.types.filter((type): type is string => typeof type === "string"),
+                    moves,
+                    movePp,
+                    experience:
+                        typeof pokemon.experience === "number" && Number.isFinite(pokemon.experience)
+                            ? Math.max(0, Math.round(pokemon.experience))
+                            : 0,
+                    experienceCurve:
+                        pokemon.experienceCurve === "fast" ||
+                        pokemon.experienceCurve === "medium" ||
+                        pokemon.experienceCurve === "slow"
+                            ? pokemon.experienceCurve
+                            : "medium",
+                    nextLevelExperience:
+                        typeof pokemon.nextLevelExperience === "number" &&
+                        Number.isFinite(pokemon.nextLevelExperience)
+                            ? Math.max(1, Math.round(pokemon.nextLevelExperience))
+                            : 100
+                };
+            });
     }
 
     private parsePokemonParty(value:string | undefined) {
@@ -839,48 +968,19 @@ export default class Auth {
                 return DEFAULT_POKEMON_PARTY;
             }
 
-            return parsed
-                .filter((pokemon): pokemon is PokemonSummary =>
-                    typeof pokemon?.id === "string" &&
-                    typeof pokemon?.name === "string" &&
-                    typeof pokemon?.level === "number" &&
-                    Number.isFinite(pokemon.level) &&
-                    Array.isArray(pokemon?.types) &&
-                    typeof pokemon?.hp === "number" &&
-                    Number.isFinite(pokemon.hp) &&
-                    typeof pokemon?.maxHp === "number" &&
-                    Number.isFinite(pokemon.maxHp) &&
-                    Array.isArray(pokemon?.moves)
-                )
-                .slice(0, 6)
-                .map((pokemon) => ({
-                    ...pokemon,
-                    sourcePokemonId:
-                        typeof pokemon.sourcePokemonId === "string" ? pokemon.sourcePokemonId : undefined,
-                    level: Math.max(1, Math.round(pokemon.level)),
-                    hp: Math.max(0, Math.round(pokemon.hp)),
-                    maxHp: Math.max(1, Math.round(pokemon.maxHp)),
-                    types: pokemon.types.filter((type): type is string => typeof type === "string"),
-                    moves: pokemon.moves.filter((move): move is string => typeof move === "string").slice(0, 4),
-                    experience:
-                        typeof pokemon.experience === "number" && Number.isFinite(pokemon.experience)
-                            ? Math.max(0, Math.round(pokemon.experience))
-                            : 0,
-                    experienceCurve:
-                        pokemon.experienceCurve === "fast" ||
-                        pokemon.experienceCurve === "medium" ||
-                        pokemon.experienceCurve === "slow"
-                            ? pokemon.experienceCurve
-                            : "medium",
-                    nextLevelExperience:
-                        typeof pokemon.nextLevelExperience === "number" &&
-                        Number.isFinite(pokemon.nextLevelExperience)
-                            ? Math.max(1, Math.round(pokemon.nextLevelExperience))
-                            : 100
-                }));
+            return this.sanitizePokemonPartyForStorage(parsed);
         } catch {
             return DEFAULT_POKEMON_PARTY;
         }
+    }
+
+    private parseMoney(value:string | undefined) {
+        if (typeof value !== "string") {
+            return DEFAULT_MONEY;
+        }
+
+        const parsed = Number.parseInt(value, 10);
+        return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : DEFAULT_MONEY;
     }
 
     private isLegacyDemoPokemonParty(value:unknown[]) {
