@@ -12,6 +12,7 @@ import type { SocketData } from "../Server/registerSocketHandlers";
 import type ServerToClientEvents from "../Server/ServerToClientEvents";
 
 const PLAYER_ACTION_TIMEOUT_MS = 60_000;
+const BATTLE_ACTION_STEP_DELAY_MS = 5_000;
 const PVP_SURRENDER_REWARD = 300;
 const DEFAULT_IV = 0;
 const DEFAULT_EV = 0;
@@ -100,6 +101,17 @@ export type BattlePublicSide = {
   party: BattlePublicPokemon[];
 };
 
+export type BattlePublicSummary = {
+  battleId: string;
+  kind: BattleKind;
+  winnerName: string | null;
+  loserName: string | null;
+  result: string;
+  startedAt: string;
+  endedAt: string | null;
+  log: string[];
+};
+
 export type BattlePublicState = {
   id: string;
   kind: BattleKind;
@@ -114,6 +126,7 @@ export type BattlePublicState = {
   turnEndsAt: string | null;
   log: string[];
   result: string | null;
+  summary: BattlePublicSummary | null;
 };
 
 type BattleStats = {
@@ -179,6 +192,9 @@ type BattleSession = {
   timer: NodeJS.Timeout | null;
   log: string[];
   result: string | null;
+  startedAt: string;
+  endedAt: string | null;
+  summary: BattlePublicSummary | null;
 };
 
 type PokemonDefinition = {
@@ -722,7 +738,10 @@ export default class BattleManager {
       turnEndsAt: null,
       timer: null,
       log,
-      result: null
+      result: null,
+      startedAt: new Date().toISOString(),
+      endedAt: null,
+      summary: null
     };
   }
 
@@ -779,7 +798,6 @@ export default class BattleManager {
     }
 
     this.clearBattleTimer(battle);
-    const turnLog: string[] = [];
     const [firstSide, secondSide] = battle.sides;
 
     for (const side of battle.sides) {
@@ -807,16 +825,17 @@ export default class BattleManager {
       }
 
       const escaped = this.tryEscape(runSide, this.getOpponentSide(battle, runSide));
-      turnLog.push(escaped ? "You got away safely." : "You could not escape.");
+      const escapeLog = escaped ? "You got away safely." : "You could not escape.";
+      await this.emitBattleStep(battle, escapeLog, !escaped);
       if (escaped) {
-        await this.finishBattle(battle, turnLog[turnLog.length - 1], null, null);
+        await this.finishBattle(battle, escapeLog, null, null);
         return;
       }
     }
 
     for (const side of battle.sides) {
       if (side.action?.type === "bag") {
-        turnLog.push(this.applyItemAction(side, side.action));
+        await this.emitBattleStep(battle, this.applyItemAction(side, side.action));
       }
     }
 
@@ -824,7 +843,7 @@ export default class BattleManager {
       if (side.action?.type === "pokemon") {
         const switched = this.switchPokemon(side, side.action.pokemonId);
         if (switched) {
-          turnLog.push(`${side.trainerName} sent out ${getActivePokemon(side).name}.`);
+          await this.emitBattleStep(battle, `${side.trainerName} sent out ${getActivePokemon(side).name}.`);
         }
       }
     }
@@ -846,10 +865,10 @@ export default class BattleManager {
         continue;
       }
 
-      turnLog.push(this.applyMoveAction(side, target, side.action.moveId));
+      await this.emitBattleStep(battle, this.applyMoveAction(side, target, side.action.moveId));
 
       if (isFainted(targetPokemon)) {
-        turnLog.push(`${targetPokemon.name} fainted.`);
+        await this.emitBattleStep(battle, `${targetPokemon.name} fainted.`);
         if (!this.autoSwitchIfPossible(target)) {
           await this.finishBattle(
             battle,
@@ -859,13 +878,25 @@ export default class BattleManager {
           );
           return;
         }
-        turnLog.push(`${target.trainerName} sent out ${getActivePokemon(target).name}.`);
+        await this.emitBattleStep(battle, `${target.trainerName} sent out ${getActivePokemon(target).name}.`);
       }
     }
 
-    battle.log = [...battle.log, ...turnLog].slice(-8);
     battle.turn += 1;
     this.startChoiceTurn(battle);
+  }
+
+  private async emitBattleStep(battle: BattleSession, message: string, shouldPause = true) {
+    if (battle.status !== "active") {
+      return;
+    }
+
+    this.appendBattleLog(battle, message);
+    this.emitBattleState(battle);
+
+    if (shouldPause) {
+      await delay(BATTLE_ACTION_STEP_DELAY_MS);
+    }
   }
 
   private async finishBattle(
@@ -876,7 +907,10 @@ export default class BattleManager {
   ) {
     battle.status = "ended";
     battle.result = result;
-    battle.log = [...battle.log, result].slice(-8);
+    battle.endedAt = new Date().toISOString();
+    if (battle.log[battle.log.length - 1] !== result) {
+      this.appendBattleLog(battle, result);
+    }
     this.clearBattleTimer(battle);
 
     if (battle.kind === "trainer" && winner?.userId && loser?.userId) {
@@ -886,17 +920,31 @@ export default class BattleManager {
       battle.log = [
         ...battle.log,
         `${winner.trainerName} received $${transferAmount}.`
-      ].slice(-8);
+      ];
     }
+
+    battle.summary = this.createBattleSummary(battle, result, winner, loser);
 
     await Promise.all(
       battle.sides
         .filter((side) => typeof side.userId === "number")
         .map(async (side) => {
-          const user = await this.auth.saveBattleState(side.userId!, {
+          await this.auth.saveBattleState(side.userId!, {
             pokemonParty: this.toPokemonPartySummaries(side),
             inventory: side.inventory,
             money: side.money
+          });
+          const user = await this.auth.appendBattleHistory(side.userId!, {
+            id: crypto.randomUUID(),
+            battleId: battle.summary!.battleId,
+            kind: battle.summary!.kind,
+            opponentName: this.getOpponentSide(battle, side).trainerName,
+            winnerName: battle.summary!.winnerName,
+            loserName: battle.summary!.loserName,
+            result: battle.summary!.result,
+            startedAt: battle.summary!.startedAt,
+            endedAt: battle.summary!.endedAt ?? new Date().toISOString(),
+            log: battle.summary!.log
           });
           if (user) {
             this.emitAuthSession(side, user);
@@ -1505,6 +1553,28 @@ export default class BattleManager {
     });
   }
 
+  private appendBattleLog(battle: BattleSession, message: string) {
+    battle.log = [...battle.log, message];
+  }
+
+  private createBattleSummary(
+    battle: BattleSession,
+    result: string,
+    winner: BattleSide | null,
+    loser: BattleSide | null
+  ): BattlePublicSummary {
+    return {
+      battleId: battle.id,
+      kind: battle.kind,
+      winnerName: winner?.trainerName ?? null,
+      loserName: loser?.trainerName ?? null,
+      result,
+      startedAt: battle.startedAt,
+      endedAt: battle.endedAt,
+      log: battle.log.slice(-100)
+    };
+  }
+
   private toPublicState(battle: BattleSession, self: BattleSide): BattlePublicState {
     const opponent = this.getOpponentSide(battle, self);
     const canAct = battle.status === "active" && !self.isAi && !self.action && !isFainted(getActivePokemon(self));
@@ -1532,7 +1602,8 @@ export default class BattleManager {
       selectedActionType,
       turnEndsAt: battle.turnEndsAt ? new Date(battle.turnEndsAt).toISOString() : null,
       log: battle.log,
-      result: battle.result
+      result: battle.result,
+      summary: battle.summary
     };
   }
 
@@ -1588,4 +1659,10 @@ export default class BattleManager {
   ) {
     (this.io.in(socketId) as any).emit(eventName, payload);
   }
+}
+
+function delay(ms: number) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }

@@ -15,6 +15,7 @@ export interface AuthenticatedUser {
     pokemonParty:PokemonSummary[];
     trainerGender:string;
     money:number;
+    battleHistory:BattleHistoryEntry[];
 }
 
 export interface AuthSessionState {
@@ -72,6 +73,19 @@ export interface PokemonSummary {
     experience:number;
     experienceCurve:"fast" | "medium" | "slow";
     nextLevelExperience:number;
+}
+
+export interface BattleHistoryEntry {
+    id:string;
+    battleId:string;
+    kind:"wild" | "trainer";
+    opponentName:string;
+    winnerName:string | null;
+    loserName:string | null;
+    result:string;
+    startedAt:string;
+    endedAt:string;
+    log:string[];
 }
 
 interface SessionTokenPayload extends JwtPayload {
@@ -160,7 +174,9 @@ const DEFAULT_INVENTORY:InventoryItem[] = [
 ];
 
 const DEFAULT_POKEMON_PARTY:PokemonSummary[] = [];
+const DEFAULT_BATTLE_HISTORY:BattleHistoryEntry[] = [];
 const DEFAULT_MONEY = 1000;
+const MAX_BATTLE_HISTORY_ITEMS = 50;
 const LEGACY_DEMO_POKEMON_PARTY_IDS = new Set(["starter-001"]);
 
 export default class Auth {
@@ -319,6 +335,20 @@ export default class Auth {
         if (Object.keys(fields).length > 0) {
             await this.redis.hSet(this.userKey(userId), fields);
         }
+
+        return this.getUserById(String(userId));
+    }
+
+    public async appendBattleHistory(userId:number, entry:BattleHistoryEntry) {
+        const user = await this.getUserById(String(userId));
+        const battleHistory = this.sanitizeBattleHistoryForStorage([
+            entry,
+            ...(user?.battleHistory ?? [])
+        ]);
+
+        await this.redis.hSet(this.userKey(userId), {
+            battle_history: JSON.stringify(battleHistory)
+        });
 
         return this.getUserById(String(userId));
     }
@@ -671,6 +701,7 @@ export default class Auth {
                     pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
                     trainer_gender: "",
                     money: String(DEFAULT_MONEY),
+                    battle_history: JSON.stringify(DEFAULT_BATTLE_HISTORY),
                     created_at: createdAt
                 })
                 .set(usernameKey, String(userId))
@@ -689,7 +720,8 @@ export default class Auth {
                     inventory: DEFAULT_INVENTORY,
                     pokemonParty: DEFAULT_POKEMON_PARTY,
                     trainerGender: "",
-                    money: DEFAULT_MONEY
+                    money: DEFAULT_MONEY,
+                    battleHistory: DEFAULT_BATTLE_HISTORY
                 };
             }
         }
@@ -822,6 +854,9 @@ export default class Auth {
         if (typeof user.money !== "string") {
             defaultFields.money = String(DEFAULT_MONEY);
         }
+        if (typeof user.battle_history !== "string") {
+            defaultFields.battle_history = JSON.stringify(DEFAULT_BATTLE_HISTORY);
+        }
 
         if (Object.keys(defaultFields).length > 0) {
             await this.redis.hSet(this.userKey(userId), defaultFields);
@@ -841,6 +876,7 @@ export default class Auth {
             pokemonParty: this.parsePokemonParty(user.pokemon_party),
             trainerGender: user.trainer_gender ?? "",
             money: this.parseMoney(user.money),
+            battleHistory: this.parseBattleHistory(user.battle_history),
             created_at: user.created_at
         } satisfies StoredUser;
     }
@@ -857,8 +893,55 @@ export default class Auth {
             inventory: user.inventory,
             pokemonParty: user.pokemonParty,
             trainerGender: user.trainerGender,
-            money: user.money
+            money: user.money,
+            battleHistory: user.battleHistory
         };
+    }
+
+    private sanitizeBattleHistoryForStorage(history:BattleHistoryEntry[]) {
+        return history
+            .filter((entry): entry is BattleHistoryEntry =>
+                typeof entry?.id === "string" &&
+                typeof entry?.battleId === "string" &&
+                (entry?.kind === "wild" || entry?.kind === "trainer") &&
+                typeof entry?.opponentName === "string" &&
+                typeof entry?.result === "string" &&
+                typeof entry?.startedAt === "string" &&
+                typeof entry?.endedAt === "string" &&
+                Array.isArray(entry?.log)
+            )
+            .slice(0, MAX_BATTLE_HISTORY_ITEMS)
+            .map((entry) => ({
+                id: entry.id,
+                battleId: entry.battleId,
+                kind: entry.kind,
+                opponentName: entry.opponentName,
+                winnerName: typeof entry.winnerName === "string" ? entry.winnerName : null,
+                loserName: typeof entry.loserName === "string" ? entry.loserName : null,
+                result: entry.result,
+                startedAt: entry.startedAt,
+                endedAt: entry.endedAt,
+                log: entry.log
+                    .filter((line): line is string => typeof line === "string")
+                    .slice(-100)
+            }));
+    }
+
+    private parseBattleHistory(value:string | undefined) {
+        if (!value) {
+            return DEFAULT_BATTLE_HISTORY;
+        }
+
+        try {
+            const parsed = JSON.parse(value);
+            if (!Array.isArray(parsed)) {
+                return DEFAULT_BATTLE_HISTORY;
+            }
+
+            return this.sanitizeBattleHistoryForStorage(parsed);
+        } catch {
+            return DEFAULT_BATTLE_HISTORY;
+        }
     }
 
     private sanitizeInventoryForStorage(inventory:InventoryItem[]) {
