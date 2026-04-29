@@ -4,6 +4,7 @@ import type { AuthenticatedUser, InventoryItem, PokemonSummary } from "./Auth";
 import Auth from "./Auth";
 import type DesignerSectionStore from "./DesignerSectionStore";
 import type { DesignerSectionItem } from "./DesignerSectionStore";
+import type { GroundItem } from "./GroundItemStore";
 import type Player from "./player";
 import type World from "./world";
 import type ClientToServerEvents from "../Server/ClientToServerEvents";
@@ -221,6 +222,11 @@ type ItemDefinition = {
   id: string;
   name: string;
   type: string;
+  category: InventoryItem["category"];
+  description: string;
+  iconSrc: string;
+  skillId: string;
+  skillName: string;
   statModifiers: {
     hp: number;
     attack: number;
@@ -288,6 +294,25 @@ function normalizeType(value: string) {
 
 function normalizeText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function toInventoryCategory(value: string): InventoryItem["category"] {
+  switch (value.toLowerCase()) {
+    case "berries":
+      return "berries";
+    case "skill item":
+    case "machines":
+      return "moves";
+    case "quest item":
+      return "quest";
+    case "usable":
+    case "medicine":
+    case "battle item":
+    case "battle items":
+      return "usable";
+    default:
+      return "quest";
+  }
 }
 
 function getStageMultiplier(stage: number) {
@@ -412,6 +437,171 @@ export default class BattleManager {
 
   public isPlayerBattling(playerId: string) {
     return this.playerBattleIds.has(playerId);
+  }
+
+  public async useInventoryItem(
+    userId: number,
+    itemId: string,
+    targetPokemonId?: string
+  ) {
+    const user = await this.auth.getUserForBattle(userId);
+    await this.loadCatalogs();
+    const item = user?.inventory.find((candidate) => candidate.id === itemId);
+    const itemDefinition = this.getCachedItemDefinition(itemId, item?.name ?? "");
+
+    if (!user || !item || !itemDefinition || item.quantity <= 0) {
+      return { ok: false, message: "That item is no longer available." };
+    }
+
+    if (!["usable", "berries"].includes(item.category)) {
+      return { ok: false, message: "That item cannot be used from the bag." };
+    }
+
+    const targetPokemon = user.pokemonParty.find((pokemon) => pokemon.id === targetPokemonId);
+
+    if (!targetPokemon) {
+      return { ok: false, message: "Choose a Pokemon for this item." };
+    }
+
+    if (itemDefinition.statModifiers.hp > 0 && targetPokemon.hp >= targetPokemon.maxHp) {
+      return { ok: false, message: `${targetPokemon.name} already has full HP.` };
+    }
+
+    const beforeHp = targetPokemon.hp;
+    targetPokemon.hp = Math.min(
+      targetPokemon.maxHp,
+      Math.max(0, targetPokemon.hp + itemDefinition.statModifiers.hp)
+    );
+    const nextInventory = this.removeInventoryQuantity(user.inventory, item.id, 1);
+    const nextUser = await this.auth.saveBattleState(userId, {
+      pokemonParty: user.pokemonParty,
+      inventory: nextInventory
+    });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message:
+        itemDefinition.statModifiers.hp > 0
+          ? `${targetPokemon.name} recovered ${targetPokemon.hp - beforeHp} HP.`
+          : `${item.name} was used on ${targetPokemon.name}.`
+    };
+  }
+
+  public async teachInventoryMove(
+    userId: number,
+    itemId: string,
+    targetPokemonId?: string
+  ) {
+    const user = await this.auth.getUserForBattle(userId);
+    await this.loadCatalogs();
+    const item = user?.inventory.find((candidate) => candidate.id === itemId);
+    const itemDefinition = this.getCachedItemDefinition(itemId, item?.name ?? "");
+
+    if (!user || !item || !itemDefinition || item.quantity <= 0) {
+      return { ok: false, message: "That move item is no longer available." };
+    }
+
+    if (item.category !== "moves" || !itemDefinition.skillName) {
+      return { ok: false, message: "That item cannot teach a move." };
+    }
+
+    const targetPokemon = user.pokemonParty.find((pokemon) => pokemon.id === targetPokemonId);
+
+    if (!targetPokemon) {
+      return { ok: false, message: "Choose a Pokemon to teach." };
+    }
+
+    if (targetPokemon.moves.includes(itemDefinition.skillName)) {
+      return { ok: false, message: `${targetPokemon.name} already knows ${itemDefinition.skillName}.` };
+    }
+
+    if (targetPokemon.moves.length >= 4) {
+      return { ok: false, message: `${targetPokemon.name} already knows four moves.` };
+    }
+
+    targetPokemon.moves = [...targetPokemon.moves, itemDefinition.skillName];
+    const nextInventory = this.removeInventoryQuantity(user.inventory, item.id, 1);
+    const nextUser = await this.auth.saveBattleState(userId, {
+      pokemonParty: user.pokemonParty,
+      inventory: nextInventory
+    });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: `${targetPokemon.name} learned ${itemDefinition.skillName}.`
+    };
+  }
+
+  public async throwInventoryItem(
+    userId: number,
+    itemId: string,
+    quantity: number,
+    player: Player
+  ) {
+    const user = await this.auth.getUserForBattle(userId);
+    await this.loadCatalogs();
+    const item = user?.inventory.find((candidate) => candidate.id === itemId);
+    const itemDefinition = this.getCachedItemDefinition(itemId, item?.name ?? "");
+    const throwQuantity = Math.max(1, Math.round(quantity));
+
+    if (!user || !item || !itemDefinition || item.quantity <= 0) {
+      return { ok: false, message: "That item is no longer available." };
+    }
+
+    if (throwQuantity > item.quantity) {
+      return { ok: false, message: "You do not have that many to throw away." };
+    }
+
+    const nextInventory = this.removeInventoryQuantity(user.inventory, item.id, throwQuantity);
+    const nextUser = await this.auth.saveInventory(userId, nextInventory);
+    const droppedItem = this.world.dropGroundItem({
+      itemId: itemDefinition.id,
+      itemName: itemDefinition.name,
+      category: itemDefinition.category,
+      description: itemDefinition.description,
+      iconSrc: itemDefinition.iconSrc,
+      quantity: throwQuantity,
+      mapId: player.currentMapId,
+      x: player.x,
+      y: player.y
+    });
+
+    return {
+      ok: true,
+      user: nextUser,
+      droppedItem,
+      message: `You threw away ${itemDefinition.name} x${throwQuantity}.`
+    };
+  }
+
+  public async pickUpGroundItem(player: Player, groundItem: GroundItem) {
+    if (typeof player.userId !== "number") {
+      return false;
+    }
+
+    const user = await this.auth.getUserForBattle(player.userId);
+    await this.loadCatalogs();
+    const itemDefinition = this.getCachedItemDefinition(groundItem.itemId, groundItem.itemName);
+
+    if (!user || !itemDefinition) {
+      return false;
+    }
+
+    const inventory = this.addInventoryQuantity(user.inventory, itemDefinition, groundItem.quantity);
+    const nextUser = await this.auth.saveInventory(player.userId, inventory);
+
+    this.emitToPlayer(player, "auth:session", {
+      authenticated: true,
+      user: nextUser,
+      token: undefined
+    });
+    this.emitToPlayer(player, "auth:info", {
+      message: `You have pick up ${itemDefinition.name} x${groundItem.quantity}`
+    });
+
+    return true;
   }
 
   public handlePlayerStep(player: Player) {
@@ -1112,6 +1302,52 @@ export default class BattleManager {
     ) ?? null;
   }
 
+  private removeInventoryQuantity(inventory: InventoryItem[], itemId: string, quantity: number) {
+    const removeQuantity = Math.max(1, Math.round(quantity));
+
+    return inventory
+      .map((item) =>
+        item.id === itemId
+          ? {
+              ...item,
+              quantity: item.quantity - removeQuantity
+            }
+          : item
+      )
+      .filter((item) => item.quantity > 0);
+  }
+
+  private addInventoryQuantity(
+    inventory: InventoryItem[],
+    itemDefinition: ItemDefinition,
+    quantity: number
+  ) {
+    const addQuantity = Math.max(1, Math.round(quantity));
+    const existingItem = inventory.find((item) => item.id === itemDefinition.id);
+
+    if (existingItem) {
+      return inventory.map((item) =>
+        item.id === itemDefinition.id
+          ? {
+              ...item,
+              quantity: item.quantity + addQuantity
+            }
+          : item
+      );
+    }
+
+    return [
+      ...inventory,
+      {
+        id: itemDefinition.id,
+        name: itemDefinition.name,
+        category: itemDefinition.category,
+        quantity: addQuantity,
+        description: itemDefinition.description
+      }
+    ];
+  }
+
   private switchPokemon(side: BattleSide, pokemonId: string) {
     const targetIndex = side.party.findIndex((pokemon) => pokemon.id === pokemonId);
     if (targetIndex < 0 || targetIndex === side.activeIndex || isFainted(side.party[targetIndex])) {
@@ -1352,6 +1588,10 @@ export default class BattleManager {
   private toItemDefinition(item: DesignerSectionItem): ItemDefinition | null {
     const profile = item.itemProfile as {
       type?: unknown;
+      description?: unknown;
+      iconSrc?: unknown;
+      skillId?: unknown;
+      skillName?: unknown;
       statModifiers?: {
         hp?: unknown;
         attack?: unknown;
@@ -1370,6 +1610,11 @@ export default class BattleManager {
       id: item.id,
       name: item.name,
       type: normalizeText(profile.type),
+      category: toInventoryCategory(normalizeText(profile.type)),
+      description: typeof profile.description === "string" ? profile.description : "",
+      iconSrc: typeof profile.iconSrc === "string" ? profile.iconSrc : "",
+      skillId: typeof profile.skillId === "string" ? profile.skillId : "",
+      skillName: typeof profile.skillName === "string" ? profile.skillName : "",
       statModifiers: {
         hp: parseNumber(profile.statModifiers.hp, 0),
         attack: parseNumber(profile.statModifiers.attack, 0),

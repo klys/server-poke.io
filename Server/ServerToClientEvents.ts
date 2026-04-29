@@ -38,6 +38,21 @@ interface ObjectData {
   height: number;
 }
 
+interface GroundItemData {
+  id: string;
+  itemId: string;
+  itemName: string;
+  category: string;
+  description: string;
+  iconSrc: string;
+  quantity: number;
+  mapId: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 interface AuthUserData {
   id: number;
   name: string;
@@ -84,6 +99,8 @@ export default interface ServerToClientEvents {
   playerDeath: (data: { playerId: string; id: number }) => void;
 
   addObject: (data: ObjectData) => void;
+  "world:item-dropped": (data: GroundItemData) => void;
+  "world:item-picked-up": (data: { groundItemId: string }) => void;
   test: (data: { test: string }) => void;
   "battle:state": (data: BattlePublicState) => void;
   "battle:ended": (data: { battleId: string }) => void;

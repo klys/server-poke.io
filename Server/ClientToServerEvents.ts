@@ -76,6 +76,9 @@ export default interface ClientToServerEvents {
   "battle:trade-request": (data: BattleTradeRequestPayload) => void;
   "battle:trade-response": (data: BattleTradeResponsePayload) => void;
   "battle:action": (data: BattleActionRequest) => void;
+  "inventory:use-item": (data: { itemId: string; targetPokemonId: string }) => void;
+  "inventory:teach-move": (data: { itemId: string; targetPokemonId: string }) => void;
+  "inventory:throw-away": (data: { itemId: string; quantity: number }) => void;
 
   /**
    * Registers a new player account and starts an authenticated socket session.

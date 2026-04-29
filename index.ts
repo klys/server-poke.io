@@ -2,6 +2,7 @@ import "@dotenvx/dotenvx/config";
 import Auth from "./components/Auth";
 import DBInit from "./components/DBInit";
 import DesignerSectionStore from "./components/DesignerSectionStore";
+import GroundItemStore from "./components/GroundItemStore";
 import MailService from "./components/MailService";
 import PlayableMapsStore from "./components/PlayableMapsStore";
 import World from "./components/world"
@@ -33,12 +34,14 @@ async function bootstrap() {
   await mailService.initialize();
   const auth = new Auth(redis, mailService);
   const designerSectionStore = new DesignerSectionStore(redis);
+  const groundItemStore = new GroundItemStore(redis);
   const playableMapsStore = new PlayableMapsStore(redis);
   const world = new World(400,400);
 
   await auth.initialize();
   world.setSocketServer(io);
-  registerSocketHandlers(io, world, auth, designerSectionStore, playableMapsStore);
+  await world.initializeGroundItems(groundItemStore);
+  registerSocketHandlers(io, world, auth, designerSectionStore, playableMapsStore, groundItemStore);
 
   httpServer.listen(PORT, () => {
     console.log("Listening on port "+PORT);

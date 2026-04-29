@@ -4,6 +4,7 @@ import GameMath from "./gameMath";
 import Pathfinding = require("pathfinding")
 import type { PlayableMapsStateSnapshot } from "./PlayableMapsState";
 import type BattleManager from "./BattleManager";
+import GroundItemStore, { type GroundItem } from "./GroundItemStore";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -39,6 +40,8 @@ export default class World {
     mapBoundsByMapId: Map<string, MapBounds>;
     playableMapsState: PlayableMapsStateSnapshot | null;
     battleManager: BattleManager | null;
+    groundItems: Map<string, GroundItem>;
+    groundItemStore: GroundItemStore | null;
     //finder:Pathfinding.Finder;
     //grid_backup:Pathfinding.Grid;
     
@@ -61,12 +64,24 @@ export default class World {
         this.mapBoundsByMapId = new Map<string, MapBounds>();
         this.playableMapsState = null;
         this.battleManager = null;
+        this.groundItems = new Map<string, GroundItem>();
+        this.groundItemStore = null;
 
         //this.finder = new Pathfinding.AStarFinder({ diagonalMovement: 1 })
         //this.grid_backup = this.grid.clone()
         //setInterval(this.moveIn.bind(this), 1)
         setInterval(this.livingProjectil.bind(this), 100)
         setInterval(this.playerWaiting.bind(this),1000)
+    }
+
+    async initializeGroundItems(groundItemStore: GroundItemStore) {
+        this.groundItemStore = groundItemStore;
+        const items = await groundItemStore.readAll();
+        this.groundItems = new Map(items.map((item) => [item.id, item]));
+    }
+
+    private persistGroundItems() {
+        void this.groundItemStore?.saveAll(Array.from(this.groundItems.values()));
     }
 
     /**
@@ -241,6 +256,7 @@ export default class World {
 
     handlePlayerStep(player: Player) {
         this.battleManager?.handlePlayerStep(player);
+        void this.handleGroundItemPickup(player);
     }
 
     getPlayableMapsState() {
@@ -500,6 +516,59 @@ export default class World {
         this.getMapObjects(mapId).forEach( (object) => {
             World.socketServer.in(socketId).emit("addObject", object)
         })
+        this.groundItems.forEach((item) => {
+            if (item.mapId === mapId) {
+                World.socketServer.in(socketId).emit("world:item-dropped", item);
+            }
+        });
+    }
+
+    dropGroundItem(item: Omit<GroundItem, "id" | "droppedAt" | "width" | "height"> & Partial<Pick<GroundItem, "width" | "height">>) {
+        const groundItem: GroundItem = {
+            ...item,
+            id: `ground-item-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+            width: item.width ?? 32,
+            height: item.height ?? 32,
+            droppedAt: new Date().toISOString()
+        };
+
+        this.groundItems.set(groundItem.id, groundItem);
+        this.persistGroundItems();
+        World.socketServer.emit("world:item-dropped", groundItem);
+
+        return groundItem;
+    }
+
+    private async handleGroundItemPickup(player: Player) {
+        if (typeof player.userId !== "number") {
+            return;
+        }
+
+        const playerBounds = {
+            x: player.x,
+            y: player.y,
+            width: player.width,
+            height: player.height
+        };
+
+        const groundItem = Array.from(this.groundItems.values()).find((item) =>
+            item.mapId === player.currentMapId &&
+            this.checkCollision(playerBounds, item)
+        );
+
+        if (!groundItem || !this.battleManager) {
+            return;
+        }
+
+        const pickedUp = await this.battleManager.pickUpGroundItem(player, groundItem);
+
+        if (!pickedUp) {
+            return;
+        }
+
+        this.groundItems.delete(groundItem.id);
+        this.persistGroundItems();
+        World.socketServer.emit("world:item-picked-up", { groundItemId: groundItem.id });
     }
 
     /**

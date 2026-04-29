@@ -6,6 +6,7 @@ import DesignerSectionStore, {
   type DesignerSectionKey,
   type DesignerSectionSyncPayload,
 } from "../components/DesignerSectionStore";
+import type GroundItemStore from "../components/GroundItemStore";
 import PlayableMapsStore, {
   applyPlayableMapsStateToWorld,
   type PlayableMapsSyncPayload,
@@ -228,6 +229,72 @@ async function emitPlayableMapsSyncIfStale(
   socket.emit("playableMaps:state", payload);
 }
 
+async function sanitizeAuthSessionInventory(
+  session: Awaited<ReturnType<Auth["resolveSession"]>>,
+  auth: Auth,
+  designerSectionStore: DesignerSectionStore
+) {
+  if (!session.authenticated || !session.user) {
+    return session;
+  }
+
+  const itemsPayload = await designerSectionStore.read("items");
+  const catalogItems = itemsPayload?.state.items ?? [];
+  const catalogById = new Map(catalogItems.map((item) => [item.id, item]));
+  const nextInventory = session.user.inventory
+    .filter((inventoryItem) => catalogById.has(inventoryItem.id))
+    .map((inventoryItem) => {
+      const catalogItem = catalogById.get(inventoryItem.id)!;
+      const profile = catalogItem.itemProfile as {
+        type?: unknown;
+        description?: unknown;
+      } | undefined;
+
+      return {
+        ...inventoryItem,
+        name: catalogItem.name,
+        category: toInventoryCategory(typeof profile?.type === "string" ? profile.type : catalogItem.category),
+        description: typeof profile?.description === "string" ? profile.description : inventoryItem.description
+      };
+    });
+
+  if (
+    nextInventory.length === session.user.inventory.length &&
+    nextInventory.every((item, index) =>
+      item.id === session.user!.inventory[index].id &&
+      item.name === session.user!.inventory[index].name &&
+      item.category === session.user!.inventory[index].category &&
+      item.description === session.user!.inventory[index].description
+    )
+  ) {
+    return session;
+  }
+
+  const user = await auth.saveInventory(session.user.id, nextInventory);
+
+  return {
+    ...session,
+    user
+  };
+}
+
+function toInventoryCategory(value: string) {
+  switch (value.toLowerCase()) {
+    case "berries":
+      return "berries" as const;
+    case "skill item":
+    case "machines":
+      return "moves" as const;
+    case "usable":
+    case "medicine":
+    case "battle item":
+    case "battle items":
+      return "usable" as const;
+    default:
+      return "quest" as const;
+  }
+}
+
 function createConnectionHandler(
   world:World,
   auth:Auth,
@@ -255,9 +322,10 @@ function createConnectionHandler(
           return;
         }
 
+        const session = await sanitizeAuthSessionInventory(result.session, auth, designerSectionStore);
         socket.data.token = result.session.token;
-        applySocketAuth(socket.data, result.session.user);
-        socket.emit("auth:session", result.session);
+        applySocketAuth(socket.data, session.user);
+        socket.emit("auth:session", session);
       } catch (error) {
         console.error("Auth register event failed:", error);
         socket.emit("auth:error", {
@@ -279,9 +347,10 @@ function createConnectionHandler(
           return;
         }
 
+        const session = await sanitizeAuthSessionInventory(result.session, auth, designerSectionStore);
         socket.data.token = result.session.token;
-        applySocketAuth(socket.data, result.session.user);
-        socket.emit("auth:session", result.session);
+        applySocketAuth(socket.data, session.user);
+        socket.emit("auth:session", session);
       } catch (error) {
         console.error("Auth login event failed:", error);
         socket.emit("auth:error", {
@@ -352,7 +421,11 @@ function createConnectionHandler(
         socket.emit("auth:info", { message: result.message });
 
         if (socket.data.token) {
-          const session = await auth.resolveSession(socket.data.token);
+          const session = await sanitizeAuthSessionInventory(
+            await auth.resolveSession(socket.data.token),
+            auth,
+            designerSectionStore
+          );
           applySocketAuth(socket.data, session.user);
           socket.emit("auth:session", session);
         }
@@ -406,8 +479,9 @@ function createConnectionHandler(
           return;
         }
 
-        applySocketAuth(socket.data, result.session.user);
-        socket.emit("auth:session", result.session);
+        const session = await sanitizeAuthSessionInventory(result.session, auth, designerSectionStore);
+        applySocketAuth(socket.data, session.user);
+        socket.emit("auth:session", session);
         socket.emit("auth:info", { message: "Profile updated successfully." });
       } catch (error) {
         console.error("Auth update profile event failed:", error);
@@ -444,8 +518,9 @@ function createConnectionHandler(
           return;
         }
 
-        applySocketAuth(socket.data, result.session.user);
-        socket.emit("auth:session", result.session);
+        const session = await sanitizeAuthSessionInventory(result.session, auth, designerSectionStore);
+        applySocketAuth(socket.data, session.user);
+        socket.emit("auth:session", session);
         socket.emit("auth:info", { message: `${starterPokemon.name} joined your team.` });
       } catch (error) {
         console.error("Auth choose starter event failed:", error);
@@ -474,7 +549,11 @@ function createConnectionHandler(
           socket.data.token = data.token;
         }
 
-        const session = await auth.resolveSession(readSocketToken(socket));
+        const session = await sanitizeAuthSessionInventory(
+          await auth.resolveSession(readSocketToken(socket)),
+          auth,
+          designerSectionStore
+        );
         applySocketAuth(socket.data, session.user);
         socket.emit("auth:session", session);
       } catch (error) {
@@ -647,7 +726,11 @@ function createConnectionHandler(
           await hydrateSocketAuthWithToken(socket, auth, data?.token);
         }
 
-        const session = await auth.resolveSession(socket.data.token);
+        const session = await sanitizeAuthSessionInventory(
+          await auth.resolveSession(socket.data.token),
+          auth,
+          designerSectionStore
+        );
         if (session.authenticated && session.user && session.user.pokemonParty.length === 0) {
           applySocketAuth(socket.data, session.user);
           socket.emit("auth:session", session);
@@ -657,7 +740,11 @@ function createConnectionHandler(
         console.error("Unable to hydrate auth before addPlayer:", error);
       }
 
-      const session = await auth.resolveSession(socket.data.token);
+      const session = await sanitizeAuthSessionInventory(
+        await auth.resolveSession(socket.data.token),
+        auth,
+        designerSectionStore
+      );
       const savedLocation =
         typeof socket.data.userId === "number"
           ? await auth.getSavedPlayerLocation(socket.data.userId)
@@ -754,6 +841,76 @@ function createConnectionHandler(
       battleManager.submitAction(socket.id, data);
     });
 
+    socket.on("inventory:use-item", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use items." });
+        return;
+      }
+
+      const result = await battleManager.useInventoryItem(
+        socket.data.userId,
+        data.itemId,
+        data.targetPokemonId
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("inventory:teach-move", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to teach moves." });
+        return;
+      }
+
+      const result = await battleManager.teachInventoryMove(
+        socket.data.userId,
+        data.itemId,
+        data.targetPokemonId
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("inventory:throw-away", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to throw away items." });
+        return;
+      }
+
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player) {
+        socket.emit("auth:error", { message: "Enter the world before throwing away items." });
+        return;
+      }
+
+      const result = await battleManager.throwInventoryItem(
+        socket.data.userId,
+        data.itemId,
+        data.quantity,
+        player
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
     socket.on("disconnect", async (reason) => {
       console.log(reason);
 
@@ -786,7 +943,8 @@ export default function registerSocketHandlers(
   world:World,
   auth:Auth,
   designerSectionStore:DesignerSectionStore,
-  playableMapsStore:PlayableMapsStore
+  playableMapsStore:PlayableMapsStore,
+  _groundItemStore:GroundItemStore
 ) {
   const battleManager = new BattleManager(io, world, auth, designerSectionStore);
   world.setBattleManager(battleManager);

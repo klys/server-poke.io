@@ -339,6 +339,14 @@ export default class Auth {
         return this.getUserById(String(userId));
     }
 
+    public async saveInventory(userId:number, inventory:InventoryItem[]) {
+        return this.saveBattleState(userId, { inventory });
+    }
+
+    public async savePokemonParty(userId:number, pokemonParty:PokemonSummary[]) {
+        return this.saveBattleState(userId, { pokemonParty });
+    }
+
     public async appendBattleHistory(userId:number, entry:BattleHistoryEntry) {
         const user = await this.getUserById(String(userId));
         const battleHistory = this.sanitizeBattleHistoryForStorage([
