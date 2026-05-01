@@ -530,6 +530,35 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("pokemon:name", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (typeof data?.pokemonId !== "string" || data.pokemonId.length === 0) {
+          socket.emit("auth:error", { message: "Choose a Pokemon to name." });
+          return;
+        }
+
+        const result = await auth.namePokemon(readSocketToken(socket), data.pokemonId, data.nickname);
+        if (!("session" in result)) {
+          socket.emit("auth:error", { message: result.error });
+          return;
+        }
+
+        const session = await sanitizeAuthSessionInventory(result.session, auth, designerSectionStore);
+        applySocketAuth(socket.data, session.user);
+        socket.emit("auth:session", session);
+        socket.emit("auth:info", { message: "Pokemon name selected." });
+      } catch (error) {
+        console.error("Pokemon name event failed:", error);
+        socket.emit("auth:error", {
+          message: "Unable to name Pokemon right now."
+        });
+      }
+    });
+
     socket.on("auth:logout", async () => {
       try {
         const session = await auth.logout(socket.data.token);
@@ -772,6 +801,7 @@ function createConnectionHandler(
       if (playerRegistration.player) {
         socket.emit("myPlayer", { playerId: playerRegistration.player.socketId });
         world.presentPlayersTo(socket.id);
+        battleManager.resumeBattleForPlayer(playerRegistration.player);
       }
     });
 
@@ -931,6 +961,12 @@ function createConnectionHandler(
         } catch (error) {
           console.error("Unable to save player location on disconnect:", error);
         }
+      }
+
+      try {
+        await battleManager.handleSocketDisconnect(socket.id);
+      } catch (error) {
+        console.error("Unable to reconcile battle on disconnect:", error);
       }
 
       world.removePlayer(socket.id);

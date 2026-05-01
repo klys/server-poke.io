@@ -9,7 +9,8 @@ export type DesignerSectionKey =
   | "passiveStates"
   | "players"
   | "regions"
-  | "npcs";
+  | "npcs"
+  | "levelingCurve";
 
 export interface DesignerItemDetail {
   label: string;
@@ -26,6 +27,7 @@ export interface DesignerSectionItem {
   skillGfxProfile?: unknown;
   pokemonProfile?: unknown;
   pokemonSkillProfile?: unknown;
+  levelingCurveProfile?: unknown;
 }
 
 export interface DesignerSectionState {
@@ -70,7 +72,8 @@ const VALID_SECTION_KEYS: DesignerSectionKey[] = [
   "passiveStates",
   "players",
   "regions",
-  "npcs"
+  "npcs",
+  "levelingCurve"
 ];
 
 export function isDesignerSectionKey(value: unknown): value is DesignerSectionKey {

@@ -57,6 +57,12 @@ interface AuthUpdateProfilePayload {
 interface AuthChooseStarterPayload {
   gender: string;
   pokemonId: string;
+  nickname: string;
+}
+
+interface AuthNamePokemonPayload {
+  pokemonId: string;
+  nickname: string;
 }
 
 interface PlayableMapsSyncRequestPayload {
@@ -79,6 +85,7 @@ export default interface ClientToServerEvents {
   "inventory:use-item": (data: { itemId: string; targetPokemonId: string }) => void;
   "inventory:teach-move": (data: { itemId: string; targetPokemonId: string }) => void;
   "inventory:throw-away": (data: { itemId: string; quantity: number }) => void;
+  "pokemon:name": (data: AuthNamePokemonPayload) => void;
 
   /**
    * Registers a new player account and starts an authenticated socket session.
@@ -153,6 +160,8 @@ export default interface ClientToServerEvents {
 
   /**
    * Grants one initial level-1 Pokemon to authenticated users with an empty party.
+   * Requires a one-time Pokemon name:
+   * - `nickname`: letters only, max 10, no spaces, no blocked insults
    */
   "auth:choose-starter": (data: AuthChooseStarterPayload) => void;
 

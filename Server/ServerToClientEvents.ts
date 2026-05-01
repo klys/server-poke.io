@@ -74,6 +74,7 @@ interface AuthUserData {
     id: string;
     sourcePokemonId?: string;
     name: string;
+    nickname?: string;
     level: number;
     types: string[];
     hp: number;
@@ -83,6 +84,14 @@ interface AuthUserData {
     experience: number;
     experienceCurve: "fast" | "medium" | "slow";
     nextLevelExperience: number;
+    statBonuses: {
+      hp: number;
+      attack: number;
+      defense: number;
+      specialAttack: number;
+      specialDefense: number;
+      speed: number;
+    };
   }>;
 }
 

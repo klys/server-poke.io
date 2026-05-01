@@ -5,6 +5,15 @@ import Auth from "./Auth";
 import type DesignerSectionStore from "./DesignerSectionStore";
 import type { DesignerSectionItem } from "./DesignerSectionStore";
 import type { GroundItem } from "./GroundItemStore";
+import {
+  computeBattleExperience,
+  createEmptyPokemonStatBonuses,
+  getExperienceForNextLevel,
+  getLevelingCurveConfigFromItems,
+  sanitizePokemonStatBonuses,
+  type LevelingCurveConfig,
+  type PokemonStatBonuses
+} from "./LevelingCurve";
 import type Player from "./player";
 import type World from "./world";
 import type ClientToServerEvents from "../Server/ClientToServerEvents";
@@ -75,6 +84,7 @@ export type BattlePublicMove = {
 export type BattlePublicPokemon = {
   id: string;
   name: string;
+  nickname?: string;
   level: number;
   types: string[];
   hp: number;
@@ -149,11 +159,14 @@ type BattlePokemon = {
   id: string;
   sourcePokemonId?: string;
   name: string;
+  nickname?: string;
   level: number;
   types: string[];
   hp: number;
   maxHp: number;
+  baseStats: BattleStats;
   stats: BattleStats;
+  statBonuses: PokemonStatBonuses;
   stages: BattleStatStages;
   moves: BattleMove[];
   frontImageSrc: string;
@@ -339,14 +352,18 @@ function calculateOtherStat(base: number, level: number) {
   );
 }
 
-function calculateStats(baseStats: BattleStats, level: number): BattleStats {
+function calculateStats(
+  baseStats: BattleStats,
+  level: number,
+  bonuses: PokemonStatBonuses = createEmptyPokemonStatBonuses()
+): BattleStats {
   return {
-    hp: calculateHpStat(baseStats.hp, level),
-    attack: calculateOtherStat(baseStats.attack, level),
-    defense: calculateOtherStat(baseStats.defense, level),
-    specialAttack: calculateOtherStat(baseStats.specialAttack, level),
-    specialDefense: calculateOtherStat(baseStats.specialDefense, level),
-    speed: calculateOtherStat(baseStats.speed, level)
+    hp: calculateHpStat(baseStats.hp, level) + bonuses.hp,
+    attack: calculateOtherStat(baseStats.attack, level) + bonuses.attack,
+    defense: calculateOtherStat(baseStats.defense, level) + bonuses.defense,
+    specialAttack: calculateOtherStat(baseStats.specialAttack, level) + bonuses.specialAttack,
+    specialDefense: calculateOtherStat(baseStats.specialDefense, level) + bonuses.specialDefense,
+    speed: calculateOtherStat(baseStats.speed, level) + bonuses.speed
   };
 }
 
@@ -372,6 +389,10 @@ function chooseRandom<T>(items: T[]) {
   return items[Math.floor(Math.random() * items.length)];
 }
 
+function getRandomStatIncrease() {
+  return Math.floor(Math.random() * 6);
+}
+
 function getMoveEffectiveness(moveType: string, targetTypes: string[]) {
   return targetTypes.reduce((multiplier, targetType) => {
     const normalizedTargetType = normalizeType(targetType);
@@ -387,6 +408,7 @@ function getPublicPokemon(pokemon: BattlePokemon): BattlePublicPokemon {
   return {
     id: pokemon.id,
     name: pokemon.name,
+    nickname: pokemon.nickname,
     level: pokemon.level,
     types: pokemon.types,
     hp: pokemon.hp,
@@ -403,6 +425,10 @@ function getPublicPokemon(pokemon: BattlePokemon): BattlePublicPokemon {
       maxPp: move.maxPp
     }))
   };
+}
+
+function getPokemonDisplayName(pokemon: Pick<BattlePokemon, "name" | "nickname">) {
+  return pokemon.nickname ? `${pokemon.nickname} (${pokemon.name})` : pokemon.name;
 }
 
 function parseNumber(value: unknown, fallback: number) {
@@ -439,6 +465,75 @@ export default class BattleManager {
     return this.playerBattleIds.has(playerId);
   }
 
+  public resumeBattleForPlayer(player: Player) {
+    const battleId = this.playerBattleIds.get(player.socketId);
+
+    if (!battleId) {
+      player.leaveBattle();
+      return false;
+    }
+
+    const battle = this.battles.get(battleId);
+    if (!battle || battle.status !== "active") {
+      this.playerBattleIds.delete(player.socketId);
+      player.leaveBattle();
+      return false;
+    }
+
+    const side = this.getBattleSideForPlayer(battle, player.socketId);
+    if (!side) {
+      this.playerBattleIds.delete(player.socketId);
+      player.leaveBattle();
+      return false;
+    }
+
+    player.enterBattle();
+    this.emitToPlayer(player, "battle:state", this.toPublicState(battle, side));
+
+    return true;
+  }
+
+  public async handleSocketDisconnect(socketId: string) {
+    const player = this.world.getPlayerBySocket(socketId);
+
+    if (!player || !player.socketConnections.has(socketId)) {
+      return;
+    }
+
+    const remainingConnections = player.socketConnections.size - 1;
+    if (remainingConnections > 0) {
+      return;
+    }
+
+    const battleId = this.playerBattleIds.get(player.socketId);
+    if (!battleId) {
+      return;
+    }
+
+    const battle = this.battles.get(battleId);
+    if (!battle || battle.status !== "active") {
+      this.playerBattleIds.delete(player.socketId);
+      return;
+    }
+
+    if (battle.kind !== "trainer") {
+      return;
+    }
+
+    const side = this.getBattleSideForPlayer(battle, player.socketId);
+    if (!side) {
+      this.playerBattleIds.delete(player.socketId);
+      return;
+    }
+
+    await this.finishBattle(
+      battle,
+      `${side.trainerName} surrendered.`,
+      this.getOpponentSide(battle, side),
+      side
+    );
+  }
+
   public async useInventoryItem(
     userId: number,
     itemId: string,
@@ -464,7 +559,7 @@ export default class BattleManager {
     }
 
     if (itemDefinition.statModifiers.hp > 0 && targetPokemon.hp >= targetPokemon.maxHp) {
-      return { ok: false, message: `${targetPokemon.name} already has full HP.` };
+      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} already has full HP.` };
     }
 
     const beforeHp = targetPokemon.hp;
@@ -483,8 +578,8 @@ export default class BattleManager {
       user: nextUser,
       message:
         itemDefinition.statModifiers.hp > 0
-          ? `${targetPokemon.name} recovered ${targetPokemon.hp - beforeHp} HP.`
-          : `${item.name} was used on ${targetPokemon.name}.`
+          ? `${getPokemonDisplayName(targetPokemon)} recovered ${targetPokemon.hp - beforeHp} HP.`
+          : `${item.name} was used on ${getPokemonDisplayName(targetPokemon)}.`
     };
   }
 
@@ -513,11 +608,11 @@ export default class BattleManager {
     }
 
     if (targetPokemon.moves.includes(itemDefinition.skillName)) {
-      return { ok: false, message: `${targetPokemon.name} already knows ${itemDefinition.skillName}.` };
+      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} already knows ${itemDefinition.skillName}.` };
     }
 
     if (targetPokemon.moves.length >= 4) {
-      return { ok: false, message: `${targetPokemon.name} already knows four moves.` };
+      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} already knows four moves.` };
     }
 
     targetPokemon.moves = [...targetPokemon.moves, itemDefinition.skillName];
@@ -530,7 +625,7 @@ export default class BattleManager {
     return {
       ok: true,
       user: nextUser,
-      message: `${targetPokemon.name} learned ${itemDefinition.skillName}.`
+      message: `${getPokemonDisplayName(targetPokemon)} learned ${itemDefinition.skillName}.`
     };
   }
 
@@ -876,7 +971,7 @@ export default class BattleManager {
     };
 
     const battle = this.createBattle("wild", playerSide, wildSide, [
-      `A wild ${wildPokemon.name} appeared.`
+      `A wild ${getPokemonDisplayName(wildPokemon)} appeared.`
     ]);
 
     this.activateBattle(battle);
@@ -1033,7 +1128,7 @@ export default class BattleManager {
       if (side.action?.type === "pokemon") {
         const switched = this.switchPokemon(side, side.action.pokemonId);
         if (switched) {
-          await this.emitBattleStep(battle, `${side.trainerName} sent out ${getActivePokemon(side).name}.`);
+          await this.emitBattleStep(battle, `${side.trainerName} sent out ${getPokemonDisplayName(getActivePokemon(side))}.`);
         }
       }
     }
@@ -1058,7 +1153,7 @@ export default class BattleManager {
       await this.emitBattleStep(battle, this.applyMoveAction(side, target, side.action.moveId));
 
       if (isFainted(targetPokemon)) {
-        await this.emitBattleStep(battle, `${targetPokemon.name} fainted.`);
+        await this.emitBattleStep(battle, `${getPokemonDisplayName(targetPokemon)} fainted.`);
         if (!this.autoSwitchIfPossible(target)) {
           await this.finishBattle(
             battle,
@@ -1068,7 +1163,7 @@ export default class BattleManager {
           );
           return;
         }
-        await this.emitBattleStep(battle, `${target.trainerName} sent out ${getActivePokemon(target).name}.`);
+        await this.emitBattleStep(battle, `${target.trainerName} sent out ${getPokemonDisplayName(getActivePokemon(target))}.`);
       }
     }
 
@@ -1087,6 +1182,120 @@ export default class BattleManager {
     if (shouldPause) {
       await delay(BATTLE_ACTION_STEP_DELAY_MS);
     }
+  }
+
+  private syncPokemonProgression(pokemon: BattlePokemon, config: LevelingCurveConfig) {
+    const summary = pokemon.originalSummary;
+    if (!summary) {
+      return;
+    }
+
+    summary.level = clamp(summary.level, 1, 100);
+    summary.experience = Math.max(0, Math.round(summary.experience));
+    summary.statBonuses = sanitizePokemonStatBonuses(summary.statBonuses);
+    summary.nextLevelExperience = getExperienceForNextLevel(summary.level, config);
+
+    if (summary.level >= 100) {
+      summary.experience = 0;
+      summary.nextLevelExperience = 0;
+    }
+
+    pokemon.level = summary.level;
+    pokemon.statBonuses = summary.statBonuses;
+  }
+
+  private formatStatBonusLog(statBonuses: PokemonStatBonuses) {
+    const labels: Array<[keyof PokemonStatBonuses, string]> = [
+      ["hp", "HP"],
+      ["attack", "Attack"],
+      ["defense", "Defense"],
+      ["specialAttack", "Sp. Attack"],
+      ["specialDefense", "Sp. Defense"],
+      ["speed", "Speed"]
+    ];
+
+    return labels
+      .map(([key, label]) => `${label} +${statBonuses[key]}`)
+      .join(", ");
+  }
+
+  private awardWinnerExperience(
+    winner: BattleSide,
+    loser: BattleSide,
+    config: LevelingCurveConfig
+  ) {
+    const winnerPokemon = getActivePokemon(winner);
+    const loserPokemon = getActivePokemon(loser);
+
+    this.syncPokemonProgression(winnerPokemon, config);
+
+    const summary = winnerPokemon.originalSummary;
+    if (!summary || summary.level >= 100) {
+      return [];
+    }
+
+    const gainedExperience = computeBattleExperience(config, summary.level, loserPokemon.level);
+    if (gainedExperience <= 0) {
+      return [`${getPokemonDisplayName(winnerPokemon)} gained no EXP.`];
+    }
+
+    const nextLevelRequirement = summary.nextLevelExperience;
+    const currentExperience = Math.max(0, Math.round(summary.experience));
+    const nextExperience = currentExperience + gainedExperience;
+    const log = [`${getPokemonDisplayName(winnerPokemon)} gained ${gainedExperience} EXP.`];
+
+    if (nextLevelRequirement > 0 && nextExperience >= nextLevelRequirement) {
+      const statIncrease: PokemonStatBonuses = {
+        hp: getRandomStatIncrease(),
+        attack: getRandomStatIncrease(),
+        defense: getRandomStatIncrease(),
+        specialAttack: getRandomStatIncrease(),
+        specialDefense: getRandomStatIncrease(),
+        speed: getRandomStatIncrease()
+      };
+      const nextLevel = Math.min(100, summary.level + 1);
+      const nextBonuses: PokemonStatBonuses = {
+        hp: winnerPokemon.statBonuses.hp + statIncrease.hp,
+        attack: winnerPokemon.statBonuses.attack + statIncrease.attack,
+        defense: winnerPokemon.statBonuses.defense + statIncrease.defense,
+        specialAttack: winnerPokemon.statBonuses.specialAttack + statIncrease.specialAttack,
+        specialDefense: winnerPokemon.statBonuses.specialDefense + statIncrease.specialDefense,
+        speed: winnerPokemon.statBonuses.speed + statIncrease.speed
+      };
+      const nextStats = calculateStats(winnerPokemon.baseStats, nextLevel, nextBonuses);
+
+      summary.level = nextLevel;
+      summary.experience = 0;
+      summary.statBonuses = nextBonuses;
+      summary.nextLevelExperience = getExperienceForNextLevel(nextLevel, config);
+      if (nextLevel >= 100) {
+        summary.nextLevelExperience = 0;
+      }
+      summary.maxHp = nextStats.hp;
+      summary.hp = nextStats.hp;
+      summary.movePp = winnerPokemon.moves.reduce<Record<string, number>>((accumulator, move) => {
+        accumulator[move.name] = move.maxPp;
+        return accumulator;
+      }, {});
+
+      winnerPokemon.level = nextLevel;
+      winnerPokemon.statBonuses = nextBonuses;
+      winnerPokemon.stats = nextStats;
+      winnerPokemon.maxHp = nextStats.hp;
+      winnerPokemon.hp = nextStats.hp;
+      winnerPokemon.moves = winnerPokemon.moves.map((move) => ({
+        ...move,
+        currentPp: move.maxPp
+      }));
+
+      log.push(`${getPokemonDisplayName(winnerPokemon)} grew to level ${nextLevel}.`);
+      log.push(this.formatStatBonusLog(statIncrease));
+      log.push(`${getPokemonDisplayName(winnerPokemon)} was fully healed and recovered all PP.`);
+      return log;
+    }
+
+    summary.experience = nextExperience;
+    return log;
   }
 
   private async finishBattle(
@@ -1110,6 +1319,17 @@ export default class BattleManager {
       battle.log = [
         ...battle.log,
         `${winner.trainerName} received $${transferAmount}.`
+      ];
+    }
+
+    const catalogs = await this.loadCatalogs();
+    battle.sides.forEach((side) => {
+      side.party.forEach((pokemon) => this.syncPokemonProgression(pokemon, catalogs.levelingCurveConfig));
+    });
+    if (winner && loser) {
+      battle.log = [
+        ...battle.log,
+        ...this.awardWinnerExperience(winner, loser, catalogs.levelingCurveConfig)
       ];
     }
 
@@ -1287,7 +1507,7 @@ export default class BattleManager {
     targetPokemon.stages.speed = clamp(targetPokemon.stages.speed + modifiers.speed, -6, 6);
 
     if (targetPokemon.hp > beforeHp) {
-      return `${side.trainerName} used ${item.name}. ${targetPokemon.name} recovered ${targetPokemon.hp - beforeHp} HP.`;
+      return `${side.trainerName} used ${item.name}. ${getPokemonDisplayName(targetPokemon)} recovered ${targetPokemon.hp - beforeHp} HP.`;
     }
 
     return `${side.trainerName} used ${item.name}.`;
@@ -1364,17 +1584,17 @@ export default class BattleManager {
     const move = attackerPokemon.moves.find((candidate) => candidate.id === moveId);
 
     if (!move || move.currentPp <= 0) {
-      return `${attackerPokemon.name} had no skill to use.`;
+      return `${getPokemonDisplayName(attackerPokemon)} had no skill to use.`;
     }
 
     move.currentPp -= 1;
 
     if (move.accuracy < 100 && Math.random() * 100 > move.accuracy) {
-      return `${attackerPokemon.name} used ${move.name}, but it missed.`;
+      return `${getPokemonDisplayName(attackerPokemon)} used ${move.name}, but it missed.`;
     }
 
     if (move.damageClass === "status" || move.power <= 0) {
-      return `${attackerPokemon.name} used ${move.name}.`;
+      return `${getPokemonDisplayName(attackerPokemon)} used ${move.name}.`;
     }
 
     const damage = this.calculateDamage(attackerPokemon, targetPokemon, move);
@@ -1389,7 +1609,7 @@ export default class BattleManager {
             ? " It was not very effective."
             : "";
 
-    return `${attackerPokemon.name} used ${move.name} for ${damage} damage.${effectivenessText}`;
+    return `${getPokemonDisplayName(attackerPokemon)} used ${move.name} for ${damage} damage.${effectivenessText}`;
   }
 
   private calculateDamage(attacker: BattlePokemon, defender: BattlePokemon, move: BattleMove) {
@@ -1469,10 +1689,11 @@ export default class BattleManager {
   }
 
   private async loadCatalogs() {
-    const [pokemonPayload, skillsPayload, itemsPayload] = await Promise.all([
+    const [pokemonPayload, skillsPayload, itemsPayload, levelingCurvePayload] = await Promise.all([
       this.designerSectionStore.read("pokemons"),
       this.designerSectionStore.read("skills"),
-      this.designerSectionStore.read("items")
+      this.designerSectionStore.read("items"),
+      this.designerSectionStore.read("levelingCurve")
     ]);
     const skillsById = new Map<string, SkillDefinition>();
     const skillsByName = new Map<string, SkillDefinition>();
@@ -1499,7 +1720,8 @@ export default class BattleManager {
     return {
       pokemonById,
       skillsById,
-      skillsByName
+      skillsByName,
+      levelingCurveConfig: getLevelingCurveConfigFromItems(levelingCurvePayload?.state.items ?? [])
     };
   }
 
@@ -1663,6 +1885,7 @@ export default class BattleManager {
     skillsByName: Map<string, SkillDefinition>
   ): BattlePokemon {
     const level = clamp(pokemon.level, 1, 100);
+    const statBonuses = sanitizePokemonStatBonuses(pokemon.statBonuses);
     const baseStats = definition?.baseStats ?? {
       hp: pokemon.maxHp,
       attack: Math.max(1, pokemon.maxHp),
@@ -1671,7 +1894,7 @@ export default class BattleManager {
       specialDefense: Math.max(1, pokemon.maxHp),
       speed: Math.max(1, pokemon.maxHp)
     };
-    const stats = calculateStats(baseStats, level);
+    const stats = calculateStats(baseStats, level, statBonuses);
     const learnedMoveNames = pokemon.moves.length > 0
       ? pokemon.moves
       : (definition?.skills ?? [])
@@ -1696,11 +1919,14 @@ export default class BattleManager {
       id: pokemon.id,
       sourcePokemonId: pokemon.sourcePokemonId,
       name: pokemon.name,
+      nickname: pokemon.nickname,
       level,
       types: pokemon.types.length > 0 ? pokemon.types.map(normalizeType) : definition?.types ?? [],
       hp: clamp(pokemon.hp, 0, stats.hp),
       maxHp: stats.hp,
+      baseStats,
       stats,
+      statBonuses,
       stages: createEmptyStages(),
       moves,
       frontImageSrc: definition?.frontImageSrc ?? "",
@@ -1714,7 +1940,8 @@ export default class BattleManager {
     level: number,
     skillsById: Map<string, SkillDefinition>
   ): BattlePokemon {
-    const stats = calculateStats(definition.baseStats, level);
+    const statBonuses = createEmptyPokemonStatBonuses();
+    const stats = calculateStats(definition.baseStats, level, statBonuses);
     const moves = definition.skills
       .filter((skill) => skill.level <= level)
       .slice(-4)
@@ -1732,7 +1959,9 @@ export default class BattleManager {
       types: definition.types,
       hp: stats.hp,
       maxHp: stats.hp,
+      baseStats: definition.baseStats,
       stats,
+      statBonuses,
       stages: createEmptyStages(),
       moves,
       frontImageSrc: definition.frontImageSrc,
@@ -1771,6 +2000,7 @@ export default class BattleManager {
           ...originalSummary,
           hp: pokemon.hp,
           maxHp: pokemon.maxHp,
+          statBonuses: pokemon.statBonuses,
           moves,
           movePp: moves.reduce<Record<string, number>>((accumulator, moveName) => {
             const battleMove = pokemon.moves.find((move) => move.name === moveName);

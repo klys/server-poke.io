@@ -1,6 +1,13 @@
 import crypto from "crypto";
 import jwt, { type JwtPayload } from "jsonwebtoken";
 import type { RedisClientType } from "redis";
+import {
+    createEmptyPokemonStatBonuses,
+    getExperienceForNextLevel,
+    readLevelingCurveConfigFromRedis,
+    sanitizePokemonStatBonuses,
+    type PokemonStatBonuses
+} from "./LevelingCurve";
 import MailService from "./MailService";
 
 export interface AuthenticatedUser {
@@ -64,6 +71,7 @@ export interface PokemonSummary {
     id:string;
     sourcePokemonId?:string;
     name:string;
+    nickname?:string;
     level:number;
     types:string[];
     hp:number;
@@ -73,6 +81,7 @@ export interface PokemonSummary {
     experience:number;
     experienceCurve:"fast" | "medium" | "slow";
     nextLevelExperience:number;
+    statBonuses:PokemonStatBonuses;
 }
 
 export interface BattleHistoryEntry {
@@ -134,6 +143,7 @@ interface UpdateProfilePayload {
 
 interface ChooseStarterPayload {
     gender:string;
+    nickname:string;
 }
 
 interface StarterPokemonDefinition {
@@ -178,6 +188,28 @@ const DEFAULT_BATTLE_HISTORY:BattleHistoryEntry[] = [];
 const DEFAULT_MONEY = 1000;
 const MAX_BATTLE_HISTORY_ITEMS = 50;
 const LEGACY_DEMO_POKEMON_PARTY_IDS = new Set(["starter-001"]);
+const POKEMON_NICKNAME_PATTERN = /^[A-Za-z]{1,10}$/;
+const BLOCKED_POKEMON_NICKNAMES = new Set([
+    "ass",
+    "bastard",
+    "bitch",
+    "bollocks",
+    "crap",
+    "cunt",
+    "damn",
+    "dick",
+    "fag",
+    "fuck",
+    "hoe",
+    "nazi",
+    "piss",
+    "prick",
+    "pussy",
+    "shit",
+    "slut",
+    "twat",
+    "whore"
+]);
 
 export default class Auth {
     private readonly redis:RedisClientType;
@@ -345,6 +377,52 @@ export default class Auth {
 
     public async savePokemonParty(userId:number, pokemonParty:PokemonSummary[]) {
         return this.saveBattleState(userId, { pokemonParty });
+    }
+
+    public async namePokemon(
+        token:string | undefined,
+        pokemonId:string,
+        nickname:string
+    ):Promise<AuthSuccessResult | AuthErrorResult> {
+        const authenticatedUser = await this.getAuthenticatedUserFromToken(token);
+        if (!authenticatedUser) {
+            return { error: "You must be authenticated to name a Pokemon." };
+        }
+
+        const safeNickname = this.normalizePokemonNickname(nickname);
+        const validationMessage = this.validatePokemonNickname(safeNickname);
+        if (validationMessage) {
+            return { error: validationMessage };
+        }
+
+        const nextParty = authenticatedUser.pokemonParty.map((pokemon) => ({ ...pokemon }));
+        const targetPokemon = nextParty.find((pokemon) => pokemon.id === pokemonId);
+        if (!targetPokemon) {
+            return { error: "Choose a Pokemon to name." };
+        }
+
+        if (targetPokemon.nickname) {
+            return { error: "This Pokemon already has a selected name." };
+        }
+
+        targetPokemon.nickname = safeNickname;
+
+        await this.redis.hSet(this.userKey(authenticatedUser.id), {
+            pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(nextParty))
+        });
+
+        const user = await this.getUserById(String(authenticatedUser.id));
+        if (!user) {
+            return { error: "Unable to refresh account details." };
+        }
+
+        return {
+            session: {
+                authenticated: true,
+                user,
+                token: token ?? await this.createSession(user)
+            }
+        };
     }
 
     public async appendBattleHistory(userId:number, entry:BattleHistoryEntry) {
@@ -571,10 +649,18 @@ export default class Auth {
             return { error: "Select a trainer gender before choosing a Pokemon." };
         }
 
+        const nickname = this.normalizePokemonNickname(payload.nickname);
+        const nicknameValidationMessage = this.validatePokemonNickname(nickname);
+        if (nicknameValidationMessage) {
+            return { error: nicknameValidationMessage };
+        }
+
+        const levelingCurveConfig = await readLevelingCurveConfigFromRedis(this.redis);
         const starter:PokemonSummary = {
             id: crypto.randomUUID(),
             sourcePokemonId: starterPokemon.id,
             name: starterPokemon.name,
+            nickname,
             level: 1,
             types: starterPokemon.elements,
             hp: Math.max(1, Math.round(starterPokemon.hp)),
@@ -587,7 +673,8 @@ export default class Auth {
             movePp: {},
             experience: 0,
             experienceCurve: "medium",
-            nextLevelExperience: 100
+            nextLevelExperience: getExperienceForNextLevel(1, levelingCurveConfig),
+            statBonuses: createEmptyPokemonStatBonuses()
         };
 
         await this.redis.hSet(this.userKey(authenticatedUser.id), {
@@ -1019,6 +1106,10 @@ export default class Auth {
                     ...pokemon,
                     sourcePokemonId:
                         typeof pokemon.sourcePokemonId === "string" ? pokemon.sourcePokemonId : undefined,
+                    nickname:
+                        typeof pokemon.nickname === "string" && this.validatePokemonNickname(this.normalizePokemonNickname(pokemon.nickname)) === null
+                            ? this.normalizePokemonNickname(pokemon.nickname)
+                            : undefined,
                     level: Math.max(1, Math.round(pokemon.level)),
                     hp: Math.max(0, Math.round(pokemon.hp)),
                     maxHp: Math.max(1, Math.round(pokemon.maxHp)),
@@ -1038,8 +1129,9 @@ export default class Auth {
                     nextLevelExperience:
                         typeof pokemon.nextLevelExperience === "number" &&
                         Number.isFinite(pokemon.nextLevelExperience)
-                            ? Math.max(1, Math.round(pokemon.nextLevelExperience))
-                            : 100
+                            ? Math.max(0, Math.round(pokemon.nextLevelExperience))
+                            : 100,
+                    statBonuses: sanitizePokemonStatBonuses(pokemon.statBonuses)
                 };
             });
     }
@@ -1063,6 +1155,22 @@ export default class Auth {
         } catch {
             return DEFAULT_POKEMON_PARTY;
         }
+    }
+
+    private normalizePokemonNickname(value:unknown) {
+        return typeof value === "string" ? value.trim() : "";
+    }
+
+    private validatePokemonNickname(value:string) {
+        if (!POKEMON_NICKNAME_PATTERN.test(value)) {
+            return "Pokemon names must use letters only, with no spaces, up to 10 characters.";
+        }
+
+        if (BLOCKED_POKEMON_NICKNAMES.has(value.toLowerCase())) {
+            return "Choose a respectful Pokemon name.";
+        }
+
+        return null;
     }
 
     private parseMoney(value:string | undefined) {
