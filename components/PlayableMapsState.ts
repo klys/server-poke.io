@@ -66,11 +66,24 @@ type MapEditorGrassPlacement = {
   encounterRate: number;
 };
 
+type MapEditorNpcPlacement = {
+  id: string;
+  npcId: string;
+  name: string;
+  category: string;
+  previewImageSrc: string;
+  npcType: string;
+  aiType: string;
+  x: number;
+  y: number;
+};
+
 export type PlayableMapEditorData = {
   version: 1;
   objects: MapEditorObjectPlacement[];
   portals: MapEditorPortalPlacement[];
   grass: MapEditorGrassPlacement[];
+  npcs: MapEditorNpcPlacement[];
 };
 
 export type PlayableMapsStateSnapshot = {
@@ -194,6 +207,7 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
       objects: [],
       portals: [],
       grass: [],
+      npcs: [],
     };
   }
 
@@ -274,6 +288,26 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
               Math.max(1, clampInteger(item.maxLevel, 1))
             ),
             encounterRate: Math.max(0, Math.min(100, clampInteger(item.encounterRate))),
+          }))
+      : [],
+    npcs: Array.isArray(candidate.npcs)
+      ? candidate.npcs
+          .filter(
+            (item): item is MapEditorNpcPlacement =>
+              typeof item?.id === "string" &&
+              typeof item?.npcId === "string" &&
+              typeof item?.name === "string" &&
+              typeof item?.category === "string" &&
+              typeof item?.previewImageSrc === "string" &&
+              typeof item?.npcType === "string" &&
+              typeof item?.aiType === "string" &&
+              typeof item?.x === "number" &&
+              typeof item?.y === "number"
+          )
+          .map((item) => ({
+            ...item,
+            x: Math.max(0, clampInteger(item.x)),
+            y: Math.max(0, clampInteger(item.y)),
           }))
       : [],
   };

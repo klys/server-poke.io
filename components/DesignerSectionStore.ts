@@ -28,6 +28,7 @@ export interface DesignerSectionItem {
   pokemonProfile?: unknown;
   pokemonSkillProfile?: unknown;
   levelingCurveProfile?: unknown;
+  npcProfile?: unknown;
 }
 
 export interface DesignerSectionState {
