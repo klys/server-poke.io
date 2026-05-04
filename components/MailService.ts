@@ -44,7 +44,11 @@ export default class MailService {
             auth: {
                 user: this.smtpUser,
                 pass: this.smtpPass
-            }
+            },
+            requireTLS: true,
+            tls: {
+                minVersion: "TLSv1.2",
+            },
         };
 
         this.transporter = nodemailer.createTransport(transportConfig);

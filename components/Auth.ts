@@ -10,6 +10,31 @@ import {
 } from "./LevelingCurve";
 import MailService from "./MailService";
 
+export const ROLE_PERMISSIONS = [
+    "game.access",
+    "designer.access",
+    "moderator.access",
+    "admin.access"
+] as const;
+
+export type RolePermission = typeof ROLE_PERMISSIONS[number];
+
+export const USER_ROLE_KEYS = [
+    "admin",
+    "designer",
+    "moderator",
+    "user"
+] as const;
+
+export type UserRoleKey = typeof USER_ROLE_KEYS[number];
+
+export interface RoleDefinition {
+    key: UserRoleKey;
+    name: string;
+    description: string;
+    permissions: RolePermission[];
+}
+
 export interface AuthenticatedUser {
     id:number;
     name:string;
@@ -23,6 +48,8 @@ export interface AuthenticatedUser {
     trainerGender:string;
     money:number;
     battleHistory:BattleHistoryEntry[];
+    role:UserRoleKey;
+    permissions:RolePermission[];
 }
 
 export interface AuthSessionState {
@@ -57,6 +84,58 @@ interface StoredUser extends AuthenticatedUser {
     password_hash:string;
     password_salt:string;
     created_at:string;
+}
+
+export interface AdminUserSummary {
+    id:number;
+    name:string;
+    username:string;
+    email:string;
+    emailVerified:boolean;
+    role:UserRoleKey;
+    permissions:RolePermission[];
+    profileImage:string;
+    description:string;
+    trainerGender:string;
+    money:number;
+    pokemonCount:number;
+    inventoryItemCount:number;
+    inventoryQuantity:number;
+    battleHistoryCount:number;
+    createdAt:string;
+    savedLocation:SavedPlayerLocation | null;
+}
+
+export interface AdminUserDetails extends AuthenticatedUser {
+    createdAt:string;
+    savedLocation:SavedPlayerLocation | null;
+}
+
+export interface AdminUserListPayload {
+    users: AdminUserSummary[];
+    search: string;
+    page: number;
+    pageSize: number;
+    total: number;
+    totalPages: number;
+}
+
+export interface AdminUserUpdatePayload {
+    name?: string;
+    profileImage?: string;
+    description?: string;
+    trainerGender?: string;
+    money?: number;
+    emailVerified?: boolean;
+    role?: UserRoleKey;
+    inventory?: InventoryItem[];
+    pokemonParty?: PokemonSummary[];
+    battleHistory?: BattleHistoryEntry[];
+    savedLocation?: SavedPlayerLocation | null;
+}
+
+export interface RoleDefinitionWithCount extends RoleDefinition {
+    userCount: number;
 }
 
 export interface InventoryItem {
@@ -187,6 +266,32 @@ const DEFAULT_POKEMON_PARTY:PokemonSummary[] = [];
 const DEFAULT_BATTLE_HISTORY:BattleHistoryEntry[] = [];
 const DEFAULT_MONEY = 1000;
 const MAX_BATTLE_HISTORY_ITEMS = 50;
+const DEFAULT_ROLE_DEFINITIONS:RoleDefinition[] = [
+    {
+        key: "admin",
+        name: "Admin",
+        description: "Full access to every admin, moderator, designer, and gameplay capability.",
+        permissions: [...ROLE_PERMISSIONS]
+    },
+    {
+        key: "designer",
+        name: "Designer",
+        description: "Gameplay access plus the collaborative designer workspace.",
+        permissions: ["game.access", "designer.access"]
+    },
+    {
+        key: "moderator",
+        name: "Moderator",
+        description: "Gameplay access plus moderator oversight tools.",
+        permissions: ["game.access", "moderator.access"]
+    },
+    {
+        key: "user",
+        name: "User",
+        description: "Standard player access to the game world.",
+        permissions: ["game.access"]
+    }
+];
 const LEGACY_DEMO_POKEMON_PARTY_IDS = new Set(["starter-001"]);
 const POKEMON_NICKNAME_PATTERN = /^[A-Za-z]{1,10}$/;
 const BLOCKED_POKEMON_NICKNAMES = new Set([
@@ -238,6 +343,8 @@ export default class Auth {
         if (!this.redis.isOpen) {
             throw new Error("Redis client must be initialized before Auth.");
         }
+
+        await this.ensureRoleDefinitions();
     }
 
     public async register(payload:RegisterPayload):Promise<AuthSuccessResult | AuthErrorResult> {
@@ -696,6 +803,241 @@ export default class Auth {
         };
     }
 
+    public async getRoleDefinitions() {
+        return this.readRoleDefinitions();
+    }
+
+    public async getRoleDefinitionsWithCounts():Promise<RoleDefinitionWithCount[]> {
+        const [roles, users] = await Promise.all([
+            this.readRoleDefinitions(),
+            this.getAllStoredUsers()
+        ]);
+        const counts = users.reduce<Record<UserRoleKey, number>>((accumulator, user) => {
+            accumulator[user.role] += 1;
+            return accumulator;
+        }, {
+            admin: 0,
+            designer: 0,
+            moderator: 0,
+            user: 0
+        });
+
+        return roles.map((role) => ({
+            ...role,
+            userCount: counts[role.key] ?? 0
+        }));
+    }
+
+    public async updateRoleDefinition(
+        roleKey:UserRoleKey,
+        updates:{
+            description?:string;
+            permissions?:RolePermission[];
+        }
+    ):Promise<{ role:RoleDefinition } | { error:string }> {
+        const roles = await this.readRoleDefinitions();
+        const roleIndex = roles.findIndex((role) => role.key === roleKey);
+        if (roleIndex === -1) {
+            return { error: "Unknown role." };
+        }
+
+        const currentRole = roles[roleIndex];
+        const nextDescription =
+            typeof updates.description === "string"
+                ? updates.description.trim().slice(0, 240)
+                : currentRole.description;
+
+        if (!nextDescription) {
+            return { error: "Role description is required." };
+        }
+
+        const nextPermissions =
+            roleKey === "admin"
+                ? [...ROLE_PERMISSIONS]
+                : this.sanitizeRolePermissions(updates.permissions ?? currentRole.permissions);
+
+        roles[roleIndex] = {
+            ...currentRole,
+            description: nextDescription,
+            permissions: nextPermissions
+        };
+
+        await this.redis.set(this.roleDefinitionsKey(), JSON.stringify(roles));
+
+        return {
+            role: roles[roleIndex]
+        };
+    }
+
+    public async listUsers(
+        payload?:{
+            search?:string;
+            page?:number;
+            pageSize?:number;
+        }
+    ):Promise<AdminUserListPayload> {
+        const search = typeof payload?.search === "string" ? payload.search.trim().toLowerCase() : "";
+        const requestedPage = typeof payload?.page === "number" && Number.isFinite(payload.page)
+            ? Math.max(1, Math.round(payload.page))
+            : 1;
+        const pageSize = typeof payload?.pageSize === "number" && Number.isFinite(payload.pageSize)
+            ? Math.max(5, Math.min(50, Math.round(payload.pageSize)))
+            : 10;
+        const users = await this.getAllStoredUsers();
+        const filteredUsers = users
+            .filter((user) => {
+                if (!search) {
+                    return true;
+                }
+
+                const haystack = [
+                    user.name,
+                    user.username,
+                    user.email,
+                    user.role
+                ].join(" ").toLowerCase();
+
+                return haystack.includes(search);
+            })
+            .sort((left, right) => right.id - left.id);
+        const total = filteredUsers.length;
+        const totalPages = Math.max(1, Math.ceil(total / pageSize));
+        const page = Math.min(requestedPage, totalPages);
+        const startIndex = (page - 1) * pageSize;
+        const pagedUsers = filteredUsers.slice(startIndex, startIndex + pageSize);
+        const summaries = await Promise.all(pagedUsers.map((user) => this.toAdminUserSummary(user)));
+
+        return {
+            users: summaries,
+            search,
+            page,
+            pageSize,
+            total,
+            totalPages
+        };
+    }
+
+    public async getUserAdminDetails(userId:number):Promise<AdminUserDetails | null> {
+        const user = await this.getStoredUserById(String(userId));
+        if (!user) {
+            return null;
+        }
+
+        return this.toAdminUserDetails(user);
+    }
+
+    public async updateUserByAdmin(
+        userId:number,
+        updates:AdminUserUpdatePayload
+    ):Promise<{ user:AdminUserDetails } | { error:string }> {
+        const storedUser = await this.getStoredUserById(String(userId));
+        if (!storedUser) {
+            return { error: "User not found." };
+        }
+
+        const fields:Record<string, string> = {};
+
+        if (typeof updates.name === "string") {
+            const name = updates.name.trim();
+            if (name.length < 2 || name.length > 30) {
+                return { error: "Name must be between 2 and 30 characters." };
+            }
+
+            if (!/^[A-Za-z]+$/.test(name)) {
+                return { error: "Name may contain letters only." };
+            }
+
+            fields.name = name;
+        }
+
+        if (typeof updates.profileImage === "string") {
+            const profileImage = updates.profileImage.trim();
+            if (profileImage.length > 2000) {
+                return { error: "Profile image URL is too long." };
+            }
+
+            fields.profile_image = profileImage;
+        }
+
+        if (typeof updates.description === "string") {
+            const description = updates.description.trim();
+            if (description.length > 50) {
+                return { error: "Description must be 50 characters or less." };
+            }
+
+            fields.description = description;
+        }
+
+        if (typeof updates.trainerGender === "string") {
+            fields.trainer_gender = updates.trainerGender.trim().slice(0, 40);
+        }
+
+        if (typeof updates.money === "number") {
+            if (!Number.isFinite(updates.money)) {
+                return { error: "Money must be a valid number." };
+            }
+
+            fields.money = String(Math.max(0, Math.round(updates.money)));
+        }
+
+        if (typeof updates.emailVerified === "boolean") {
+            fields.email_verified = updates.emailVerified ? "1" : "0";
+        }
+
+        if (typeof updates.role === "string") {
+            const roles = await this.readRoleDefinitions();
+            if (!roles.some((role) => role.key === updates.role)) {
+                return { error: "Unknown role." };
+            }
+
+            fields.role = updates.role;
+        }
+
+        if (updates.inventory) {
+            fields.inventory = JSON.stringify(this.sanitizeInventoryForStorage(updates.inventory));
+        }
+
+        if (updates.pokemonParty) {
+            fields.pokemon_party = JSON.stringify(this.sanitizePokemonPartyForStorage(updates.pokemonParty));
+        }
+
+        if (updates.battleHistory) {
+            fields.battle_history = JSON.stringify(this.sanitizeBattleHistoryForStorage(updates.battleHistory));
+        }
+
+        if (Object.keys(fields).length > 0) {
+            await this.redis.hSet(this.userKey(userId), fields);
+        }
+
+        if (updates.savedLocation) {
+            if (
+                typeof updates.savedLocation.mapId !== "string" ||
+                updates.savedLocation.mapId.trim().length === 0 ||
+                typeof updates.savedLocation.x !== "number" ||
+                !Number.isFinite(updates.savedLocation.x) ||
+                typeof updates.savedLocation.y !== "number" ||
+                !Number.isFinite(updates.savedLocation.y)
+            ) {
+                return { error: "Saved location must include a map and valid coordinates." };
+            }
+
+            await this.savePlayerLocation(userId, {
+                mapId: updates.savedLocation.mapId.trim(),
+                x: updates.savedLocation.x,
+                y: updates.savedLocation.y
+            });
+        }
+
+        const updatedUser = await this.getUserAdminDetails(userId);
+        if (!updatedUser) {
+            return { error: "Unable to refresh the updated user." };
+        }
+
+        return {
+            user: updatedUser
+        };
+    }
+
 
     private async sendPostRegistrationEmails(user:AuthenticatedUser) {
         const results = await Promise.allSettled([
@@ -760,7 +1102,84 @@ export default class Auth {
         return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
     }
 
-    private async createUser(name:string, username:string, email:string, password:string) {
+    private async ensureRoleDefinitions() {
+        const roles = await this.readRoleDefinitions();
+        await this.redis.set(this.roleDefinitionsKey(), JSON.stringify(roles));
+    }
+
+    private async readRoleDefinitions() {
+        const parsed = this.sanitizeRoleDefinitions(
+            await this.redis.get(this.roleDefinitionsKey())
+        );
+
+        return USER_ROLE_KEYS.map((roleKey) => (
+            parsed.find((role) => role.key === roleKey) ?? DEFAULT_ROLE_DEFINITIONS.find((role) => role.key === roleKey)!
+        ));
+    }
+
+    private sanitizeRoleDefinitions(value:string | null) {
+        if (!value) {
+            return [...DEFAULT_ROLE_DEFINITIONS];
+        }
+
+        try {
+            const parsed = JSON.parse(value);
+            if (!Array.isArray(parsed)) {
+                return [...DEFAULT_ROLE_DEFINITIONS];
+            }
+
+            return parsed
+                .filter((role): role is RoleDefinition =>
+                    role &&
+                    typeof role === "object" &&
+                    this.isUserRoleKey((role as { key?:unknown }).key) &&
+                    typeof (role as { name?:unknown }).name === "string" &&
+                    typeof (role as { description?:unknown }).description === "string" &&
+                    Array.isArray((role as { permissions?:unknown }).permissions)
+                )
+                .map((role) => ({
+                    key: role.key,
+                    name: role.name.trim() || DEFAULT_ROLE_DEFINITIONS.find((defaultRole) => defaultRole.key === role.key)!.name,
+                    description: role.description.trim() || DEFAULT_ROLE_DEFINITIONS.find((defaultRole) => defaultRole.key === role.key)!.description,
+                    permissions: this.sanitizeRolePermissions(role.permissions)
+                }));
+        } catch {
+            return [...DEFAULT_ROLE_DEFINITIONS];
+        }
+    }
+
+    private sanitizeRolePermissions(permissions:unknown):RolePermission[] {
+        if (!Array.isArray(permissions)) {
+            return [];
+        }
+
+        const uniquePermissions = new Set<RolePermission>();
+        permissions.forEach((permission) => {
+            if (this.isRolePermission(permission)) {
+                uniquePermissions.add(permission);
+            }
+        });
+
+        return Array.from(uniquePermissions);
+    }
+
+    private resolvePermissionsForRole(role:unknown, roles:RoleDefinition[]) {
+        const safeRole = this.isUserRoleKey(role) ? role : "user";
+        const matchedRole = roles.find((candidate) => candidate.key === safeRole)
+            ?? DEFAULT_ROLE_DEFINITIONS.find((candidate) => candidate.key === safeRole)!;
+
+        return {
+            role: matchedRole.key,
+            permissions: this.sanitizeRolePermissions(matchedRole.permissions)
+        };
+    }
+
+    private async createUser(
+        name:string,
+        username:string,
+        email:string,
+        password:string
+    ):Promise<AuthenticatedUser | null> {
         const normalizedUsername = username.toLowerCase();
         const normalizedEmail = email.toLowerCase();
         const usernameKey = this.usernameIndexKey(normalizedUsername);
@@ -780,6 +1199,7 @@ export default class Auth {
             const passwordHash = this.hashPassword(password, passwordSalt);
             const createdAt = new Date().toISOString();
             const userKey = this.userKey(userId);
+            const role:UserRoleKey = userId === 1 ? "admin" : "user";
 
             const transaction = await this.redis.multi()
                 .hSet(userKey, {
@@ -797,6 +1217,7 @@ export default class Auth {
                     trainer_gender: "",
                     money: String(DEFAULT_MONEY),
                     battle_history: JSON.stringify(DEFAULT_BATTLE_HISTORY),
+                    role,
                     created_at: createdAt
                 })
                 .set(usernameKey, String(userId))
@@ -816,7 +1237,11 @@ export default class Auth {
                     pokemonParty: DEFAULT_POKEMON_PARTY,
                     trainerGender: "",
                     money: DEFAULT_MONEY,
-                    battleHistory: DEFAULT_BATTLE_HISTORY
+                    battleHistory: DEFAULT_BATTLE_HISTORY,
+                    role,
+                    permissions: role === "admin"
+                        ? [...ROLE_PERMISSIONS]
+                        : ["game.access" as const]
                 };
             }
         }
@@ -922,6 +1347,19 @@ export default class Auth {
         return user ? this.toAuthenticatedUser(user) : null;
     }
 
+    private async getAllStoredUsers() {
+        const highestUserId = Number.parseInt(await this.redis.get(this.userIdSequenceKey()) ?? "0", 10);
+        if (!Number.isFinite(highestUserId) || highestUserId <= 0) {
+            return [];
+        }
+
+        const users = await Promise.all(
+            Array.from({ length: highestUserId }, (_, index) => this.getStoredUserById(String(index + 1)))
+        );
+
+        return users.filter((user): user is StoredUser => Boolean(user));
+    }
+
     private async getStoredUserById(userId:string) {
         const user = await this.redis.hGetAll(this.userKey(userId));
         if (!user.id) {
@@ -952,10 +1390,16 @@ export default class Auth {
         if (typeof user.battle_history !== "string") {
             defaultFields.battle_history = JSON.stringify(DEFAULT_BATTLE_HISTORY);
         }
+        if (!this.isUserRoleKey(user.role)) {
+            defaultFields.role = "user";
+        }
 
         if (Object.keys(defaultFields).length > 0) {
             await this.redis.hSet(this.userKey(userId), defaultFields);
         }
+
+        const roles = await this.readRoleDefinitions();
+        const resolvedRole = this.resolvePermissionsForRole(user.role ?? defaultFields.role, roles);
 
         return {
             id: Number(user.id),
@@ -972,6 +1416,8 @@ export default class Auth {
             trainerGender: user.trainer_gender ?? "",
             money: this.parseMoney(user.money),
             battleHistory: this.parseBattleHistory(user.battle_history),
+            role: resolvedRole.role,
+            permissions: resolvedRole.permissions,
             created_at: user.created_at
         } satisfies StoredUser;
     }
@@ -989,7 +1435,41 @@ export default class Auth {
             pokemonParty: user.pokemonParty,
             trainerGender: user.trainerGender,
             money: user.money,
-            battleHistory: user.battleHistory
+            battleHistory: user.battleHistory,
+            role: user.role,
+            permissions: user.permissions
+        };
+    }
+
+    private async toAdminUserSummary(user:StoredUser):Promise<AdminUserSummary> {
+        const inventoryQuantity = user.inventory.reduce((sum, item) => sum + item.quantity, 0);
+
+        return {
+            id: user.id,
+            name: user.name,
+            username: user.username,
+            email: user.email,
+            emailVerified: user.emailVerified,
+            role: user.role,
+            permissions: user.permissions,
+            profileImage: user.profileImage,
+            description: user.description,
+            trainerGender: user.trainerGender,
+            money: user.money,
+            pokemonCount: user.pokemonParty.length,
+            inventoryItemCount: user.inventory.length,
+            inventoryQuantity,
+            battleHistoryCount: user.battleHistory.length,
+            createdAt: user.created_at,
+            savedLocation: await this.getSavedPlayerLocation(user.id)
+        };
+    }
+
+    private async toAdminUserDetails(user:StoredUser):Promise<AdminUserDetails> {
+        return {
+            ...this.toAuthenticatedUser(user),
+            createdAt: user.created_at,
+            savedLocation: await this.getSavedPlayerLocation(user.id)
         };
     }
 
@@ -1219,6 +1699,14 @@ export default class Auth {
         }
     }
 
+    private isUserRoleKey(value:unknown):value is UserRoleKey {
+        return typeof value === "string" && USER_ROLE_KEYS.includes(value as UserRoleKey);
+    }
+
+    private isRolePermission(value:unknown):value is RolePermission {
+        return typeof value === "string" && ROLE_PERMISSIONS.includes(value as RolePermission);
+    }
+
     private unauthenticatedSession():AuthSessionState {
         return {
             authenticated: false,
@@ -1254,6 +1742,10 @@ export default class Auth {
 
     private userIdSequenceKey() {
         return "auth:user:id:sequence";
+    }
+
+    private roleDefinitionsKey() {
+        return "auth:roles";
     }
 
     private usernameIndexKey(username:string) {

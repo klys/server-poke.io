@@ -1,4 +1,9 @@
 import type {
+  AdminUserUpdatePayload,
+  RolePermission,
+  UserRoleKey
+} from "../components/Auth";
+import type {
   BattleActionRequest,
   BattleChallengePayload,
   BattleChallengeResponsePayload,
@@ -207,4 +212,18 @@ export default interface ClientToServerEvents {
    * Persists the full playable maps snapshot to Redis and publishes a new version.
    */
   "designer:maps:update": (data: { state: PlayableMapsStateSnapshot }) => void;
+  "admin:users:list": (data?: {
+    search?: string;
+    page?: number;
+    pageSize?: number;
+  }) => void;
+  "admin:user:get": (data: { userId: number }) => void;
+  "admin:user:update": (data: { userId: number; updates: AdminUserUpdatePayload }) => void;
+  "admin:roles:list": () => void;
+  "admin:role:update": (data: {
+    roleKey: UserRoleKey;
+    description?: string;
+    permissions?: RolePermission[];
+  }) => void;
+  "moderation:maps:list": () => void;
 }

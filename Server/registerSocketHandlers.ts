@@ -1,5 +1,9 @@
 import { type Server, type Socket } from "socket.io";
-import Auth, { type AuthenticatedUser } from "../components/Auth";
+import Auth, {
+  type AuthenticatedUser,
+  type RolePermission,
+  type UserRoleKey
+} from "../components/Auth";
 import BattleManager from "../components/BattleManager";
 import DesignerSectionStore, {
   isDesignerSectionKey,
@@ -25,6 +29,8 @@ export interface SocketData {
   userId?: number;
   username?: string;
   email?: string;
+  role?: UserRoleKey;
+  permissions?: RolePermission[];
 }
 
 type ServerSocket = Socket<
@@ -49,12 +55,16 @@ function applySocketAuth(socketData:SocketData, user:AuthenticatedUser | null) {
     delete socketData.userId;
     delete socketData.username;
     delete socketData.email;
+    delete socketData.role;
+    delete socketData.permissions;
     return;
   }
 
   socketData.userId = user.id;
   socketData.username = user.username;
   socketData.email = user.email;
+  socketData.role = user.role;
+  socketData.permissions = user.permissions;
 }
 
 function readSocketToken(socket:ServerSocket) {
@@ -97,7 +107,27 @@ function requireDesignerAccess(
   errorEvent: "designer:section:error" | "playableMaps:error",
   message:string
 ) {
-  if (socket.data.authenticated) {
+  if (
+    socket.data.authenticated &&
+    socket.data.permissions?.includes("designer.access")
+  ) {
+    return true;
+  }
+
+  socket.emit(errorEvent, { message });
+  return false;
+}
+
+function requirePermission(
+  socket:ServerSocket,
+  permission:RolePermission,
+  errorEvent:"admin:error" | "moderation:error",
+  message:string
+) {
+  if (
+    socket.data.authenticated &&
+    socket.data.permissions?.includes(permission)
+  ) {
     return true;
   }
 
@@ -118,6 +148,24 @@ function requireDesignerMapsAccess(socket:ServerSocket) {
     socket,
     "playableMaps:error",
     "You must be authenticated to use the map designer."
+  );
+}
+
+function requireAdminAccess(socket:ServerSocket) {
+  return requirePermission(
+    socket,
+    "admin.access",
+    "admin:error",
+    "You must be an admin to use the admin tools."
+  );
+}
+
+function requireModeratorAccess(socket:ServerSocket) {
+  return requirePermission(
+    socket,
+    "moderator.access",
+    "moderation:error",
+    "You must be a moderator to use the moderator tools."
   );
 }
 
@@ -296,6 +344,7 @@ function toInventoryCategory(value: string) {
 }
 
 function createConnectionHandler(
+  _io:TypedSocketServer,
   world:World,
   auth:Auth,
   designerSectionStore:DesignerSectionStore,
@@ -598,10 +647,6 @@ function createConnectionHandler(
         await hydrateSocketAuth(socket, auth);
       }
 
-      if (!requireDesignerSectionAccess(socket)) {
-        return;
-      }
-
       if (!isDesignerSectionKey(data?.sectionKey)) {
         socket.emit("designer:section:error", {
           message: "Unknown designer section."
@@ -610,6 +655,14 @@ function createConnectionHandler(
       }
 
       const sectionKey = data.sectionKey;
+      const canReadSharedSection =
+        socket.data.authenticated &&
+        sectionKey === "pokemons";
+
+      if (!canReadSharedSection && !requireDesignerSectionAccess(socket)) {
+        return;
+      }
+
       socket.join(getDesignerSectionRoom(sectionKey));
 
       try {
@@ -740,6 +793,207 @@ function createConnectionHandler(
         console.error("Unable to save playable maps state:", error);
         socket.emit("playableMaps:error", {
           message: "Unable to save the playable maps state."
+        });
+      }
+    });
+
+    socket.on("admin:users:list", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        socket.emit("admin:users:list", await auth.listUsers(data));
+      } catch (error) {
+        console.error("Unable to list admin users:", error);
+        socket.emit("admin:error", {
+          message: "Unable to load users right now."
+        });
+      }
+    });
+
+    socket.on("admin:user:get", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", {
+            message: "Choose a valid user."
+          });
+          return;
+        }
+
+        socket.emit("admin:user:details", {
+          user: await auth.getUserAdminDetails(userId)
+        });
+      } catch (error) {
+        console.error("Unable to load admin user details:", error);
+        socket.emit("admin:error", {
+          message: "Unable to load the selected user."
+        });
+      }
+    });
+
+    socket.on("admin:user:update", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", {
+            message: "Choose a valid user."
+          });
+          return;
+        }
+
+        const result = await auth.updateUserByAdmin(userId, data.updates ?? {});
+        if ("error" in result) {
+          socket.emit("admin:error", {
+            message: result.error
+          });
+          return;
+        }
+
+        if (data.updates?.savedLocation) {
+          const player = world.getPlayerByUserId(userId);
+          if (player) {
+            player.teleport(
+              data.updates.savedLocation.mapId,
+              data.updates.savedLocation.x,
+              data.updates.savedLocation.y
+            );
+            world.players.set(player.socketId, player);
+            world.presentPlayerToMap(player);
+            player.socketConnections.forEach((socketId) => {
+              world.presentPlayersOnMapTo(socketId, player.currentMapId);
+            });
+          }
+        }
+
+        socket.emit("admin:user:details", {
+          user: result.user
+        });
+        socket.emit("auth:info", {
+          message: `Updated ${result.user.username}.`
+        });
+
+        if (socket.data.userId === userId && socket.data.token) {
+          const session = await sanitizeAuthSessionInventory(
+            await auth.resolveSession(socket.data.token),
+            auth,
+            designerSectionStore
+          );
+          applySocketAuth(socket.data, session.user);
+          socket.emit("auth:session", session);
+        }
+      } catch (error) {
+        console.error("Unable to update admin user:", error);
+        socket.emit("admin:error", {
+          message: "Unable to update the selected user."
+        });
+      }
+    });
+
+    socket.on("admin:roles:list", async () => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        socket.emit("admin:roles:list", {
+          roles: await auth.getRoleDefinitionsWithCounts()
+        });
+      } catch (error) {
+        console.error("Unable to list role definitions:", error);
+        socket.emit("admin:error", {
+          message: "Unable to load roles right now."
+        });
+      }
+    });
+
+    socket.on("admin:role:update", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        if (typeof data?.roleKey !== "string") {
+          socket.emit("admin:error", {
+            message: "Choose a valid role."
+          });
+          return;
+        }
+
+        const result = await auth.updateRoleDefinition(data.roleKey as UserRoleKey, {
+          description: data.description,
+          permissions: data.permissions
+        });
+        if ("error" in result) {
+          socket.emit("admin:error", {
+            message: result.error
+          });
+          return;
+        }
+
+        socket.emit("admin:roles:list", {
+          roles: await auth.getRoleDefinitionsWithCounts()
+        });
+        socket.emit("auth:info", {
+          message: `Updated the ${result.role.name} role.`
+        });
+      } catch (error) {
+        console.error("Unable to update role definition:", error);
+        socket.emit("admin:error", {
+          message: "Unable to update the selected role."
+        });
+      }
+    });
+
+    socket.on("moderation:maps:list", async () => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireModeratorAccess(socket)) {
+          return;
+        }
+
+        const maps = world.getOnlineMapsOverview();
+        socket.emit("moderation:maps:list", {
+          maps,
+          totalOnlinePlayers: maps.reduce((total, map) => total + map.onlinePlayers, 0),
+          fetchedAt: new Date().toISOString()
+        });
+      } catch (error) {
+        console.error("Unable to load moderation map overview:", error);
+        socket.emit("moderation:error", {
+          message: "Unable to load online map activity."
         });
       }
     });
@@ -984,5 +1238,5 @@ export default function registerSocketHandlers(
 ) {
   const battleManager = new BattleManager(io, world, auth, designerSectionStore);
   world.setBattleManager(battleManager);
-  io.on("connection", createConnectionHandler(world, auth, designerSectionStore, playableMapsStore, battleManager));
+  io.on("connection", createConnectionHandler(io, world, auth, designerSectionStore, playableMapsStore, battleManager));
 }

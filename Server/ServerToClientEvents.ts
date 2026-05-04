@@ -1,4 +1,9 @@
 import type {
+  AdminUserDetails,
+  AdminUserListPayload,
+  RoleDefinitionWithCount
+} from "../components/Auth";
+import type {
   BattlePublicState
 } from "../components/BattleManager";
 import type {
@@ -63,6 +68,8 @@ interface AuthUserData {
   description: string;
   trainerGender: string;
   money: number;
+  role: "admin" | "designer" | "moderator" | "user";
+  permissions: Array<"game.access" | "designer.access" | "moderator.access" | "admin.access">;
   inventory: Array<{
     id: string;
     name: string;
@@ -182,6 +189,28 @@ export default interface ServerToClientEvents {
    * Playable map sync error for both game clients and the designer.
    */
   "playableMaps:error": (data: { message: string }) => void;
+  "admin:users:list": (data: AdminUserListPayload) => void;
+  "admin:user:details": (data: { user: AdminUserDetails | null }) => void;
+  "admin:roles:list": (data: { roles: RoleDefinitionWithCount[] }) => void;
+  "admin:error": (data: { message: string }) => void;
+  "moderation:maps:list": (data: {
+    maps: Array<{
+      mapId: string;
+      onlinePlayers: number;
+      players: Array<{
+        playerId: string;
+        userId: number | null;
+        username: string;
+        name: string;
+        x: number;
+        y: number;
+        connectedSockets: number;
+      }>;
+    }>;
+    totalOnlinePlayers: number;
+    fetchedAt: string;
+  }) => void;
+  "moderation:error": (data: { message: string }) => void;
 
   // Dynamic events using template literal types
   [event: `move${string}`]: (data: {

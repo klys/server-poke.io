@@ -408,6 +408,50 @@ export default class World {
         return playerId ? this.players.get(playerId) : undefined;
     }
 
+    getPlayerByUserId(userId:number) {
+        return this.players.get(this.getAuthenticatedPlayerId(userId));
+    }
+
+    getOnlineMapsOverview() {
+        const maps = new Map<string, {
+            mapId:string;
+            players:Array<{
+                playerId:string;
+                userId:number | null;
+                username:string;
+                name:string;
+                x:number;
+                y:number;
+                connectedSockets:number;
+            }>;
+        }>();
+
+        this.players.forEach((player) => {
+            const currentMap = maps.get(player.currentMapId) ?? {
+                mapId: player.currentMapId,
+                players: []
+            };
+
+            currentMap.players.push({
+                playerId: player.socketId,
+                userId: player.userId,
+                username: player.username,
+                name: player.name,
+                x: player.x,
+                y: player.y,
+                connectedSockets: player.socketConnections.size
+            });
+            maps.set(player.currentMapId, currentMap);
+        });
+
+        return Array.from(maps.values())
+            .map((map) => ({
+                ...map,
+                onlinePlayers: map.players.length
+            }))
+            .sort((left, right) => right.onlinePlayers - left.onlinePlayers || left.mapId.localeCompare(right.mapId));
+    }
+
     addPlayer(
         socketId:string,
         spawnState?: { mapId?: string; x?: number; y?: number },
