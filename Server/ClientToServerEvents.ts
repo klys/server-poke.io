@@ -90,6 +90,9 @@ export default interface ClientToServerEvents {
   "inventory:use-item": (data: { itemId: string; targetPokemonId: string }) => void;
   "inventory:teach-move": (data: { itemId: string; targetPokemonId: string }) => void;
   "inventory:throw-away": (data: { itemId: string; quantity: number }) => void;
+  "npc:heal-party": (data: { npcPlacementId: string }) => void;
+  "npc:store-buy": (data: { npcPlacementId: string; itemId: string; quantity: number }) => void;
+  "npc:store-sell": (data: { npcPlacementId: string; itemId: string; quantity: number }) => void;
   "pokemon:name": (data: AuthNamePokemonPayload) => void;
 
   /**

@@ -250,6 +250,32 @@ type ItemDefinition = {
   };
 };
 
+type NpcStoreDefinition = {
+  itemId: string;
+  itemName: string;
+  quantity: number;
+  price: number;
+};
+
+type NpcDefinition = {
+  id: string;
+  name: string;
+  npcType: "healer" | "trainer" | "store" | "chest";
+  healPrice: number;
+  storeItems: NpcStoreDefinition[];
+};
+
+type ResolvedNpcInteraction = {
+  player: Player;
+  placement: {
+    id: string;
+    npcId: string;
+    name: string;
+    x: number;
+    y: number;
+  };
+};
+
 type ChallengeRequest = {
   id: string;
   challengerPlayerId: string;
@@ -668,6 +694,159 @@ export default class BattleManager {
       user: nextUser,
       droppedItem,
       message: `You threw away ${itemDefinition.name} x${throwQuantity}.`
+    };
+  }
+
+  public async healPartyAtNpc(userId: number, npcPlacementId?: string) {
+    const interaction = this.resolveNpcInteraction(userId, npcPlacementId);
+
+    if (!interaction.ok) {
+      return interaction;
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    const catalogs = await this.loadCatalogs();
+    const npc = this.cachedNpcDefinitions.get(interaction.placement.npcId);
+
+    if (!user || !npc || npc.npcType !== "healer") {
+      return { ok: false, message: "That healer is unavailable right now." };
+    }
+
+    if (user.pokemonParty.length === 0) {
+      return { ok: false, message: "You do not have a Pokemon team to heal." };
+    }
+
+    if (user.money < npc.healPrice) {
+      return {
+        ok: false,
+        message: `${npc.name} charges $${npc.healPrice} to heal your team.`
+      };
+    }
+
+    if (this.isPartyFullyHealed(user.pokemonParty, catalogs.skillsByName)) {
+      return { ok: false, message: "Your Pokemon team is already fully healed." };
+    }
+
+    const healedParty = user.pokemonParty.map((pokemon) => ({
+      ...pokemon,
+      hp: pokemon.maxHp,
+      movePp: this.restorePokemonMovePp(pokemon, catalogs.skillsByName)
+    }));
+    const nextUser = await this.auth.saveBattleState(userId, {
+      pokemonParty: healedParty,
+      money: user.money - npc.healPrice
+    });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: `${npc.name} fully healed your team for $${npc.healPrice}.`
+    };
+  }
+
+  public async buyFromNpcStore(
+    userId: number,
+    npcPlacementId?: string,
+    itemId?: string,
+    quantity?: number
+  ) {
+    const interaction = this.resolveNpcInteraction(userId, npcPlacementId);
+
+    if (!interaction.ok) {
+      return interaction;
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    await this.loadCatalogs();
+    const npc = this.cachedNpcDefinitions.get(interaction.placement.npcId);
+    const purchaseCount =
+      typeof quantity === "number" && Number.isFinite(quantity)
+        ? Math.max(1, Math.round(quantity))
+        : 1;
+    const storeItem = npc?.storeItems.find((candidate) => candidate.itemId === itemId);
+    const itemDefinition = storeItem
+      ? this.getCachedItemDefinition(storeItem.itemId, storeItem.itemName)
+      : null;
+
+    if (!user || !npc || npc.npcType !== "store") {
+      return { ok: false, message: "That store is unavailable right now." };
+    }
+
+    if (!storeItem || !itemDefinition) {
+      return { ok: false, message: "That item is not available in this store." };
+    }
+
+    const totalPrice = storeItem.price * purchaseCount;
+
+    if (user.money < totalPrice) {
+      return { ok: false, message: "You do not have enough money for that purchase." };
+    }
+
+    const totalQuantity = storeItem.quantity * purchaseCount;
+    const nextInventory = this.addInventoryQuantity(user.inventory, itemDefinition, totalQuantity);
+    const nextUser = await this.auth.saveBattleState(userId, {
+      inventory: nextInventory,
+      money: user.money - totalPrice
+    });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: `You bought ${itemDefinition.name} x${totalQuantity} for $${totalPrice}.`
+    };
+  }
+
+  public async sellToNpcStore(
+    userId: number,
+    npcPlacementId?: string,
+    itemId?: string,
+    quantity?: number
+  ) {
+    const interaction = this.resolveNpcInteraction(userId, npcPlacementId);
+
+    if (!interaction.ok) {
+      return interaction;
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    await this.loadCatalogs();
+    const npc = this.cachedNpcDefinitions.get(interaction.placement.npcId);
+    const sellCount =
+      typeof quantity === "number" && Number.isFinite(quantity)
+        ? Math.max(1, Math.round(quantity))
+        : 1;
+    const storeItem = npc?.storeItems.find((candidate) => candidate.itemId === itemId);
+    const inventoryItem = user?.inventory.find((candidate) => candidate.id === itemId);
+
+    if (!user || !npc || npc.npcType !== "store") {
+      return { ok: false, message: "That store is unavailable right now." };
+    }
+
+    if (!storeItem) {
+      return { ok: false, message: "This store only buys items it keeps in stock." };
+    }
+
+    if (!inventoryItem || inventoryItem.quantity < sellCount) {
+      return { ok: false, message: "You do not have that many items to sell." };
+    }
+
+    const sellPricePerUnit = this.getNpcStoreSellPrice(storeItem);
+
+    if (sellPricePerUnit <= 0) {
+      return { ok: false, message: "This store is not buying that item right now." };
+    }
+
+    const totalPrice = sellPricePerUnit * sellCount;
+    const nextInventory = this.removeInventoryQuantity(user.inventory, inventoryItem.id, sellCount);
+    const nextUser = await this.auth.saveBattleState(userId, {
+      inventory: nextInventory,
+      money: user.money + totalPrice
+    });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: `You sold ${inventoryItem.name} x${sellCount} for $${totalPrice}.`
     };
   }
 
@@ -1514,6 +1693,7 @@ export default class BattleManager {
   }
 
   private cachedItemDefinitions: ItemDefinition[] = [];
+  private cachedNpcDefinitions = new Map<string, NpcDefinition>();
 
   private getCachedItemDefinition(itemId: string, itemName: string) {
     const normalizedName = itemName.toLowerCase();
@@ -1566,6 +1746,107 @@ export default class BattleManager {
         description: itemDefinition.description
       }
     ];
+  }
+
+  private resolveNpcInteraction(
+    userId: number,
+    npcPlacementId?: string
+  ): { ok: false; message: string } | ({ ok: true } & ResolvedNpcInteraction) {
+    if (typeof npcPlacementId !== "string" || npcPlacementId.trim().length === 0) {
+      return { ok: false, message: "Choose an NPC to interact with." };
+    }
+
+    const player = this.world.getPlayerByUserId(userId);
+
+    if (!player) {
+      return { ok: false, message: "Enter the world before talking to NPCs." };
+    }
+
+    const playableMapsState = this.world.getPlayableMapsState();
+
+    if (!playableMapsState) {
+      return { ok: false, message: "The world map is still loading." };
+    }
+
+    const mapEditorData = playableMapsState.editorDataByMapId[player.currentMapId];
+    const placement =
+      mapEditorData?.npcs.find((candidate) => candidate.id === npcPlacementId) ?? null;
+
+    if (!placement) {
+      return { ok: false, message: "That NPC is not on your current map." };
+    }
+
+    const mapDefinition =
+      playableMapsState.items.find((candidate) => candidate.id === player.currentMapId) ?? null;
+    const cellSize = mapDefinition?.playableMapConfig?.cellSize ?? 32;
+    const distance = Math.hypot(
+      player.x - placement.x * cellSize,
+      player.y - placement.y * cellSize
+    );
+
+    if (distance > cellSize * 2) {
+      return { ok: false, message: "Move closer to talk with that NPC." };
+    }
+
+    return {
+      ok: true,
+      player,
+      placement: {
+        id: placement.id,
+        npcId: placement.npcId,
+        name: placement.name,
+        x: placement.x,
+        y: placement.y
+      }
+    };
+  }
+
+  private restorePokemonMovePp(
+    pokemon: PokemonSummary,
+    skillsByName: Map<string, SkillDefinition>
+  ) {
+    if (!Array.isArray(pokemon.moves) || pokemon.moves.length === 0) {
+      return pokemon.movePp ?? {};
+    }
+
+    return pokemon.moves.reduce<Record<string, number>>((accumulator, moveName) => {
+      const skillDefinition = skillsByName.get(moveName.toLowerCase());
+      const currentPp = pokemon.movePp?.[moveName];
+      const fallbackPp =
+        typeof currentPp === "number" && Number.isFinite(currentPp)
+          ? Math.max(0, Math.round(currentPp))
+          : 1;
+
+      accumulator[moveName] = Math.max(1, skillDefinition?.powerPoint ?? fallbackPp);
+      return accumulator;
+    }, {});
+  }
+
+  private isPartyFullyHealed(
+    party: PokemonSummary[],
+    skillsByName: Map<string, SkillDefinition>
+  ) {
+    return party.every((pokemon) => {
+      if (pokemon.hp < pokemon.maxHp) {
+        return false;
+      }
+
+      return pokemon.moves.every((moveName) => {
+        const skillDefinition = skillsByName.get(moveName.toLowerCase());
+        const maxPp = Math.max(1, skillDefinition?.powerPoint ?? pokemon.movePp?.[moveName] ?? 1);
+        const currentPp =
+          typeof pokemon.movePp?.[moveName] === "number" && Number.isFinite(pokemon.movePp[moveName])
+            ? Math.max(0, Math.round(pokemon.movePp[moveName]!))
+            : maxPp;
+
+        return currentPp >= maxPp;
+      });
+    });
+  }
+
+  private getNpcStoreSellPrice(storeItem: NpcStoreDefinition) {
+    const perUnitBuyPrice = Math.floor(storeItem.price / Math.max(1, storeItem.quantity));
+    return Math.max(0, Math.floor(perUnitBuyPrice / 2));
   }
 
   private switchPokemon(side: BattleSide, pokemonId: string) {
@@ -1689,11 +1970,12 @@ export default class BattleManager {
   }
 
   private async loadCatalogs() {
-    const [pokemonPayload, skillsPayload, itemsPayload, levelingCurvePayload] = await Promise.all([
+    const [pokemonPayload, skillsPayload, itemsPayload, levelingCurvePayload, npcsPayload] = await Promise.all([
       this.designerSectionStore.read("pokemons"),
       this.designerSectionStore.read("skills"),
       this.designerSectionStore.read("items"),
-      this.designerSectionStore.read("levelingCurve")
+      this.designerSectionStore.read("levelingCurve"),
+      this.designerSectionStore.read("npcs")
     ]);
     const skillsById = new Map<string, SkillDefinition>();
     const skillsByName = new Map<string, SkillDefinition>();
@@ -1716,6 +1998,12 @@ export default class BattleManager {
     this.cachedItemDefinitions = (itemsPayload?.state.items ?? [])
       .map(this.toItemDefinition)
       .filter((item): item is ItemDefinition => Boolean(item));
+    this.cachedNpcDefinitions = new Map(
+      (npcsPayload?.state.items ?? [])
+        .map(this.toNpcDefinition)
+        .filter((item): item is NpcDefinition => Boolean(item))
+        .map((item) => [item.id, item] as const)
+    );
 
     return {
       pokemonById,
@@ -1845,6 +2133,71 @@ export default class BattleManager {
         specialDefense: parseNumber(profile.statModifiers.specialDefense, 0),
         speed: parseNumber(profile.statModifiers.speed, 0)
       }
+    };
+  }
+
+  private toNpcDefinition(item: DesignerSectionItem): NpcDefinition | null {
+    const profile = item.npcProfile as {
+      npcType?: unknown;
+      healPrice?: unknown;
+      storeItems?: unknown;
+    } | undefined;
+
+    if (!profile) {
+      return null;
+    }
+
+    const npcType = profile.npcType;
+
+    if (
+      npcType !== "healer" &&
+      npcType !== "trainer" &&
+      npcType !== "store" &&
+      npcType !== "chest"
+    ) {
+      return null;
+    }
+
+    const storeItems = Array.isArray(profile.storeItems)
+      ? profile.storeItems
+          .filter(
+            (storeItem): storeItem is {
+              itemId: string;
+              itemName: string;
+              quantity: number;
+              price: number;
+            } => {
+              const candidate = storeItem as {
+                itemId?: unknown;
+                itemName?: unknown;
+                quantity?: unknown;
+                price?: unknown;
+              };
+
+              return (
+                typeof candidate.itemId === "string" &&
+                typeof candidate.itemName === "string" &&
+                typeof candidate.quantity === "number" &&
+                Number.isFinite(candidate.quantity) &&
+                typeof candidate.price === "number" &&
+                Number.isFinite(candidate.price)
+              );
+            }
+          )
+          .map((storeItem) => ({
+            itemId: storeItem.itemId,
+            itemName: normalizeText(storeItem.itemName),
+            quantity: Math.max(1, Math.round(storeItem.quantity)),
+            price: Math.max(0, Math.round(storeItem.price)),
+          }))
+      : [];
+
+    return {
+      id: item.id,
+      name: item.name,
+      npcType,
+      healPrice: Math.max(0, parseNumber(profile.healPrice, 0)),
+      storeItems,
     };
   }
 

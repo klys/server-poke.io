@@ -657,7 +657,7 @@ function createConnectionHandler(
       const sectionKey = data.sectionKey;
       const canReadSharedSection =
         socket.data.authenticated &&
-        sectionKey === "pokemons";
+        (sectionKey === "pokemons" || sectionKey === "npcs");
 
       if (!canReadSharedSection && !requireDesignerSectionAccess(socket)) {
         return;
@@ -1184,6 +1184,70 @@ function createConnectionHandler(
         data.itemId,
         data.quantity,
         player
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("npc:heal-party", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to talk with NPCs." });
+        return;
+      }
+
+      const result = await battleManager.healPartyAtNpc(
+        socket.data.userId,
+        data?.npcPlacementId
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("npc:store-buy", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to shop with NPCs." });
+        return;
+      }
+
+      const result = await battleManager.buyFromNpcStore(
+        socket.data.userId,
+        data?.npcPlacementId,
+        data?.itemId,
+        data?.quantity
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("npc:store-sell", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to sell items." });
+        return;
+      }
+
+      const result = await battleManager.sellToNpcStore(
+        socket.data.userId,
+        data?.npcPlacementId,
+        data?.itemId,
+        data?.quantity
       );
 
       if (!result.ok) {
