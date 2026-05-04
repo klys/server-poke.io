@@ -36,9 +36,9 @@ export ADMIN_PASSWORD
 
 node <<'NODE'
 const crypto = require("crypto");
+const { spawnSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const { createClient } = require("redis");
 
 const DEFAULT_ROLE_DEFINITIONS = [
     {
@@ -144,66 +144,108 @@ async function main() {
     const normalizedUsername = username.toLowerCase();
     const usernameKey = `auth:index:username:${normalizedUsername}`;
     const userIdSequenceKey = "auth:user:id:sequence";
-    const userKeyPrefix = "auth:user:";
     const rolesKey = "auth:roles";
+    const passwordSalt = crypto.randomBytes(16).toString("hex");
+    const passwordHash = crypto.scryptSync(password + passwordPepper, passwordSalt, 64).toString("hex");
+    const createdAt = new Date().toISOString();
 
-    const client = createClient({ url: redisUrl });
-    client.on("error", (error) => {
-        console.error("Redis client error:", error.message);
-    });
+    const luaScript = `
+local usernameKey = KEYS[1]
+local userIdSequenceKey = KEYS[2]
+local rolesKey = KEYS[3]
+local username = ARGV[1]
+local passwordHash = ARGV[2]
+local passwordSalt = ARGV[3]
+local createdAt = ARGV[4]
+local roleDefinitions = ARGV[5]
 
-    await client.connect();
+if redis.call("EXISTS", usernameKey) == 1 then
+    return redis.error_reply("USERNAME_EXISTS")
+end
 
-    try {
-        await client.setNX(userIdSequenceKey, "0");
-        await client.setNX(rolesKey, JSON.stringify(DEFAULT_ROLE_DEFINITIONS));
+if redis.call("EXISTS", userIdSequenceKey) == 0 then
+    redis.call("SET", userIdSequenceKey, "0")
+end
 
-        for (let attempt = 0; attempt < 5; attempt += 1) {
-            await client.watch(usernameKey);
+if redis.call("EXISTS", rolesKey) == 0 then
+    redis.call("SET", rolesKey, roleDefinitions)
+end
 
-            const existingUserId = await client.get(usernameKey);
-            if (existingUserId) {
-                await client.unwatch();
-                throw new Error(`Username "${username}" already exists.`);
-            }
+local userId = redis.call("INCR", userIdSequenceKey)
+local userKey = "auth:user:" .. userId
 
-            const userId = await client.incr(userIdSequenceKey);
-            const passwordSalt = crypto.randomBytes(16).toString("hex");
-            const passwordHash = crypto.scryptSync(password + passwordPepper, passwordSalt, 64).toString("hex");
-            const createdAt = new Date().toISOString();
+redis.call(
+    "HSET",
+    userKey,
+    "id", tostring(userId),
+    "name", "",
+    "username", username,
+    "email", "",
+    "password_hash", passwordHash,
+    "password_salt", passwordSalt,
+    "email_verified", "0",
+    "profile_image", "",
+    "description", "",
+    "inventory", "[]",
+    "pokemon_party", "[]",
+    "trainer_gender", "",
+    "money", "0",
+    "battle_history", "[]",
+    "role", "admin",
+    "created_at", createdAt
+)
 
-            const transactionResult = await client.multi()
-                .hSet(`${userKeyPrefix}${userId}`, {
-                    id: String(userId),
-                    name: "",
-                    username,
-                    email: "",
-                    password_hash: passwordHash,
-                    password_salt: passwordSalt,
-                    email_verified: "0",
-                    profile_image: "",
-                    description: "",
-                    inventory: "[]",
-                    pokemon_party: "[]",
-                    trainer_gender: "",
-                    money: "0",
-                    battle_history: "[]",
-                    role: "admin",
-                    created_at: createdAt
-                })
-                .set(usernameKey, String(userId))
-                .exec();
+redis.call("SET", usernameKey, tostring(userId))
 
-            if (transactionResult) {
-                console.log(`Admin user created with id ${userId} and username "${username}".`);
-                return;
-            }
+return tostring(userId)
+`;
+
+    const redisCliResult = spawnSync(
+        "redis-cli",
+        [
+            "--raw",
+            "-u",
+            redisUrl,
+            "EVAL",
+            luaScript,
+            "3",
+            usernameKey,
+            userIdSequenceKey,
+            rolesKey,
+            username,
+            passwordHash,
+            passwordSalt,
+            createdAt,
+            JSON.stringify(DEFAULT_ROLE_DEFINITIONS)
+        ],
+        {
+            encoding: "utf8"
+        }
+    );
+
+    if (redisCliResult.error) {
+        if (redisCliResult.error.code === "ENOENT") {
+            throw new Error("redis-cli is required on this machine to create admin users.");
         }
 
-        throw new Error("Unable to create the admin user after multiple Redis transaction retries.");
-    } finally {
-        await client.quit();
+        throw redisCliResult.error;
     }
+
+    if (redisCliResult.status !== 0) {
+        const stderr = (redisCliResult.stderr || "").trim();
+        if (stderr.includes("USERNAME_EXISTS")) {
+            throw new Error(`Username "${username}" already exists.`);
+        }
+
+        throw new Error(stderr || "redis-cli failed to create the admin user.");
+    }
+
+    const userId = (redisCliResult.stdout || "").trim();
+    if (!userId) {
+        throw new Error("Redis did not return the new admin user id.");
+    }
+
+    console.log(`Admin user created with id ${userId} and username "${username}".`);
 }
 
 main().catch((error) => {

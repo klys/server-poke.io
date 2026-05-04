@@ -200,5 +200,3 @@ Designer sections such as Pokemons, Objects, Regions, Items, Skills, Passive Sta
     *   Movement interpolation happens on a faster interval (1ms) within the Player class.
 
 ---
-
-# smtp fix
