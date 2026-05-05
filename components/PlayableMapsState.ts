@@ -74,6 +74,7 @@ type MapEditorNpcPlacement = {
   previewImageSrc: string;
   npcType: string;
   aiType: string;
+  interactionDistanceSquares: number;
   x: number;
   y: number;
 };
@@ -107,6 +108,7 @@ export type PlayableMapDefinition = {
 const DEFAULT_CELL_SIZE = 32;
 const DEFAULT_MAP_WIDTH = 500;
 const DEFAULT_MAP_HEIGHT = 500;
+const DEFAULT_NPC_INTERACTION_DISTANCE_SQUARES = 2;
 
 function normalizeText(value: string) {
   return value.trim().replace(/\s+/g, " ");
@@ -306,6 +308,12 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
           )
           .map((item) => ({
             ...item,
+            interactionDistanceSquares:
+              typeof item.interactionDistanceSquares === "number" &&
+              Number.isFinite(item.interactionDistanceSquares) &&
+              item.interactionDistanceSquares >= 0
+                ? Math.round(item.interactionDistanceSquares)
+                : DEFAULT_NPC_INTERACTION_DISTANCE_SQUARES,
             x: Math.max(0, clampInteger(item.x)),
             y: Math.max(0, clampInteger(item.y)),
           }))

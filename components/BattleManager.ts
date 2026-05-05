@@ -271,6 +271,7 @@ type ResolvedNpcInteraction = {
     id: string;
     npcId: string;
     name: string;
+    interactionDistanceSquares: number;
     x: number;
     y: number;
   };
@@ -1779,14 +1780,26 @@ export default class BattleManager {
     const mapDefinition =
       playableMapsState.items.find((candidate) => candidate.id === player.currentMapId) ?? null;
     const cellSize = mapDefinition?.playableMapConfig?.cellSize ?? 32;
+    const interactionDistanceSquares =
+      typeof placement.interactionDistanceSquares === "number" &&
+      Number.isFinite(placement.interactionDistanceSquares) &&
+      placement.interactionDistanceSquares >= 0
+        ? placement.interactionDistanceSquares
+        : 2;
+    const playerCenterX = player.x + player.width / 2;
+    const playerCenterY = player.y + player.height / 2;
+    const npcCenterX = placement.x * cellSize + cellSize / 2;
+    const npcCenterY = placement.y * cellSize + cellSize / 2;
     const distance = Math.hypot(
-      player.x - placement.x * cellSize,
-      player.y - placement.y * cellSize
+      playerCenterX - npcCenterX,
+      playerCenterY - npcCenterY
     );
 
-    if (distance > cellSize * 2) {
+    if (distance > cellSize * interactionDistanceSquares) {
       return { ok: false, message: "Move closer to talk with that NPC." };
     }
+
+    player.stopMovement();
 
     return {
       ok: true,
@@ -1795,6 +1808,7 @@ export default class BattleManager {
         id: placement.id,
         npcId: placement.npcId,
         name: placement.name,
+        interactionDistanceSquares,
         x: placement.x,
         y: placement.y
       }

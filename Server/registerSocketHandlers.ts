@@ -326,6 +326,35 @@ async function sanitizeAuthSessionInventory(
   };
 }
 
+async function emitRefreshedAuthSessionToUserSockets(
+  io: TypedSocketServer,
+  auth: Auth,
+  designerSectionStore: DesignerSectionStore,
+  userId: number
+) {
+  const matchingSockets = Array.from(io.sockets.sockets.values()).filter(
+    (candidate) => candidate.data.userId === userId
+  );
+
+  await Promise.all(
+    matchingSockets.map(async (candidateSocket) => {
+      const session = await sanitizeAuthSessionInventory(
+        await auth.resolveSession(candidateSocket.data.token),
+        auth,
+        designerSectionStore
+      );
+
+      applySocketAuth(candidateSocket.data, session.user);
+
+      if (session.token) {
+        candidateSocket.data.token = session.token;
+      }
+
+      candidateSocket.emit("auth:session", session);
+    })
+  );
+}
+
 function toInventoryCategory(value: string) {
   switch (value.toLowerCase()) {
     case "berries":
@@ -893,16 +922,12 @@ function createConnectionHandler(
         socket.emit("auth:info", {
           message: `Updated ${result.user.username}.`
         });
-
-        if (socket.data.userId === userId && socket.data.token) {
-          const session = await sanitizeAuthSessionInventory(
-            await auth.resolveSession(socket.data.token),
-            auth,
-            designerSectionStore
-          );
-          applySocketAuth(socket.data, session.user);
-          socket.emit("auth:session", session);
-        }
+        await emitRefreshedAuthSessionToUserSockets(
+          _io,
+          auth,
+          designerSectionStore,
+          userId
+        );
       } catch (error) {
         console.error("Unable to update admin user:", error);
         socket.emit("admin:error", {
