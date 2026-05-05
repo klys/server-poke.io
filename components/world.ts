@@ -461,6 +461,7 @@ export default class World {
             name?: string;
             profileImage?: string;
             description?: string;
+            characterSkinId?: string;
         }
     ) {
         const existingPlayerForSocket = this.getPlayerBySocket(socketId);

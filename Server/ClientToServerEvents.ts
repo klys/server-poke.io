@@ -57,6 +57,7 @@ interface AuthChangePasswordPayload {
 interface AuthUpdateProfilePayload {
   profileImage?: string;
   description?: string;
+  characterSkinId?: string;
 }
 
 interface AuthChooseStarterPayload {

@@ -26,6 +26,7 @@ interface PlayerData {
   name?: string;
   profileImage?: string;
   description?: string;
+  characterSkinId?: string;
 }
 
 interface ProjectilData {
@@ -67,6 +68,7 @@ interface AuthUserData {
   profileImage: string;
   description: string;
   trainerGender: string;
+  characterSkinId: string;
   money: number;
   role: "admin" | "designer" | "moderator" | "user";
   permissions: Array<"game.access" | "designer.access" | "moderator.access" | "admin.access">;

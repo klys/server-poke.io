@@ -20,6 +20,7 @@ export default class Player {
     name:string;
     profileImage:string;
     description:string;
+    characterSkinId:string;
     inBattle:boolean;
     path:number[][];
     path_pos:number;
@@ -54,6 +55,7 @@ export default class Player {
             name?: string;
             profileImage?: string;
             description?: string;
+            characterSkinId?: string;
         }
     ){
         this.x = x;
@@ -70,6 +72,7 @@ export default class Player {
         this.name = trainerProfile?.name ?? "";
         this.profileImage = trainerProfile?.profileImage ?? "";
         this.description = trainerProfile?.description ?? "";
+        this.characterSkinId = trainerProfile?.characterSkinId ?? "";
         this.inBattle = false;
         this.speed = 1;
         this.path = [];
@@ -277,7 +280,8 @@ export default class Player {
             username:this.username,
             name:this.name,
             profileImage:this.profileImage,
-            description:this.description
+            description:this.description,
+            characterSkinId:this.characterSkinId
         }
         console.log("presenting existing player with data:", playerData)
         return{
@@ -290,7 +294,8 @@ export default class Player {
             username:this.username,
             name:this.name,
             profileImage:this.profileImage,
-            description:this.description
+            description:this.description,
+            characterSkinId:this.characterSkinId
         }
     }
 

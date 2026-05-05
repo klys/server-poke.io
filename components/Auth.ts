@@ -46,6 +46,7 @@ export interface AuthenticatedUser {
     inventory:InventoryItem[];
     pokemonParty:PokemonSummary[];
     trainerGender:string;
+    characterSkinId:string;
     money:number;
     battleHistory:BattleHistoryEntry[];
     role:UserRoleKey;
@@ -97,6 +98,7 @@ export interface AdminUserSummary {
     profileImage:string;
     description:string;
     trainerGender:string;
+    characterSkinId:string;
     money:number;
     pokemonCount:number;
     inventoryItemCount:number;
@@ -125,6 +127,7 @@ export interface AdminUserUpdatePayload {
     profileImage?: string;
     description?: string;
     trainerGender?: string;
+    characterSkinId?: string;
     money?: number;
     emailVerified?: boolean;
     role?: UserRoleKey;
@@ -218,6 +221,7 @@ interface ChangePasswordPayload {
 interface UpdateProfilePayload {
     profileImage?:string;
     description?:string;
+    characterSkinId?:string;
 }
 
 interface ChooseStarterPayload {
@@ -708,6 +712,10 @@ export default class Auth {
 
         const profileImage = typeof payload.profileImage === "string" ? payload.profileImage.trim() : authenticatedUser.profileImage;
         const description = typeof payload.description === "string" ? payload.description.trim() : authenticatedUser.description;
+        const characterSkinId =
+            typeof payload.characterSkinId === "string"
+                ? payload.characterSkinId.trim().slice(0, 120)
+                : authenticatedUser.characterSkinId;
 
         if (description.length > 50) {
             return { error: "Description must be 50 characters or less." };
@@ -719,7 +727,8 @@ export default class Auth {
 
         await this.redis.hSet(this.userKey(authenticatedUser.id), {
             profile_image: profileImage,
-            description
+            description,
+            character_skin_id: characterSkinId
         });
 
         const user = await this.getUserById(String(authenticatedUser.id));
@@ -972,6 +981,10 @@ export default class Auth {
             fields.trainer_gender = updates.trainerGender.trim().slice(0, 40);
         }
 
+        if (typeof updates.characterSkinId === "string") {
+            fields.character_skin_id = updates.characterSkinId.trim().slice(0, 120);
+        }
+
         if (typeof updates.money === "number") {
             if (!Number.isFinite(updates.money)) {
                 return { error: "Money must be a valid number." };
@@ -1215,6 +1228,7 @@ export default class Auth {
                     inventory: JSON.stringify(DEFAULT_INVENTORY),
                     pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
                     trainer_gender: "",
+                    character_skin_id: "",
                     money: String(DEFAULT_MONEY),
                     battle_history: JSON.stringify(DEFAULT_BATTLE_HISTORY),
                     role,
@@ -1236,6 +1250,7 @@ export default class Auth {
                     inventory: DEFAULT_INVENTORY,
                     pokemonParty: DEFAULT_POKEMON_PARTY,
                     trainerGender: "",
+                    characterSkinId: "",
                     money: DEFAULT_MONEY,
                     battleHistory: DEFAULT_BATTLE_HISTORY,
                     role,
@@ -1384,6 +1399,9 @@ export default class Auth {
         if (typeof user.trainer_gender !== "string") {
             defaultFields.trainer_gender = "";
         }
+        if (typeof user.character_skin_id !== "string") {
+            defaultFields.character_skin_id = "";
+        }
         if (typeof user.money !== "string") {
             defaultFields.money = String(DEFAULT_MONEY);
         }
@@ -1414,6 +1432,7 @@ export default class Auth {
             inventory: this.parseInventory(user.inventory),
             pokemonParty: this.parsePokemonParty(user.pokemon_party),
             trainerGender: user.trainer_gender ?? "",
+            characterSkinId: user.character_skin_id ?? "",
             money: this.parseMoney(user.money),
             battleHistory: this.parseBattleHistory(user.battle_history),
             role: resolvedRole.role,
@@ -1434,6 +1453,7 @@ export default class Auth {
             inventory: user.inventory,
             pokemonParty: user.pokemonParty,
             trainerGender: user.trainerGender,
+            characterSkinId: user.characterSkinId,
             money: user.money,
             battleHistory: user.battleHistory,
             role: user.role,
@@ -1455,6 +1475,7 @@ export default class Auth {
             profileImage: user.profileImage,
             description: user.description,
             trainerGender: user.trainerGender,
+            characterSkinId: user.characterSkinId,
             money: user.money,
             pokemonCount: user.pokemonParty.length,
             inventoryItemCount: user.inventory.length,

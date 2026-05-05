@@ -326,6 +326,19 @@ async function sanitizeAuthSessionInventory(
   };
 }
 
+function applyAndEmitAuthSession(
+  socket: ServerSocket,
+  session: Awaited<ReturnType<Auth["resolveSession"]>>
+) {
+  applySocketAuth(socket.data, session.user);
+
+  if (session.token) {
+    socket.data.token = session.token;
+  }
+
+  socket.emit("auth:session", session);
+}
+
 async function emitRefreshedAuthSessionToUserSockets(
   io: TypedSocketServer,
   auth: Auth,
@@ -344,13 +357,7 @@ async function emitRefreshedAuthSessionToUserSockets(
         designerSectionStore
       );
 
-      applySocketAuth(candidateSocket.data, session.user);
-
-      if (session.token) {
-        candidateSocket.data.token = session.token;
-      }
-
-      candidateSocket.emit("auth:session", session);
+      applyAndEmitAuthSession(candidateSocket, session);
     })
   );
 }
@@ -402,8 +409,7 @@ function createConnectionHandler(
 
         const session = await sanitizeAuthSessionInventory(result.session, auth, designerSectionStore);
         socket.data.token = result.session.token;
-        applySocketAuth(socket.data, session.user);
-        socket.emit("auth:session", session);
+        applyAndEmitAuthSession(socket, session);
       } catch (error) {
         console.error("Auth register event failed:", error);
         socket.emit("auth:error", {
@@ -427,8 +433,7 @@ function createConnectionHandler(
 
         const session = await sanitizeAuthSessionInventory(result.session, auth, designerSectionStore);
         socket.data.token = result.session.token;
-        applySocketAuth(socket.data, session.user);
-        socket.emit("auth:session", session);
+        applyAndEmitAuthSession(socket, session);
       } catch (error) {
         console.error("Auth login event failed:", error);
         socket.emit("auth:error", {
@@ -504,8 +509,7 @@ function createConnectionHandler(
             auth,
             designerSectionStore
           );
-          applySocketAuth(socket.data, session.user);
-          socket.emit("auth:session", session);
+          applyAndEmitAuthSession(socket, session);
         }
       } catch (error) {
         console.error("Auth verify email event failed:", error);
@@ -551,15 +555,18 @@ function createConnectionHandler(
 
     socket.on("auth:update-profile", async (data) => {
       try {
-        const result = await auth.updateProfile(socket.data.token, data);
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        const result = await auth.updateProfile(readSocketToken(socket), data);
         if (!("session" in result)) {
           socket.emit("auth:error", { message: result.error });
           return;
         }
 
         const session = await sanitizeAuthSessionInventory(result.session, auth, designerSectionStore);
-        applySocketAuth(socket.data, session.user);
-        socket.emit("auth:session", session);
+        applyAndEmitAuthSession(socket, session);
         socket.emit("auth:info", { message: "Profile updated successfully." });
       } catch (error) {
         console.error("Auth update profile event failed:", error);
@@ -597,8 +604,7 @@ function createConnectionHandler(
         }
 
         const session = await sanitizeAuthSessionInventory(result.session, auth, designerSectionStore);
-        applySocketAuth(socket.data, session.user);
-        socket.emit("auth:session", session);
+        applyAndEmitAuthSession(socket, session);
         socket.emit("auth:info", { message: `${starterPokemon.name} joined your team.` });
       } catch (error) {
         console.error("Auth choose starter event failed:", error);
@@ -686,7 +692,7 @@ function createConnectionHandler(
       const sectionKey = data.sectionKey;
       const canReadSharedSection =
         socket.data.authenticated &&
-        (sectionKey === "pokemons" || sectionKey === "npcs");
+        (sectionKey === "pokemons" || sectionKey === "npcs" || sectionKey === "players");
 
       if (!canReadSharedSection && !requireDesignerSectionAccess(socket)) {
         return;
@@ -1039,7 +1045,11 @@ function createConnectionHandler(
           auth,
           designerSectionStore
         );
-        if (session.authenticated && session.user && session.user.pokemonParty.length === 0) {
+        if (
+          session.authenticated &&
+          session.user &&
+          (session.user.pokemonParty.length === 0 || !session.user.characterSkinId)
+        ) {
           applySocketAuth(socket.data, session.user);
           socket.emit("auth:session", session);
           return;
@@ -1072,7 +1082,8 @@ function createConnectionHandler(
               username: session.user.username,
               name: session.user.name,
               profileImage: session.user.profileImage,
-              description: session.user.description
+              description: session.user.description,
+              characterSkinId: session.user.characterSkinId
             }
           : undefined
       );
