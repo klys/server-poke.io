@@ -77,6 +77,17 @@ export type BattlePublicMove = {
   type: string;
   power: number;
   accuracy: number;
+  category?: string;
+  target?: string;
+  functionCode?: string;
+  flags?: string[];
+  priority?: number;
+  description?: string;
+  effectText?: string;
+  skillGfxId?: string;
+  skillGfxName?: string;
+  animationId?: string;
+  animationName?: string;
   currentPp: number;
   maxPp: number;
 };
@@ -229,6 +240,16 @@ type SkillDefinition = {
   powerPoint: number;
   accuracy: number;
   category: string;
+  target: string;
+  functionCode: string;
+  flags: string[];
+  priority: number;
+  description: string;
+  effectText: string;
+  skillGfxId: string;
+  skillGfxName: string;
+  animationId: string;
+  animationName: string;
 };
 
 type ItemDefinition = {
@@ -2088,6 +2109,17 @@ export default class BattleManager {
       power?: unknown;
       powerPoint?: unknown;
       accuracy?: unknown;
+      category?: unknown;
+      target?: unknown;
+      functionCode?: unknown;
+      flags?: unknown;
+      priority?: unknown;
+      description?: unknown;
+      effectText?: unknown;
+      skillGfxId?: unknown;
+      skillGfxName?: unknown;
+      animationId?: unknown;
+      animationName?: unknown;
     } | undefined;
 
     if (!profile) {
@@ -2105,7 +2137,28 @@ export default class BattleManager {
       power: Math.max(0, parseNumber(profile.power, 0)),
       powerPoint: Math.max(1, parseNumber(profile.powerPoint, 1)),
       accuracy: clamp(parseNumber(profile.accuracy, 100), 1, 100),
-      category: item.category
+      category: normalizeText(
+        typeof profile.category === "string" && profile.category.trim().length > 0
+          ? profile.category
+          : item.category
+      ),
+      target: normalizeText(typeof profile.target === "string" ? profile.target : ""),
+      functionCode: normalizeText(
+        typeof profile.functionCode === "string" ? profile.functionCode : ""
+      ),
+      flags: Array.isArray(profile.flags)
+        ? profile.flags
+            .filter((flag): flag is string => typeof flag === "string")
+            .map((flag) => normalizeText(flag))
+            .filter(Boolean)
+        : [],
+      priority: Math.round(parseNumber(profile.priority, 0)),
+      description: typeof profile.description === "string" ? profile.description : "",
+      effectText: typeof profile.effectText === "string" ? profile.effectText : "",
+      skillGfxId: typeof profile.skillGfxId === "string" ? profile.skillGfxId : "",
+      skillGfxName: typeof profile.skillGfxName === "string" ? profile.skillGfxName : "",
+      animationId: typeof profile.animationId === "string" ? profile.animationId : "",
+      animationName: typeof profile.animationName === "string" ? profile.animationName : ""
     };
   }
 
@@ -2343,14 +2396,27 @@ export default class BattleManager {
       type: skill.type,
       power: skill.power,
       accuracy: skill.accuracy,
+      category: skill.category,
+      target: skill.target,
+      functionCode: skill.functionCode,
+      flags: skill.flags,
+      priority: skill.priority,
+      description: skill.description,
+      effectText: skill.effectText,
+      skillGfxId: skill.skillGfxId,
+      skillGfxName: skill.skillGfxName,
+      animationId: skill.animationId,
+      animationName: skill.animationName,
       maxPp: skill.powerPoint,
       currentPp:
         typeof currentPp === "number" && Number.isFinite(currentPp)
           ? clamp(Math.round(currentPp), 0, skill.powerPoint)
           : skill.powerPoint,
-      damageClass: skill.power <= 0 || skill.category.toLowerCase() === "support"
+      damageClass: skill.power <= 0 || skill.category.toLowerCase() === "status"
         ? "status"
-        : "physical"
+        : skill.category.toLowerCase() === "special"
+          ? "special"
+          : "physical"
     };
   }
 

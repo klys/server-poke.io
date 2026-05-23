@@ -20,6 +20,39 @@ type DesignerPlayableMapConfig = {
   backgroundColor: string;
   backgroundImageSrc: string;
   backgroundImageMode: DesignerPlayableMapBackgroundImageMode;
+  essentialsMapId?: string;
+  essentialsMapName?: string;
+  rxdataPath?: string;
+  mapInfoId?: number;
+  tilesetId?: number;
+  tilesetName?: string;
+  tilesetAssetId?: string;
+  battleBack?: string;
+  environment?: string;
+  flags?: string[];
+  outdoor?: boolean;
+  showArea?: boolean;
+  mapPosition?: {
+    regionId?: number;
+    x: number;
+    y: number;
+  };
+  healingSpot?: {
+    mapId: string;
+    x: number;
+    y: number;
+    direction?: number;
+  };
+  bgm?: string;
+  bgs?: string;
+  source?: {
+    project: "Pokemon Essentials v21.1";
+    sourcePath: string;
+    sectionId?: string;
+    lineNumber?: number;
+    originalId?: string;
+    originalName?: string;
+  };
 };
 
 type PlayableMapItem = {
@@ -54,6 +87,15 @@ type MapEditorPortalPlacement = {
   targetMapX: number;
   targetMapY: number;
   eventScript: string;
+  essentialsConnection?: {
+    sourceMapId: string;
+    sourceX: number;
+    sourceY: number;
+    targetMapId: string;
+    targetX: number;
+    targetY: number;
+    sourcePath?: string;
+  };
 };
 
 type MapEditorGrassPlacement = {
@@ -64,6 +106,14 @@ type MapEditorGrassPlacement = {
   minLevel: number;
   maxLevel: number;
   encounterRate: number;
+  encounterMethod?: string;
+  encounterRows?: Array<{
+    weight: number;
+    pokemonId: string;
+    minLevel: number;
+    maxLevel: number;
+  }>;
+  sourceEncounterId?: string;
 };
 
 type MapEditorNpcPlacement = {
@@ -77,6 +127,13 @@ type MapEditorNpcPlacement = {
   interactionDistanceSquares: number;
   x: number;
   y: number;
+  eventId?: number;
+  eventPageIndex?: number;
+  eventCommands?: Array<{
+    code: number;
+    parameters: unknown[];
+    indent?: number;
+  }>;
 };
 
 export type PlayableMapEditorData = {
@@ -85,6 +142,28 @@ export type PlayableMapEditorData = {
   portals: MapEditorPortalPlacement[];
   grass: MapEditorGrassPlacement[];
   npcs: MapEditorNpcPlacement[];
+  essentials?: {
+    mapId: string;
+    rxdataPath: string;
+    width: number;
+    height: number;
+    tilesetId: number;
+    layers?: number;
+    table?: {
+      xsize: number;
+      ysize: number;
+      zsize: number;
+      data?: number[];
+    };
+    events?: Array<{
+      id: number;
+      name: string;
+      x: number;
+      y: number;
+      pages: unknown[];
+    }>;
+    sourceExportPath?: string;
+  };
 };
 
 export type PlayableMapsStateSnapshot = {
@@ -168,6 +247,67 @@ function sanitizePlayableMapConfig(value: unknown): DesignerPlayableMapConfig | 
       candidate.backgroundImageMode === "repeat"
         ? candidate.backgroundImageMode
         : "repeat",
+    essentialsMapId:
+      typeof candidate.essentialsMapId === "string" ? candidate.essentialsMapId : undefined,
+    essentialsMapName:
+      typeof candidate.essentialsMapName === "string" ? candidate.essentialsMapName : undefined,
+    rxdataPath: typeof candidate.rxdataPath === "string" ? candidate.rxdataPath : undefined,
+    mapInfoId:
+      typeof candidate.mapInfoId === "number" && Number.isFinite(candidate.mapInfoId)
+        ? Math.round(candidate.mapInfoId)
+        : undefined,
+    tilesetId:
+      typeof candidate.tilesetId === "number" && Number.isFinite(candidate.tilesetId)
+        ? Math.round(candidate.tilesetId)
+        : undefined,
+    tilesetName: typeof candidate.tilesetName === "string" ? candidate.tilesetName : undefined,
+    tilesetAssetId:
+      typeof candidate.tilesetAssetId === "string" ? candidate.tilesetAssetId : undefined,
+    battleBack: typeof candidate.battleBack === "string" ? candidate.battleBack : undefined,
+    environment: typeof candidate.environment === "string" ? candidate.environment : undefined,
+    flags: Array.isArray(candidate.flags)
+      ? candidate.flags.filter((flag): flag is string => typeof flag === "string")
+      : undefined,
+    outdoor: typeof candidate.outdoor === "boolean" ? candidate.outdoor : undefined,
+    showArea: typeof candidate.showArea === "boolean" ? candidate.showArea : undefined,
+    mapPosition:
+      candidate.mapPosition && typeof candidate.mapPosition === "object" &&
+      typeof candidate.mapPosition.x === "number" &&
+      typeof candidate.mapPosition.y === "number"
+        ? {
+            regionId:
+              typeof candidate.mapPosition.regionId === "number" &&
+              Number.isFinite(candidate.mapPosition.regionId)
+                ? Math.round(candidate.mapPosition.regionId)
+                : undefined,
+            x: clampInteger(candidate.mapPosition.x),
+            y: clampInteger(candidate.mapPosition.y),
+          }
+        : undefined,
+    healingSpot:
+      candidate.healingSpot && typeof candidate.healingSpot === "object" &&
+      typeof candidate.healingSpot.mapId === "string" &&
+      typeof candidate.healingSpot.x === "number" &&
+      typeof candidate.healingSpot.y === "number"
+        ? {
+            mapId: candidate.healingSpot.mapId,
+            x: clampInteger(candidate.healingSpot.x),
+            y: clampInteger(candidate.healingSpot.y),
+            direction:
+              typeof candidate.healingSpot.direction === "number" &&
+              Number.isFinite(candidate.healingSpot.direction)
+                ? Math.round(candidate.healingSpot.direction)
+                : undefined,
+          }
+        : undefined,
+    bgm: typeof candidate.bgm === "string" ? candidate.bgm : undefined,
+    bgs: typeof candidate.bgs === "string" ? candidate.bgs : undefined,
+    source:
+      candidate.source && typeof candidate.source === "object" &&
+      candidate.source.project === "Pokemon Essentials v21.1" &&
+      typeof candidate.source.sourcePath === "string"
+        ? candidate.source
+        : undefined,
   };
 }
 
@@ -210,6 +350,7 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
       portals: [],
       grass: [],
       npcs: [],
+      essentials: undefined,
     };
   }
 
@@ -318,6 +459,15 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
             y: Math.max(0, clampInteger(item.y)),
           }))
       : [],
+    essentials:
+      candidate.essentials && typeof candidate.essentials === "object" &&
+      typeof candidate.essentials.mapId === "string" &&
+      typeof candidate.essentials.rxdataPath === "string" &&
+      typeof candidate.essentials.width === "number" &&
+      typeof candidate.essentials.height === "number" &&
+      typeof candidate.essentials.tilesetId === "number"
+        ? candidate.essentials
+        : undefined,
   };
 }
 

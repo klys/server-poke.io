@@ -28,28 +28,400 @@ export interface DesignerItemDetail {
   value: string;
 }
 
+export interface DesignerEssentialsSourceProfile {
+  project: "Pokemon Essentials v21.1";
+  sourcePath: string;
+  sectionId?: string;
+  lineNumber?: number;
+  originalId?: string;
+  originalName?: string;
+}
+
+export interface DesignerPokemonSkillAssignment {
+  skillId: string;
+  skillName: string;
+  level: number;
+  sourceMoveId?: string;
+}
+
+export interface DesignerPokemonEvYield {
+  stat: string;
+  value: number;
+}
+
+export interface DesignerPokemonEvolution {
+  targetId: string;
+  method: string;
+  parameter?: string | number | boolean | null;
+}
+
+export interface DesignerPokemonFormProfile {
+  formId: string;
+  formName?: string;
+  properties: Record<string, unknown>;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerPokemonMetricsProfile {
+  backSprite?: [number, number];
+  frontSprite?: [number, number];
+  frontSpriteAltitude?: number;
+  shadowX?: number;
+  shadowSize?: number;
+  raw?: Record<string, unknown>;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerPokemonProfile {
+  essentialsId?: string;
+  hp: number;
+  attack: number;
+  defense: number;
+  specialAttack: number;
+  specialDefense: number;
+  speed: number;
+  isInitialPokemon: boolean;
+  elements: string[];
+  skills: DesignerPokemonSkillAssignment[];
+  frontImageSrc: string;
+  backImageSrc: string;
+  iconImageSrc: string;
+  genderRatio?: string;
+  growthRate?: string;
+  baseExp?: number;
+  evs?: DesignerPokemonEvYield[];
+  catchRate?: number;
+  happiness?: number;
+  abilities?: string[];
+  hiddenAbilities?: string[];
+  tutorMoves?: string[];
+  eggMoves?: string[];
+  eggGroups?: string[];
+  hatchSteps?: number;
+  height?: number;
+  weight?: number;
+  color?: string;
+  shape?: string;
+  habitat?: string;
+  category?: string;
+  pokedex?: string;
+  generation?: number;
+  evolutions?: DesignerPokemonEvolution[];
+  forms?: DesignerPokemonFormProfile[];
+  metrics?: DesignerPokemonMetricsProfile;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerPokemonSkillProfile {
+  essentialsId?: string;
+  elements: string[];
+  power: number;
+  powerPoint: number;
+  accuracy: number;
+  category?: string;
+  target?: string;
+  functionCode?: string;
+  flags?: string[];
+  priority?: number;
+  description: string;
+  effectText?: string;
+  skillGfxId: string;
+  skillGfxName: string;
+  animationId?: string;
+  animationName?: string;
+  weatherEffect: string;
+  inflictStateId: string;
+  inflictStateName: string;
+  cooldown: number;
+  stateConditionId: string;
+  stateConditionName: string;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerSkillGfxProfile {
+  mediaSrc: string;
+  applyTo: string;
+  appear: number;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerItemStatModifiers {
+  hp: number;
+  attack: number;
+  defense: number;
+  specialAttack: number;
+  specialDefense: number;
+  speed: number;
+}
+
+export interface DesignerGameItemProfile {
+  essentialsId?: string;
+  iconSrc: string;
+  description: string;
+  namePlural?: string;
+  pocket?: string;
+  price?: number;
+  fieldUse?: string;
+  flags?: string[];
+  pokemonDbCategory: string;
+  effectText: string;
+  effectKind: string;
+  useCondition: string;
+  type: string;
+  statModifiers: DesignerItemStatModifiers;
+  skillId: string;
+  skillName: string;
+  pokeballBonusElements: string[];
+  pokeballBonusRatio: number;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerNpcTrainerPokemon {
+  pokemonId: string;
+  pokemonName: string;
+  level: number;
+  moves?: string[];
+  ability?: string;
+  itemId?: string;
+}
+
+export interface DesignerNpcStoreItem {
+  itemId: string;
+  itemName: string;
+  quantity: number;
+  price: number;
+}
+
+export interface DesignerNpcChestItem {
+  itemId: string;
+  itemName: string;
+  quantity: number;
+}
+
+export interface DesignerMapEventCommandProfile {
+  code: number;
+  parameters: unknown[];
+  indent?: number;
+}
+
+export interface DesignerNpcGraphicsProfile {
+  standingUpSrc: string;
+  standingDownSrc: string;
+  standingLeftSrc: string;
+  standingRightSrc: string;
+  walkingUpSrc: string;
+  walkingDownSrc: string;
+  walkingLeftSrc: string;
+  walkingRightSrc: string;
+  chestImageSrc: string;
+  trainerFrontImageSrc: string;
+}
+
+export interface DesignerNpcProfile {
+  essentialsId?: string;
+  aiType: string;
+  npcType: "healer" | "trainer" | "store" | "chest";
+  trainerTypeId?: string;
+  trainerTypeName?: string;
+  loseText?: string;
+  eventCommands?: DesignerMapEventCommandProfile[];
+  graphicsSource: string;
+  characterSkinId: string;
+  characterSkinName: string;
+  movementIntervalMinSeconds: number;
+  movementIntervalMaxSeconds: number;
+  movementStepMin: number;
+  movementStepMax: number;
+  scriptSource: string;
+  healPrice: number;
+  trainerPokemons: DesignerNpcTrainerPokemon[];
+  storeMoney: number;
+  storeItems: DesignerNpcStoreItem[];
+  chestSlotCapacity: number;
+  chestItems: DesignerNpcChestItem[];
+  graphics: DesignerNpcGraphicsProfile;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerCharacterSkinProfile {
+  standingUpSrc: string;
+  standingDownSrc: string;
+  standingLeftSrc: string;
+  standingRightSrc: string;
+  walkingUpSrc: string;
+  walkingDownSrc: string;
+  walkingLeftSrc: string;
+  walkingRightSrc: string;
+  frontImageSrc: string;
+  backImageSrc: string;
+}
+
+export interface DesignerAbilityProfile {
+  essentialsId: string;
+  name: string;
+  description: string;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerTypeProfile {
+  essentialsId: string;
+  name: string;
+  iconPosition?: number;
+  weaknesses: string[];
+  resistances?: string[];
+  immunities: string[];
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerTrainerPokemonProfile {
+  pokemonId: string;
+  level: number;
+  name?: string;
+  form?: number;
+  gender?: string;
+  ability?: string;
+  itemId?: string;
+  moves?: string[];
+  nature?: string;
+  ivs?: Record<string, number>;
+  evs?: Record<string, number>;
+}
+
+export interface DesignerTrainerProfile {
+  essentialsId: string;
+  trainerTypeId: string;
+  trainerTypeName?: string;
+  version?: number;
+  name: string;
+  party: DesignerTrainerPokemonProfile[];
+  items?: string[];
+  loseText?: string;
+  battleBgm?: string;
+  victoryMe?: string;
+  sourceEventIds?: string[];
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerTrainerTypeProfile {
+  essentialsId: string;
+  name: string;
+  baseMoney?: number;
+  battleBgm?: string;
+  victoryMe?: string;
+  gender?: string;
+  skillLevel?: number;
+  flags?: string[];
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerEncounterRowProfile {
+  weight: number;
+  pokemonId: string;
+  minLevel: number;
+  maxLevel: number;
+}
+
+export interface DesignerEncounterTableProfile {
+  method: string;
+  density?: number;
+  rows: DesignerEncounterRowProfile[];
+}
+
+export interface DesignerEncounterProfile {
+  mapId: string;
+  mapVersion?: number;
+  mapName?: string;
+  tables: DesignerEncounterTableProfile[];
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerBerryPlantProfile {
+  essentialsId: string;
+  hoursPerStage?: number;
+  dryRatePerHour?: number;
+  minimumYield?: number;
+  maximumYield?: number;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerRibbonProfile {
+  essentialsId: string;
+  name: string;
+  description: string;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerAssetFrameProfile {
+  index: number;
+  x?: number;
+  y?: number;
+  width: number;
+  height: number;
+  durationMs?: number;
+  outputPath?: string;
+}
+
+export interface DesignerAssetProfile {
+  assetId: string;
+  sourcePath: string;
+  kind: "image" | "gif" | "sprite-sheet" | "tileset" | "battleback" | "animation" | "ui" | "audio" | "font" | "other";
+  width?: number;
+  height?: number;
+  mimeType?: string;
+  frameCount?: number;
+  loop?: boolean;
+  frames?: DesignerAssetFrameProfile[];
+  relatedRecordIds?: string[];
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerBattleBackgroundProfile extends DesignerAssetProfile {
+  kind: "battleback";
+  environment?: string;
+  mapIds?: string[];
+}
+
+export interface DesignerAudioProfile {
+  assetId: string;
+  sourcePath: string;
+  kind: "BGM" | "ME" | "SE";
+  loop?: boolean;
+  volume?: number;
+  pitch?: number;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerFontProfile {
+  assetId: string;
+  sourcePath: string;
+  familyName?: string;
+  source?: DesignerEssentialsSourceProfile;
+}
+
 export interface DesignerSectionItem {
   id: string;
   name: string;
   category: string;
   details: DesignerItemDetail[];
-  itemProfile?: unknown;
+  itemProfile?: DesignerGameItemProfile;
   mapObjectAsset?: unknown;
-  skillGfxProfile?: unknown;
-  pokemonProfile?: unknown;
-  pokemonSkillProfile?: unknown;
+  skillGfxProfile?: DesignerSkillGfxProfile;
+  pokemonProfile?: DesignerPokemonProfile;
+  pokemonSkillProfile?: DesignerPokemonSkillProfile;
   levelingCurveProfile?: unknown;
-  npcProfile?: unknown;
-  characterSkinProfile?: unknown;
-  abilityProfile?: unknown;
-  typeProfile?: unknown;
-  trainerTypeProfile?: unknown;
-  encounterProfile?: unknown;
-  berryPlantProfile?: unknown;
-  ribbonProfile?: unknown;
-  assetProfile?: unknown;
-  audioProfile?: unknown;
-  fontProfile?: unknown;
+  npcProfile?: DesignerNpcProfile;
+  characterSkinProfile?: DesignerCharacterSkinProfile;
+  abilityProfile?: DesignerAbilityProfile;
+  typeProfile?: DesignerTypeProfile;
+  trainerProfile?: DesignerTrainerProfile;
+  trainerTypeProfile?: DesignerTrainerTypeProfile;
+  encounterProfile?: DesignerEncounterProfile;
+  berryPlantProfile?: DesignerBerryPlantProfile;
+  ribbonProfile?: DesignerRibbonProfile;
+  assetProfile?: DesignerAssetProfile;
+  battleBackgroundProfile?: DesignerBattleBackgroundProfile;
+  audioProfile?: DesignerAudioProfile;
+  fontProfile?: DesignerFontProfile;
 }
 
 export interface DesignerSectionState {
