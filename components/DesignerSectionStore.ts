@@ -10,7 +10,18 @@ export type DesignerSectionKey =
   | "players"
   | "regions"
   | "npcs"
-  | "levelingCurve";
+  | "levelingCurve"
+  | "abilities"
+  | "types"
+  | "trainers"
+  | "trainerTypes"
+  | "encounters"
+  | "berries"
+  | "ribbons"
+  | "assets"
+  | "battleBackgrounds"
+  | "audio"
+  | "fonts";
 
 export interface DesignerItemDetail {
   label: string;
@@ -29,6 +40,16 @@ export interface DesignerSectionItem {
   pokemonSkillProfile?: unknown;
   levelingCurveProfile?: unknown;
   npcProfile?: unknown;
+  characterSkinProfile?: unknown;
+  abilityProfile?: unknown;
+  typeProfile?: unknown;
+  trainerTypeProfile?: unknown;
+  encounterProfile?: unknown;
+  berryPlantProfile?: unknown;
+  ribbonProfile?: unknown;
+  assetProfile?: unknown;
+  audioProfile?: unknown;
+  fontProfile?: unknown;
 }
 
 export interface DesignerSectionState {
@@ -74,7 +95,18 @@ const VALID_SECTION_KEYS: DesignerSectionKey[] = [
   "players",
   "regions",
   "npcs",
-  "levelingCurve"
+  "levelingCurve",
+  "abilities",
+  "types",
+  "trainers",
+  "trainerTypes",
+  "encounters",
+  "berries",
+  "ribbons",
+  "assets",
+  "battleBackgrounds",
+  "audio",
+  "fonts"
 ];
 
 export function isDesignerSectionKey(value: unknown): value is DesignerSectionKey {
