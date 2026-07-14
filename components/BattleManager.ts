@@ -14,19 +14,60 @@ import {
   type LevelingCurveConfig,
   type PokemonStatBonuses
 } from "./LevelingCurve";
+import type {
+  BattlePublicEvent,
+  BattleSequencedEvent,
+  BattleStageKey,
+  BattleStatGain,
+  BattleStatKey,
+  BattleStatusId
+} from "./battle/events";
+import { resolveFunctionCode } from "./battle/functionCodeMap";
+import { resolveHeldItemEffect, type HeldItemEffect } from "./battle/heldItems";
+import {
+  parseMoveEffect,
+  rollMultiHitCount,
+  STAGE_DISPLAY_NAMES,
+  type MoveEffectSpec
+} from "./battle/moveEffects";
+import {
+  applyStatusEndOfTurn,
+  checkStatusBeforeMove,
+  createStatusState,
+  getStatusCatchBonus,
+  getStatusStatMultiplier,
+  isImmuneToStatus,
+  sanitizeStatusState,
+  STATUS_DISPLAY_NAMES,
+  type StatusState
+} from "./battle/statuses";
+import {
+  computeFoeExperience,
+  expToNextLevel,
+  normalizeGrowthRate,
+  type GrowthRateId
+} from "./battle/growth";
+import {
+  buildTypeChart,
+  getTypeEffectiveness,
+  isSameType,
+  resolveTypeId,
+  type TypeChart
+} from "./battle/typeChart";
 import type Player from "./player";
 import type World from "./world";
+import { resolveInitialSpawnFromPlayableMapsState } from "./PlayableMapsState";
 import type ClientToServerEvents from "../Server/ClientToServerEvents";
 import type InterServerEvents from "../Server/InterServerEvents";
 import type { SocketData } from "../Server/registerSocketHandlers";
 import type ServerToClientEvents from "../Server/ServerToClientEvents";
 
 const PLAYER_ACTION_TIMEOUT_MS = 60_000;
-const BATTLE_ACTION_STEP_DELAY_MS = 5_000;
+const BATTLE_ACTION_STEP_DELAY_MS = 2_500;
 const PVP_SURRENDER_REWARD = 300;
-const DEFAULT_IV = 0;
-const DEFAULT_EV = 0;
 const NEUTRAL_NATURE = 1;
+const MAX_PARTY_SIZE = 6;
+const MAX_EV_PER_STAT = 255;
 
 type TypedSocketServer = Server<
   ClientToServerEvents,
@@ -100,6 +141,12 @@ export type BattlePublicPokemon = {
   types: string[];
   hp: number;
   maxHp: number;
+  experience: number;
+  nextLevelExperience: number;
+  status: BattleStatusId | null;
+  confused: boolean;
+  statStages: Record<BattleStageKey, number>;
+  heldItemName: string | null;
   frontImageSrc: string;
   backImageSrc: string;
   moves: BattlePublicMove[];
@@ -160,10 +207,17 @@ type BattleStats = {
   speed: number;
 };
 
-type BattleStatStages = Omit<BattleStats, "hp">;
+type BattleStatStages = Record<BattleStageKey, number>;
 
 type BattleMove = BattlePublicMove & {
   damageClass: BattleDamageClass;
+  effectChance: number;
+};
+
+type BattleVolatileState = {
+  confusionTurns: number;
+  flinched: boolean;
+  protected: boolean;
 };
 
 type BattlePokemon = {
@@ -175,10 +229,24 @@ type BattlePokemon = {
   types: string[];
   hp: number;
   maxHp: number;
+  experience: number;
+  nextLevelExperience: number;
+  growthRate: GrowthRateId | null;
+  baseExp: number;
+  catchRate: number;
+  evYield: Partial<Record<BattleStatKey, number>>;
   baseStats: BattleStats;
   stats: BattleStats;
   statBonuses: PokemonStatBonuses;
+  ivs: BattleStats;
+  evs: BattleStats;
   stages: BattleStatStages;
+  status: StatusState | null;
+  volatile: BattleVolatileState;
+  heldItemId: string | null;
+  heldItemName: string | null;
+  learnset: Array<{ skillId: string; skillName: string; level: number }>;
+  evolutions: PokemonEvolutionDefinition[];
   moves: BattleMove[];
   frontImageSrc: string;
   backImageSrc: string;
@@ -216,17 +284,36 @@ type BattleSession = {
   turnEndsAt: number | null;
   timer: NodeJS.Timeout | null;
   log: string[];
+  events: BattleSequencedEvent[];
+  eventSeq: number;
+  lastFlushedSeq: number;
+  /** foe pokemon id -> ids of opposing pokemon that fought it (for exp split) */
+  participation: Map<string, Set<string>>;
+  /** pokemon ids that gained at least one level during this battle */
+  leveledPokemonIds: Set<string>;
   result: string | null;
   startedAt: string;
   endedAt: string | null;
   summary: BattlePublicSummary | null;
 };
 
+type PokemonEvolutionDefinition = {
+  targetId: string;
+  method: string;
+  parameter: string | number | null;
+};
+
 type PokemonDefinition = {
   id: string;
   name: string;
+  essentialsId: string;
   types: string[];
   baseStats: BattleStats;
+  growthRate: GrowthRateId | null;
+  baseExp: number;
+  catchRate: number;
+  evYield: Partial<Record<BattleStatKey, number>>;
+  evolutions: PokemonEvolutionDefinition[];
   skills: Array<{ skillId: string; skillName: string; level: number }>;
   frontImageSrc: string;
   backImageSrc: string;
@@ -244,6 +331,7 @@ type SkillDefinition = {
   functionCode: string;
   flags: string[];
   priority: number;
+  effectChance: number;
   description: string;
   effectText: string;
   skillGfxId: string;
@@ -255,12 +343,20 @@ type SkillDefinition = {
 type ItemDefinition = {
   id: string;
   name: string;
+  essentialsId: string;
   type: string;
   category: InventoryItem["category"];
   description: string;
   iconSrc: string;
   skillId: string;
   skillName: string;
+  effectKind: string;
+  useCondition: string;
+  isPokeball: boolean;
+  pokeballBonusRatio: number;
+  curesStatuses: BattleStatusId[] | "any" | null;
+  curesConfusion: boolean;
+  heldEffect: HeldItemEffect | null;
   statModifiers: {
     hp: number;
     attack: number;
@@ -278,12 +374,24 @@ type NpcStoreDefinition = {
   price: number;
 };
 
+type NpcTrainerPokemonDefinition = {
+  pokemonId: string;
+  pokemonName: string;
+  level: number;
+  moves: string[];
+  itemId: string;
+};
+
 type NpcDefinition = {
   id: string;
   name: string;
   npcType: "healer" | "trainer" | "store" | "chest";
   healPrice: number;
   storeItems: NpcStoreDefinition[];
+  trainerTypeId: string;
+  trainerTypeName: string;
+  loseText: string;
+  trainerPokemons: NpcTrainerPokemonDefinition[];
 };
 
 type ResolvedNpcInteraction = {
@@ -310,27 +418,6 @@ type TradeRequest = {
   requesterPlayerId: string;
   targetPlayerId: string;
   timeout: NodeJS.Timeout;
-};
-
-const TYPE_EFFECTIVENESS: Record<string, Record<string, number>> = {
-  Normal: { Rock: 0.5, Ghost: 0, Steel: 0.5 },
-  Fire: { Fire: 0.5, Water: 0.5, Grass: 2, Ice: 2, Bug: 2, Rock: 0.5, Dragon: 0.5, Steel: 2 },
-  Water: { Fire: 2, Water: 0.5, Grass: 0.5, Ground: 2, Rock: 2, Dragon: 0.5 },
-  Electric: { Water: 2, Electric: 0.5, Grass: 0.5, Ground: 0, Flying: 2, Dragon: 0.5 },
-  Grass: { Fire: 0.5, Water: 2, Grass: 0.5, Poison: 0.5, Ground: 2, Flying: 0.5, Bug: 0.5, Rock: 2, Dragon: 0.5, Steel: 0.5 },
-  Ice: { Fire: 0.5, Water: 0.5, Grass: 2, Ice: 0.5, Ground: 2, Flying: 2, Dragon: 2, Steel: 0.5 },
-  Fighting: { Normal: 2, Ice: 2, Poison: 0.5, Flying: 0.5, Psychic: 0.5, Bug: 0.5, Rock: 2, Ghost: 0, Dark: 2, Steel: 2, Fairy: 0.5 },
-  Poison: { Grass: 2, Poison: 0.5, Ground: 0.5, Rock: 0.5, Ghost: 0.5, Steel: 0, Fairy: 2 },
-  Ground: { Fire: 2, Electric: 2, Grass: 0.5, Poison: 2, Flying: 0, Bug: 0.5, Rock: 2, Steel: 2 },
-  Flying: { Electric: 0.5, Grass: 2, Fighting: 2, Bug: 2, Rock: 0.5, Steel: 0.5 },
-  Psychic: { Fighting: 2, Poison: 2, Psychic: 0.5, Dark: 0, Steel: 0.5 },
-  Bug: { Fire: 0.5, Grass: 2, Fighting: 0.5, Poison: 0.5, Flying: 0.5, Psychic: 2, Ghost: 0.5, Dark: 2, Steel: 0.5, Fairy: 0.5 },
-  Rock: { Fire: 2, Ice: 2, Fighting: 0.5, Ground: 0.5, Flying: 2, Bug: 2, Steel: 0.5 },
-  Ghost: { Normal: 0, Psychic: 2, Ghost: 2, Dark: 0.5 },
-  Dragon: { Dragon: 2, Steel: 0.5, Fairy: 0 },
-  Dark: { Fighting: 0.5, Psychic: 2, Ghost: 2, Dark: 0.5, Fairy: 0.5 },
-  Steel: { Fire: 0.5, Water: 0.5, Electric: 0.5, Ice: 2, Rock: 2, Steel: 0.5, Fairy: 2 },
-  Fairy: { Fire: 0.5, Fighting: 2, Poison: 0.5, Dragon: 2, Dark: 2, Steel: 0.5 }
 };
 
 function clamp(value: number, min: number, max: number) {
@@ -383,35 +470,69 @@ function getStageMultiplier(stage: number) {
     : 2 / (2 + Math.abs(normalizedStage));
 }
 
-function calculateHpStat(base: number, level: number) {
+/** Accuracy/evasion use the classic 3/3-based stage table. */
+function getAccuracyStageMultiplier(stage: number) {
+  const normalizedStage = clamp(Math.round(stage), -6, 6);
+  return normalizedStage >= 0
+    ? (3 + normalizedStage) / 3
+    : 3 / (3 + Math.abs(normalizedStage));
+}
+
+function calculateHpStat(base: number, level: number, iv: number, ev: number) {
   return Math.max(
     1,
-    Math.floor(((2 * base + DEFAULT_IV + Math.floor(DEFAULT_EV / 4)) * level) / 100) + level + 10
+    Math.floor(((2 * base + iv + Math.floor(ev / 4)) * level) / 100) + level + 10
   );
 }
 
-function calculateOtherStat(base: number, level: number) {
+function calculateOtherStat(base: number, level: number, iv: number, ev: number) {
   return Math.max(
     1,
     Math.floor(
-      (Math.floor(((2 * base + DEFAULT_IV + Math.floor(DEFAULT_EV / 4)) * level) / 100) + 5) *
+      (Math.floor(((2 * base + iv + Math.floor(ev / 4)) * level) / 100) + 5) *
       NEUTRAL_NATURE
     )
   );
 }
 
+function createEmptyBattleStats(): BattleStats {
+  return { hp: 0, attack: 0, defense: 0, specialAttack: 0, specialDefense: 0, speed: 0 };
+}
+
+function sanitizeBattleStats(value: unknown, max: number): BattleStats {
+  const stats = createEmptyBattleStats();
+  if (!value || typeof value !== "object") {
+    return stats;
+  }
+
+  const candidate = value as Partial<Record<keyof BattleStats, unknown>>;
+  (Object.keys(stats) as Array<keyof BattleStats>).forEach((key) => {
+    const raw = candidate[key];
+    stats[key] =
+      typeof raw === "number" && Number.isFinite(raw) ? clamp(Math.round(raw), 0, max) : 0;
+  });
+
+  return stats;
+}
+
 function calculateStats(
   baseStats: BattleStats,
   level: number,
-  bonuses: PokemonStatBonuses = createEmptyPokemonStatBonuses()
+  bonuses: PokemonStatBonuses = createEmptyPokemonStatBonuses(),
+  ivs: BattleStats = createEmptyBattleStats(),
+  evs: BattleStats = createEmptyBattleStats()
 ): BattleStats {
   return {
-    hp: calculateHpStat(baseStats.hp, level) + bonuses.hp,
-    attack: calculateOtherStat(baseStats.attack, level) + bonuses.attack,
-    defense: calculateOtherStat(baseStats.defense, level) + bonuses.defense,
-    specialAttack: calculateOtherStat(baseStats.specialAttack, level) + bonuses.specialAttack,
-    specialDefense: calculateOtherStat(baseStats.specialDefense, level) + bonuses.specialDefense,
-    speed: calculateOtherStat(baseStats.speed, level) + bonuses.speed
+    hp: calculateHpStat(baseStats.hp, level, ivs.hp, evs.hp) + bonuses.hp,
+    attack: calculateOtherStat(baseStats.attack, level, ivs.attack, evs.attack) + bonuses.attack,
+    defense: calculateOtherStat(baseStats.defense, level, ivs.defense, evs.defense) + bonuses.defense,
+    specialAttack:
+      calculateOtherStat(baseStats.specialAttack, level, ivs.specialAttack, evs.specialAttack) +
+      bonuses.specialAttack,
+    specialDefense:
+      calculateOtherStat(baseStats.specialDefense, level, ivs.specialDefense, evs.specialDefense) +
+      bonuses.specialDefense,
+    speed: calculateOtherStat(baseStats.speed, level, ivs.speed, evs.speed) + bonuses.speed
   };
 }
 
@@ -421,7 +542,25 @@ function createEmptyStages(): BattleStatStages {
     defense: 0,
     specialAttack: 0,
     specialDefense: 0,
-    speed: 0
+    speed: 0,
+    accuracy: 0,
+    evasion: 0
+  };
+}
+
+function createEmptyVolatile(): BattleVolatileState {
+  return { confusionTurns: 0, flinched: false, protected: false };
+}
+
+function rollIvs(): BattleStats {
+  const roll = () => Math.floor(Math.random() * 32);
+  return {
+    hp: roll(),
+    attack: roll(),
+    defense: roll(),
+    specialAttack: roll(),
+    specialDefense: roll(),
+    speed: roll()
   };
 }
 
@@ -437,17 +576,6 @@ function chooseRandom<T>(items: T[]) {
   return items[Math.floor(Math.random() * items.length)];
 }
 
-function getRandomStatIncrease() {
-  return Math.floor(Math.random() * 6);
-}
-
-function getMoveEffectiveness(moveType: string, targetTypes: string[]) {
-  return targetTypes.reduce((multiplier, targetType) => {
-    const normalizedTargetType = normalizeType(targetType);
-    return multiplier * (TYPE_EFFECTIVENESS[normalizeType(moveType)]?.[normalizedTargetType] ?? 1);
-  }, 1);
-}
-
 function getUsableMoves(pokemon: BattlePokemon) {
   return pokemon.moves.filter((move) => move.currentPp > 0);
 }
@@ -461,6 +589,12 @@ function getPublicPokemon(pokemon: BattlePokemon): BattlePublicPokemon {
     types: pokemon.types,
     hp: pokemon.hp,
     maxHp: pokemon.maxHp,
+    experience: pokemon.experience,
+    nextLevelExperience: pokemon.nextLevelExperience,
+    status: pokemon.status?.id ?? null,
+    confused: pokemon.volatile.confusionTurns > 0,
+    statStages: { ...pokemon.stages },
+    heldItemName: pokemon.heldItemName,
     frontImageSrc: pokemon.frontImageSrc,
     backImageSrc: pokemon.backImageSrc,
     moves: pokemon.moves.map((move) => ({
@@ -469,6 +603,13 @@ function getPublicPokemon(pokemon: BattlePokemon): BattlePublicPokemon {
       type: move.type,
       power: move.power,
       accuracy: move.accuracy,
+      category: move.category,
+      description: move.description,
+      priority: move.priority,
+      skillGfxId: move.skillGfxId,
+      skillGfxName: move.skillGfxName,
+      animationId: move.animationId,
+      animationName: move.animationName,
       currentPp: move.currentPp,
       maxPp: move.maxPp
     }))
@@ -485,6 +626,62 @@ function parseNumber(value: unknown, fallback: number) {
     : fallback;
 }
 
+const STATUS_CURE_ITEMS: Record<string, { statuses: BattleStatusId[] | "any"; confusion: boolean }> = {
+  ANTIDOTE: { statuses: ["poison", "toxic"], confusion: false },
+  PARLYZHEAL: { statuses: ["paralysis"], confusion: false },
+  PARALYZEHEAL: { statuses: ["paralysis"], confusion: false },
+  AWAKENING: { statuses: ["sleep"], confusion: false },
+  BURNHEAL: { statuses: ["burn"], confusion: false },
+  ICEHEAL: { statuses: ["freeze"], confusion: false },
+  FULLHEAL: { statuses: "any", confusion: true },
+  FULLRESTORE: { statuses: "any", confusion: true },
+  LAVACOOKIE: { statuses: "any", confusion: true },
+  OLDGATEAU: { statuses: "any", confusion: true },
+  HEALPOWDER: { statuses: "any", confusion: true },
+  LUMBERRY: { statuses: "any", confusion: true },
+  CHERIBERRY: { statuses: ["paralysis"], confusion: false },
+  CHESTOBERRY: { statuses: ["sleep"], confusion: false },
+  PECHABERRY: { statuses: ["poison", "toxic"], confusion: false },
+  RAWSTBERRY: { statuses: ["burn"], confusion: false },
+  ASPEARBERRY: { statuses: ["freeze"], confusion: false },
+  PERSIMBERRY: { statuses: [], confusion: true },
+  MIRACLEBERRY: { statuses: "any", confusion: true },
+  BITTERBERRY: { statuses: [], confusion: true },
+  PRZCUREBERRY: { statuses: ["paralysis"], confusion: false },
+  MINTBERRY: { statuses: ["sleep"], confusion: false },
+  PSNCUREBERRY: { statuses: ["poison", "toxic"], confusion: false },
+  ICEBERRY: { statuses: ["burn"], confusion: false },
+  BURNTBERRY: { statuses: ["freeze"], confusion: false }
+};
+
+function normalizeStatKey(raw: string): BattleStatKey | null {
+  const normalized = raw.trim().toLowerCase().replace(/[\s_-]/g, "");
+  switch (normalized) {
+    case "hp":
+      return "hp";
+    case "attack":
+    case "atk":
+      return "attack";
+    case "defense":
+    case "def":
+      return "defense";
+    case "specialattack":
+    case "spatk":
+    case "spattack":
+    case "specialatk":
+      return "specialAttack";
+    case "specialdefense":
+    case "spdef":
+    case "spdefense":
+      return "specialDefense";
+    case "speed":
+    case "spd":
+      return "speed";
+    default:
+      return null;
+  }
+}
+
 export default class BattleManager {
   private readonly io: TypedSocketServer;
   private readonly world: World;
@@ -496,6 +693,7 @@ export default class BattleManager {
   private readonly pendingStepChecks = new Set<string>();
   private readonly challenges = new Map<string, ChallengeRequest>();
   private readonly tradeRequests = new Map<string, TradeRequest>();
+  private typeChart: TypeChart = buildTypeChart([]);
 
   constructor(
     io: TypedSocketServer,
@@ -674,6 +872,183 @@ export default class BattleManager {
       ok: true,
       user: nextUser,
       message: `${getPokemonDisplayName(targetPokemon)} learned ${itemDefinition.skillName}.`
+    };
+  }
+
+  public async resolveMoveLearn(
+    userId: number,
+    pokemonId: string,
+    moveName: string,
+    replaceMoveName?: string
+  ) {
+    const user = await this.auth.getUserForBattle(userId);
+    const catalogs = await this.loadCatalogs();
+    const targetPokemon = user?.pokemonParty.find((pokemon) => pokemon.id === pokemonId);
+
+    if (!user || !targetPokemon) {
+      return { ok: false, message: "That Pokemon is not in your party." };
+    }
+
+    const pending = targetPokemon.pendingMoveLearns ?? [];
+    if (!pending.includes(moveName)) {
+      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} has no pending move to learn.` };
+    }
+
+    targetPokemon.pendingMoveLearns = pending.filter((name) => name !== moveName);
+
+    if (!replaceMoveName) {
+      await this.auth.saveBattleState(userId, { pokemonParty: user.pokemonParty });
+      return {
+        ok: true,
+        user: await this.auth.getUserForBattle(userId),
+        message: `${getPokemonDisplayName(targetPokemon)} did not learn ${moveName}.`
+      };
+    }
+
+    const replaceIndex = targetPokemon.moves.indexOf(replaceMoveName);
+    if (replaceIndex < 0) {
+      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} does not know ${replaceMoveName}.` };
+    }
+
+    const skillDefinition = catalogs.skillsByName.get(moveName.toLowerCase());
+    if (!skillDefinition) {
+      return { ok: false, message: `${moveName} is not a valid move.` };
+    }
+
+    targetPokemon.moves = targetPokemon.moves.map((name, index) =>
+      index === replaceIndex ? moveName : name
+    );
+    const movePp = { ...(targetPokemon.movePp ?? {}) };
+    delete movePp[replaceMoveName];
+    movePp[moveName] = skillDefinition.powerPoint;
+    targetPokemon.movePp = movePp;
+
+    this.updateActiveBattleMoves(userId, targetPokemon, catalogs);
+    const nextUser = await this.auth.saveBattleState(userId, { pokemonParty: user.pokemonParty });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: `${getPokemonDisplayName(targetPokemon)} forgot ${replaceMoveName} and learned ${moveName}!`
+    };
+  }
+
+  private updateActiveBattleMoves(
+    userId: number,
+    summary: PokemonSummary,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ) {
+    for (const battle of this.battles.values()) {
+      if (battle.status !== "active") {
+        continue;
+      }
+
+      const side = battle.sides.find((candidate) => candidate.userId === userId);
+      const battlePokemon = side?.party.find((pokemon) => pokemon.id === summary.id);
+      if (!side || !battlePokemon) {
+        continue;
+      }
+
+      battlePokemon.moves = summary.moves
+        .map((moveName) => {
+          const existing = battlePokemon.moves.find((move) => move.name === moveName);
+          if (existing) {
+            return existing;
+          }
+          const skillDefinition = catalogs.skillsByName.get(moveName.toLowerCase());
+          return skillDefinition
+            ? this.buildBattleMove(skillDefinition, summary.movePp?.[moveName])
+            : null;
+        })
+        .filter((move): move is BattleMove => Boolean(move))
+        .slice(0, 4);
+      this.emitBattleState(battle);
+    }
+  }
+
+  public async setHeldItem(userId: number, pokemonId: string, itemId: string) {
+    const player = this.world.getPlayerByUserId(userId);
+    if (player && this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "You can't change held items during a battle." };
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    await this.loadCatalogs();
+    const item = user?.inventory.find((candidate) => candidate.id === itemId);
+    const itemDefinition = this.getCachedItemDefinition(itemId, item?.name ?? "");
+    const targetPokemon = user?.pokemonParty.find((pokemon) => pokemon.id === pokemonId);
+
+    if (!user || !item || !itemDefinition || item.quantity <= 0) {
+      return { ok: false, message: "That item is no longer available." };
+    }
+
+    if (!targetPokemon) {
+      return { ok: false, message: "Choose a Pokemon to hold the item." };
+    }
+
+    let inventory = this.removeInventoryQuantity(user.inventory, item.id, 1);
+    if (targetPokemon.heldItemId) {
+      const previousDefinition = this.getCachedItemDefinition(
+        targetPokemon.heldItemId,
+        targetPokemon.heldItemName ?? ""
+      );
+      if (previousDefinition) {
+        inventory = this.addInventoryQuantity(inventory, previousDefinition, 1);
+      }
+    }
+
+    targetPokemon.heldItemId = itemDefinition.id;
+    targetPokemon.heldItemName = itemDefinition.name;
+    const nextUser = await this.auth.saveBattleState(userId, {
+      pokemonParty: user.pokemonParty,
+      inventory
+    });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: `${getPokemonDisplayName(targetPokemon)} is now holding ${itemDefinition.name}.`
+    };
+  }
+
+  public async takeHeldItem(userId: number, pokemonId: string) {
+    const player = this.world.getPlayerByUserId(userId);
+    if (player && this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "You can't change held items during a battle." };
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    await this.loadCatalogs();
+    const targetPokemon = user?.pokemonParty.find((pokemon) => pokemon.id === pokemonId);
+
+    if (!user || !targetPokemon) {
+      return { ok: false, message: "That Pokemon is not in your party." };
+    }
+
+    if (!targetPokemon.heldItemId) {
+      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} is not holding anything.` };
+    }
+
+    const itemDefinition = this.getCachedItemDefinition(
+      targetPokemon.heldItemId,
+      targetPokemon.heldItemName ?? ""
+    );
+    const itemName = targetPokemon.heldItemName ?? itemDefinition?.name ?? "its item";
+    const inventory = itemDefinition
+      ? this.addInventoryQuantity(user.inventory, itemDefinition, 1)
+      : user.inventory;
+
+    targetPokemon.heldItemId = undefined;
+    targetPokemon.heldItemName = undefined;
+    const nextUser = await this.auth.saveBattleState(userId, {
+      pokemonParty: user.pokemonParty,
+      inventory
+    });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: `You took ${itemName} from ${getPokemonDisplayName(targetPokemon)}.`
     };
   }
 
@@ -1103,8 +1478,9 @@ export default class BattleManager {
     side.action = action;
     this.emitBattleState(battle);
 
-    if (battle.kind === "wild") {
-      this.getOpponentSide(battle, side).action = this.chooseAiAction(this.getOpponentSide(battle, side), side);
+    const aiSide = battle.sides.find((candidate) => candidate.isAi);
+    if (aiSide) {
+      aiSide.action = this.chooseAiAction(aiSide, side);
       void this.resolveTurn(battle);
       return;
     }
@@ -1128,14 +1504,43 @@ export default class BattleManager {
     const cellX = Math.floor((player.x + player.width / 2) / cellSize);
     const cellY = Math.floor((player.y + player.height / 2) / cellSize);
 
-    return editorData.grass.find((grass) => grass.x === cellX && grass.y === cellY) ?? null;
+    const cell = editorData.grass.find((grass) => grass.x === cellX && grass.y === cellY) ?? null;
+    if (!cell) {
+      return null;
+    }
+
+    // Imported maps store the (identical) weighted encounter table once, on
+    // a single carrier cell, instead of copying it onto every cell — the
+    // duplication was ~16MB of the maps payload. Fall back to that table.
+    type GrassWithRows = typeof cell & {
+      encounterRows?: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }>;
+    };
+    const cellWithRows = cell as GrassWithRows;
+    if (!cellWithRows.encounterRows?.length) {
+      const carrier = (editorData.grass as GrassWithRows[]).find(
+        (candidate) => candidate.encounterRows?.length
+      );
+      if (carrier) {
+        return {
+          ...cell,
+          encounterRows: carrier.encounterRows,
+          pokemonIds: cell.pokemonIds.length > 0 ? cell.pokemonIds : carrier.pokemonIds
+        };
+      }
+    }
+    return cell;
   }
 
   private async startWildBattle(
     player: Player,
-    grass: { pokemonIds: string[]; minLevel: number; maxLevel: number }
+    grass: {
+      pokemonIds: string[];
+      minLevel: number;
+      maxLevel: number;
+      encounterRows?: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }>;
+    }
   ) {
-    if (player.userId === null || grass.pokemonIds.length === 0) {
+    if (player.userId === null || (grass.pokemonIds.length === 0 && !(grass.encounterRows?.length))) {
       return;
     }
 
@@ -1146,7 +1551,32 @@ export default class BattleManager {
 
     const catalogs = await this.loadCatalogs();
     const playerSide = this.buildPlayerSide("a", player, user, catalogs);
-    const sourcePokemonId = chooseRandom(grass.pokemonIds);
+
+    // Weighted Essentials slot rows take precedence over the flat species list.
+    let sourcePokemonId: string;
+    let minLevel = grass.minLevel;
+    let maxLevel = grass.maxLevel;
+    const rows = (grass.encounterRows ?? []).filter(
+      (row) => row && typeof row.pokemonId === "string" && row.weight > 0
+    );
+    if (rows.length > 0) {
+      const totalWeight = rows.reduce((sum, row) => sum + row.weight, 0);
+      let roll = Math.random() * totalWeight;
+      let chosen = rows[rows.length - 1];
+      for (const row of rows) {
+        roll -= row.weight;
+        if (roll <= 0) {
+          chosen = row;
+          break;
+        }
+      }
+      sourcePokemonId = chosen.pokemonId;
+      minLevel = Math.max(1, Math.round(chosen.minLevel || grass.minLevel));
+      maxLevel = Math.max(minLevel, Math.round(chosen.maxLevel || chosen.minLevel || grass.maxLevel));
+    } else {
+      sourcePokemonId = chooseRandom(grass.pokemonIds);
+    }
+
     const pokemonDefinition = catalogs.pokemonById.get(sourcePokemonId);
 
     if (!pokemonDefinition || !this.hasAvailablePokemon(playerSide)) {
@@ -1154,7 +1584,7 @@ export default class BattleManager {
     }
 
     const level = clamp(
-      grass.minLevel + Math.floor(Math.random() * (Math.max(grass.minLevel, grass.maxLevel) - grass.minLevel + 1)),
+      minLevel + Math.floor(Math.random() * (Math.max(minLevel, maxLevel) - minLevel + 1)),
       1,
       100
     );
@@ -1176,6 +1606,243 @@ export default class BattleManager {
     ]);
 
     this.activateBattle(battle);
+  }
+
+  /** Starts a battle against a map-placed NPC trainer using its designer roster. */
+  public async startNpcTrainerBattle(userId: number, npcPlacementId?: string) {
+    const interaction = this.resolveNpcInteraction(userId, npcPlacementId);
+    if (!interaction.ok) {
+      return interaction;
+    }
+
+    const player = interaction.player;
+    if (this.isPlayerBattling(player.socketId)) {
+      return { ok: false as const, message: "You are already in a battle." };
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    const catalogs = await this.loadCatalogs();
+    const npc = this.cachedNpcDefinitions.get(interaction.placement.npcId);
+
+    if (!user || !npc || npc.npcType !== "trainer" || npc.trainerPokemons.length === 0) {
+      return { ok: false as const, message: "That trainer is not ready to battle." };
+    }
+
+    const playerSide = this.buildPlayerSide("a", player, user, catalogs);
+    if (!this.hasAvailablePokemon(playerSide)) {
+      return { ok: false as const, message: "Your team has no Pokemon able to battle." };
+    }
+
+    const party = npc.trainerPokemons
+      .map((entry) => this.buildNpcTrainerPokemon(entry, catalogs))
+      .filter((pokemon): pokemon is BattlePokemon => Boolean(pokemon));
+
+    if (party.length === 0) {
+      return { ok: false as const, message: "That trainer has no valid team." };
+    }
+
+    const trainerDisplayName =
+      npc.trainerTypeName &&
+      !npc.name.toLowerCase().includes(npc.trainerTypeName.toLowerCase())
+        ? `${npc.trainerTypeName} ${npc.name}`
+        : npc.name;
+    const npcSide: BattleSide = {
+      id: "b",
+      isAi: true,
+      trainerName: trainerDisplayName,
+      money: await this.computeNpcTrainerPrize(npc, party),
+      inventory: [],
+      party,
+      activeIndex: 0,
+      action: null,
+      escapeAttempts: 0
+    };
+
+    const battle = this.createBattle("trainer", playerSide, npcSide, [
+      `${trainerDisplayName} wants to battle!`,
+      `${trainerDisplayName} sent out ${getPokemonDisplayName(party[0])}.`
+    ]);
+
+    this.activateBattle(battle);
+    return { ok: true as const, message: `${trainerDisplayName} wants to battle!` };
+  }
+
+  /**
+   * Starts a trainer battle from an RPG Maker event script:
+   * `pbTrainerBattle(PBTrainers::TYPE, "Name", ...)`. The roster comes from
+   * the imported `trainers` designer section (PBS trainers.txt).
+   */
+  public async startScriptedTrainerBattle(
+    userId: number,
+    trainerTypeEssentialsId: string,
+    trainerName: string
+  ): Promise<
+    | { ok: true; battleId: string; playerSideId: string }
+    | { ok: false; message: string }
+  > {
+    const player = this.world.getPlayerByUserId(userId);
+    if (!player) {
+      return { ok: false, message: "Enter the world before battling." };
+    }
+    if (this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "You are already in a battle." };
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    const catalogs = await this.loadCatalogs();
+    if (!user) {
+      return { ok: false, message: "Account not found." };
+    }
+
+    const trainersPayload = await this.designerSectionStore.read("trainers");
+    const wanted = `${trainerTypeEssentialsId}/${trainerName}`.toLowerCase();
+    const record = (trainersPayload?.state.items ?? []).find((item) => {
+      const profile = item.trainerProfile as
+        | { trainerTypeEssentialsId?: string; name?: string }
+        | undefined;
+      return (
+        profile &&
+        `${profile.trainerTypeEssentialsId ?? ""}/${profile.name ?? ""}`.toLowerCase() === wanted
+      );
+    });
+    const profile = record?.trainerProfile as
+      | {
+          trainerTypeId?: string;
+          trainerTypeName?: string;
+          name?: string;
+          party?: Array<{
+            pokemonId?: string;
+            speciesEssentialsId?: string;
+            level?: number;
+            moves?: string[];
+            itemId?: string;
+          }>;
+        }
+      | undefined;
+
+    if (!profile || !Array.isArray(profile.party) || profile.party.length === 0) {
+      return { ok: false, message: `${trainerName} has no team ready to battle.` };
+    }
+
+    const playerSide = this.buildPlayerSide("a", player, user, catalogs);
+    if (!this.hasAvailablePokemon(playerSide)) {
+      return { ok: false, message: "Your team has no Pokemon able to battle." };
+    }
+
+    const party = profile.party
+      .map((entry) =>
+        this.buildNpcTrainerPokemon(
+          {
+            pokemonId: entry.pokemonId ?? "",
+            pokemonName: entry.speciesEssentialsId ?? "",
+            level: Math.max(1, Math.round(entry.level ?? 1)),
+            moves: Array.isArray(entry.moves) ? entry.moves : [],
+            itemId: entry.itemId ?? ""
+          },
+          catalogs
+        )
+      )
+      .filter((pokemon): pokemon is BattlePokemon => Boolean(pokemon));
+
+    if (party.length === 0) {
+      return { ok: false, message: `${trainerName} has no valid team.` };
+    }
+
+    const trainerDisplayName = `${profile.trainerTypeName ?? ""} ${profile.name ?? trainerName}`.trim();
+    const npcSide: BattleSide = {
+      id: "b",
+      isAi: true,
+      trainerName: trainerDisplayName,
+      money: await this.computeNpcTrainerPrize({ trainerTypeId: profile.trainerTypeId ?? "" }, party),
+      inventory: [],
+      party,
+      activeIndex: 0,
+      action: null,
+      escapeAttempts: 0
+    };
+
+    const battle = this.createBattle("trainer", playerSide, npcSide, [
+      `${trainerDisplayName} wants to battle!`,
+      `${trainerDisplayName} sent out ${getPokemonDisplayName(party[0])}.`
+    ]);
+
+    this.activateBattle(battle);
+    return { ok: true, battleId: battle.id, playerSideId: playerSide.id };
+  }
+
+  /** One-shot notification when a battle finishes (used by the event runtime). */
+  public onBattleEnd(battleId: string, listener: (winnerSideId: string | null) => void) {
+    const listeners = this.battleEndListeners.get(battleId) ?? [];
+    listeners.push(listener);
+    this.battleEndListeners.set(battleId, listeners);
+  }
+
+  private battleEndListeners = new Map<string, Array<(winnerSideId: string | null) => void>>();
+
+  private buildNpcTrainerPokemon(
+    entry: NpcTrainerPokemonDefinition,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): BattlePokemon | null {
+    const definition =
+      this.resolvePokemonDefinition(entry.pokemonId, catalogs) ??
+      (entry.pokemonName ? this.resolvePokemonDefinition(entry.pokemonName, catalogs) : null);
+    if (!definition) {
+      return null;
+    }
+
+    const pokemon = this.buildWildPokemon(definition, entry.level, catalogs.skillsById);
+    pokemon.id = `npc:${crypto.randomUUID()}`;
+
+    if (entry.moves.length > 0) {
+      const moves = entry.moves
+        .map((moveName) => {
+          const normalized = moveName.trim();
+          const skillDefinition =
+            catalogs.skillsById.get(normalized) ??
+            catalogs.skillsById.get(`skill-${normalized.toUpperCase()}`) ??
+            catalogs.skillsById.get(`skill-${normalized}`) ??
+            catalogs.skillsByName.get(normalized.toLowerCase());
+          return skillDefinition ? this.buildBattleMove(skillDefinition) : null;
+        })
+        .filter((move): move is BattleMove => Boolean(move))
+        .slice(0, 4);
+      if (moves.length > 0) {
+        pokemon.moves = moves;
+      }
+    }
+
+    if (entry.itemId) {
+      const itemDefinition = this.getCachedItemDefinition(entry.itemId, "");
+      if (itemDefinition) {
+        pokemon.heldItemId = itemDefinition.id;
+        pokemon.heldItemName = itemDefinition.name;
+      }
+    }
+
+    return pokemon;
+  }
+
+  /** Prize money: trainer type base money x strongest party level (Essentials rule). */
+  private async computeNpcTrainerPrize(npc: Pick<NpcDefinition, "trainerTypeId">, party: BattlePokemon[]) {
+    const highestLevel = party.reduce((highest, pokemon) => Math.max(highest, pokemon.level), 1);
+    let baseMoney = 40;
+
+    if (npc.trainerTypeId) {
+      const payload = await this.designerSectionStore.read("trainerTypes");
+      const record = (payload?.state.items ?? []).find(
+        (item) =>
+          item.id === npc.trainerTypeId ||
+          (item.trainerTypeProfile as { essentialsId?: string } | undefined)?.essentialsId ===
+            npc.trainerTypeId
+      );
+      const profile = record?.trainerTypeProfile as { baseMoney?: unknown } | undefined;
+      const parsed = parseNumber(profile?.baseMoney, 0);
+      if (parsed > 0) {
+        baseMoney = parsed;
+      }
+    }
+
+    return Math.max(0, baseMoney * highestLevel);
   }
 
   private async startTrainerBattle(firstPlayer: Player, secondPlayer: Player) {
@@ -1215,7 +1882,7 @@ export default class BattleManager {
     secondSide: BattleSide,
     log: string[]
   ): BattleSession {
-    return {
+    const battle: BattleSession = {
       id: crypto.randomUUID(),
       kind,
       status: "active",
@@ -1223,12 +1890,28 @@ export default class BattleManager {
       turn: 1,
       turnEndsAt: null,
       timer: null,
-      log,
+      log: [],
+      events: [],
+      eventSeq: 0,
+      lastFlushedSeq: 0,
+      participation: new Map(),
+      leveledPokemonIds: new Set(),
       result: null,
       startedAt: new Date().toISOString(),
       endedAt: null,
       summary: null
     };
+
+    this.pushEvent(battle, {
+      kind: "battle-start",
+      battleKind: kind,
+      transition: kind === "wild" ? "wild-flash" : "trainer-versus",
+      bgmName: null,
+      introText: log[0] ?? ""
+    });
+    log.forEach((entry) => this.say(battle, entry));
+
+    return battle;
   }
 
   private activateBattle(battle: BattleSession) {
@@ -1268,6 +1951,7 @@ export default class BattleManager {
     }
 
     this.emitBattleState(battle);
+    this.flushEvents(battle);
   }
 
   private clearBattleTimer(battle: BattleSession) {
@@ -1284,6 +1968,7 @@ export default class BattleManager {
     }
 
     this.clearBattleTimer(battle);
+    this.recordParticipation(battle);
     const [firstSide, secondSide] = battle.sides;
 
     for (const side of battle.sides) {
@@ -1311,17 +1996,25 @@ export default class BattleManager {
       }
 
       const escaped = this.tryEscape(runSide, this.getOpponentSide(battle, runSide));
-      const escapeLog = escaped ? "You got away safely." : "You could not escape.";
-      await this.emitBattleStep(battle, escapeLog, !escaped);
+      this.pushEvent(
+        battle,
+        { kind: "escape", success: escaped },
+        escaped ? "You got away safely." : "You could not escape."
+      );
+      await this.emitBattleStep(battle, !escaped);
       if (escaped) {
-        await this.finishBattle(battle, escapeLog, null, null);
+        await this.finishBattle(battle, "You got away safely.", null, null);
         return;
       }
     }
 
     for (const side of battle.sides) {
       if (side.action?.type === "bag") {
-        await this.emitBattleStep(battle, this.applyItemAction(side, side.action));
+        const battleEnded = await this.applyItemAction(battle, side, side.action);
+        await this.emitBattleStep(battle);
+        if (battleEnded || (battle.status as BattleStatus) !== "active") {
+          return;
+        }
       }
     }
 
@@ -1329,7 +2022,14 @@ export default class BattleManager {
       if (side.action?.type === "pokemon") {
         const switched = this.switchPokemon(side, side.action.pokemonId);
         if (switched) {
-          await this.emitBattleStep(battle, `${side.trainerName} sent out ${getPokemonDisplayName(getActivePokemon(side))}.`);
+          const sentOut = getActivePokemon(side);
+          this.pushEvent(
+            battle,
+            { kind: "switch", sideId: side.id, pokemon: getPublicPokemon(sentOut) },
+            `${side.trainerName} sent out ${getPokemonDisplayName(sentOut)}.`
+          );
+          this.recordParticipation(battle);
+          await this.emitBattleStep(battle);
         }
       }
     }
@@ -1337,51 +2037,312 @@ export default class BattleManager {
     const attackOrder = [firstSide, secondSide]
       .filter((side) => side.action?.type === "fight" && !isFainted(getActivePokemon(side)))
       .sort((left, right) => {
+        const leftMove = this.getQueuedMove(left);
+        const rightMove = this.getQueuedMove(right);
+        const priorityDiff = (rightMove?.priority ?? 0) - (leftMove?.priority ?? 0);
+        if (priorityDiff !== 0) {
+          return priorityDiff;
+        }
+
         const leftSpeed = this.getModifiedStat(getActivePokemon(left), "speed");
         const rightSpeed = this.getModifiedStat(getActivePokemon(right), "speed");
         return rightSpeed - leftSpeed || (Math.random() > 0.5 ? 1 : -1);
       });
 
     for (const side of attackOrder) {
+      if ((battle.status as BattleStatus) !== "active") {
+        return;
+      }
+
       const target = this.getOpponentSide(battle, side);
       const attackerPokemon = getActivePokemon(side);
-      const targetPokemon = getActivePokemon(target);
 
-      if (isFainted(attackerPokemon) || isFainted(targetPokemon) || side.action?.type !== "fight") {
+      if (isFainted(attackerPokemon) || side.action?.type !== "fight") {
         continue;
       }
 
-      await this.emitBattleStep(battle, this.applyMoveAction(side, target, side.action.moveId));
+      await this.executeMoveAction(battle, side, target, side.action.moveId);
 
-      if (isFainted(targetPokemon)) {
-        await this.emitBattleStep(battle, `${getPokemonDisplayName(targetPokemon)} fainted.`);
-        if (!this.autoSwitchIfPossible(target)) {
-          await this.finishBattle(
-            battle,
-            `${side.trainerName} won the battle.`,
-            side,
-            target
-          );
-          return;
-        }
-        await this.emitBattleStep(battle, `${target.trainerName} sent out ${getPokemonDisplayName(getActivePokemon(target))}.`);
+      if (await this.handleFaintChecks(battle)) {
+        return;
       }
+    }
+
+    if (await this.applyEndOfTurn(battle)) {
+      return;
     }
 
     battle.turn += 1;
     this.startChoiceTurn(battle);
   }
 
-  private async emitBattleStep(battle: BattleSession, message: string, shouldPause = true) {
-    if (battle.status !== "active") {
+  private getQueuedMove(side: BattleSide): BattleMove | null {
+    if (side.action?.type !== "fight") {
+      return null;
+    }
+
+    const moveId = side.action.moveId;
+    return getActivePokemon(side).moves.find((move) => move.id === moveId) ?? null;
+  }
+
+  private pushEvent(battle: BattleSession, event: BattlePublicEvent, logText?: string | null) {
+    battle.eventSeq += 1;
+    battle.events.push({
+      ...event,
+      seq: battle.eventSeq,
+      text: logText ?? undefined
+    } as BattleSequencedEvent);
+    if (logText) {
+      this.appendBattleLog(battle, logText);
+    }
+  }
+
+  private say(battle: BattleSession, text: string) {
+    this.pushEvent(battle, { kind: "message", text }, text);
+  }
+
+  private flushEvents(battle: BattleSession) {
+    const pending = battle.events.filter((event) => event.seq > battle.lastFlushedSeq);
+    if (pending.length === 0) {
       return;
     }
 
-    this.appendBattleLog(battle, message);
-    this.emitBattleState(battle);
+    battle.lastFlushedSeq = battle.eventSeq;
+    battle.sides.forEach((side) => {
+      if (!side.isAi) {
+        this.emitToSide(side, "battle:events", {
+          battleId: battle.id,
+          turn: battle.turn,
+          events: pending
+        });
+      }
+    });
+  }
 
-    if (shouldPause) {
+  private async emitBattleStep(battle: BattleSession, shouldPause = true) {
+    this.emitBattleState(battle);
+    this.flushEvents(battle);
+
+    if (shouldPause && battle.status === "active") {
       await delay(BATTLE_ACTION_STEP_DELAY_MS);
+    }
+  }
+
+  private recordParticipation(battle: BattleSession) {
+    battle.sides.forEach((side) => {
+      const opponent = this.getOpponentSide(battle, side);
+      const mine = getActivePokemon(side);
+      const foe = getActivePokemon(opponent);
+
+      if (!mine || !foe || isFainted(mine)) {
+        return;
+      }
+
+      let participants = battle.participation.get(foe.id);
+      if (!participants) {
+        participants = new Set<string>();
+        battle.participation.set(foe.id, participants);
+      }
+      participants.add(mine.id);
+    });
+  }
+
+  private async handleFaintChecks(battle: BattleSession): Promise<boolean> {
+    if (battle.status !== "active") {
+      return true;
+    }
+
+    for (const side of battle.sides) {
+      const active = getActivePokemon(side);
+      if (!active || !isFainted(active)) {
+        continue;
+      }
+
+      this.pushEvent(
+        battle,
+        { kind: "faint", sideId: side.id, pokemonId: active.id, pokemonName: getPokemonDisplayName(active) },
+        `${getPokemonDisplayName(active)} fainted.`
+      );
+      await this.emitBattleStep(battle);
+      await this.awardExperienceForFaint(battle, side, active);
+
+      if ((battle.status as BattleStatus) !== "active") {
+        return true;
+      }
+
+      if (!this.autoSwitchIfPossible(side)) {
+        const winner = this.getOpponentSide(battle, side);
+        await this.finishBattle(battle, `${winner.trainerName} won the battle.`, winner, side);
+        return true;
+      }
+
+      const sentOut = getActivePokemon(side);
+      this.pushEvent(
+        battle,
+        { kind: "switch", sideId: side.id, pokemon: getPublicPokemon(sentOut) },
+        `${side.trainerName} sent out ${getPokemonDisplayName(sentOut)}.`
+      );
+      this.recordParticipation(battle);
+      await this.emitBattleStep(battle);
+    }
+
+    return battle.status !== "active";
+  }
+
+  private async applyEndOfTurn(battle: BattleSession): Promise<boolean> {
+    if (battle.status !== "active") {
+      return true;
+    }
+
+    let pushedAnyEvent = false;
+
+    for (const side of battle.sides) {
+      const pokemon = getActivePokemon(side);
+      if (!pokemon || isFainted(pokemon)) {
+        continue;
+      }
+
+      const displayName = getPokemonDisplayName(pokemon);
+      const residual = applyStatusEndOfTurn(pokemon.status, pokemon.maxHp, displayName);
+      if (residual.damage > 0) {
+        pokemon.hp = Math.max(0, pokemon.hp - residual.damage);
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: side.id,
+            pokemonId: pokemon.id,
+            amount: residual.damage,
+            hpAfter: pokemon.hp,
+            maxHp: pokemon.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "status"
+          },
+          residual.message
+        );
+        pushedAnyEvent = true;
+      }
+
+      if (!isFainted(pokemon) && this.applyHeldItemTriggers(battle, side, pokemon)) {
+        pushedAnyEvent = true;
+      }
+
+      pokemon.volatile.flinched = false;
+      pokemon.volatile.protected = false;
+    }
+
+    if (pushedAnyEvent) {
+      await this.emitBattleStep(battle);
+    }
+
+    return this.handleFaintChecks(battle);
+  }
+
+  /** Returns true when at least one event was pushed. */
+  private applyHeldItemTriggers(battle: BattleSession, side: BattleSide, pokemon: BattlePokemon): boolean {
+    if (!pokemon.heldItemId) {
+      return false;
+    }
+
+    const definition = this.getCachedItemDefinition(pokemon.heldItemId, pokemon.heldItemName ?? "");
+    const effect = definition?.heldEffect;
+    if (!definition || !effect) {
+      return false;
+    }
+
+    const displayName = getPokemonDisplayName(pokemon);
+    let used = false;
+
+    if (
+      effect.trigger === "end-of-turn" &&
+      effect.action === "heal-fraction" &&
+      pokemon.hp < pokemon.maxHp
+    ) {
+      const amount = Math.max(1, Math.floor(pokemon.maxHp * effect.fraction));
+      pokemon.hp = Math.min(pokemon.maxHp, pokemon.hp + amount);
+      this.pushEvent(
+        battle,
+        {
+          kind: "heal",
+          sideId: side.id,
+          pokemonId: pokemon.id,
+          amount,
+          hpAfter: pokemon.hp,
+          maxHp: pokemon.maxHp,
+          source: "held-item"
+        },
+        `${displayName} restored a little HP using its ${definition.name}.`
+      );
+      used = true;
+    }
+
+    if (effect.trigger === "hp-below-half" && pokemon.hp > 0 && pokemon.hp <= Math.floor(pokemon.maxHp / 2)) {
+      const amount =
+        effect.action === "heal-amount"
+          ? effect.amount
+          : Math.max(1, Math.floor(pokemon.maxHp * effect.fraction));
+      pokemon.hp = Math.min(pokemon.maxHp, pokemon.hp + Math.max(1, amount));
+      this.pushEvent(
+        battle,
+        { kind: "held-item-used", sideId: side.id, pokemonId: pokemon.id, itemName: definition.name },
+        `${displayName} ate its ${definition.name}!`
+      );
+      this.pushEvent(battle, {
+        kind: "heal",
+        sideId: side.id,
+        pokemonId: pokemon.id,
+        amount: Math.max(1, amount),
+        hpAfter: pokemon.hp,
+        maxHp: pokemon.maxHp,
+        source: "held-item"
+      });
+      this.consumeHeldItem(pokemon);
+      used = true;
+    }
+
+    if (effect.trigger === "status") {
+      const cures =
+        pokemon.status &&
+        (effect.cures === "any" || effect.cures.includes(pokemon.status.id));
+      const curesConfusion = effect.curesConfusion && pokemon.volatile.confusionTurns > 0;
+
+      if (cures || curesConfusion) {
+        this.pushEvent(
+          battle,
+          { kind: "held-item-used", sideId: side.id, pokemonId: pokemon.id, itemName: definition.name },
+          `${displayName} ate its ${definition.name}!`
+        );
+        if (cures && pokemon.status) {
+          this.pushEvent(
+            battle,
+            { kind: "status-cured", sideId: side.id, pokemonId: pokemon.id, status: pokemon.status.id },
+            `${displayName} is no longer ${STATUS_DISPLAY_NAMES[pokemon.status.id]}.`
+          );
+          pokemon.status = null;
+        }
+        if (curesConfusion) {
+          pokemon.volatile.confusionTurns = 0;
+          this.pushEvent(
+            battle,
+            { kind: "confusion-end", sideId: side.id, pokemonId: pokemon.id },
+            `${displayName} snapped out of its confusion.`
+          );
+        }
+        this.consumeHeldItem(pokemon);
+        used = true;
+      }
+    }
+
+    return used;
+  }
+
+  private consumeHeldItem(pokemon: BattlePokemon) {
+    pokemon.heldItemId = null;
+    pokemon.heldItemName = null;
+    if (pokemon.originalSummary) {
+      pokemon.originalSummary.heldItemId = undefined;
+      pokemon.originalSummary.heldItemName = undefined;
     }
   }
 
@@ -1394,7 +2355,7 @@ export default class BattleManager {
     summary.level = clamp(summary.level, 1, 100);
     summary.experience = Math.max(0, Math.round(summary.experience));
     summary.statBonuses = sanitizePokemonStatBonuses(summary.statBonuses);
-    summary.nextLevelExperience = getExperienceForNextLevel(summary.level, config);
+    summary.nextLevelExperience = this.getExperienceRequirement(pokemon, summary.level, config);
 
     if (summary.level >= 100) {
       summary.experience = 0;
@@ -1403,100 +2364,271 @@ export default class BattleManager {
 
     pokemon.level = summary.level;
     pokemon.statBonuses = summary.statBonuses;
+    pokemon.experience = summary.experience;
+    pokemon.nextLevelExperience = summary.nextLevelExperience;
   }
 
-  private formatStatBonusLog(statBonuses: PokemonStatBonuses) {
-    const labels: Array<[keyof PokemonStatBonuses, string]> = [
-      ["hp", "HP"],
-      ["attack", "Attack"],
-      ["defense", "Defense"],
-      ["specialAttack", "Sp. Attack"],
-      ["specialDefense", "Sp. Defense"],
-      ["speed", "Speed"]
-    ];
-
-    return labels
-      .map(([key, label]) => `${label} +${statBonuses[key]}`)
-      .join(", ");
-  }
-
-  private awardWinnerExperience(
-    winner: BattleSide,
-    loser: BattleSide,
+  /**
+   * Experience needed to go from `level` to `level + 1`: the species growth
+   * curve when the species defines one, otherwise the designer-configured
+   * global leveling curve.
+   */
+  private getExperienceRequirement(
+    pokemon: Pick<BattlePokemon, "growthRate">,
+    level: number,
     config: LevelingCurveConfig
   ) {
-    const winnerPokemon = getActivePokemon(winner);
-    const loserPokemon = getActivePokemon(loser);
-
-    this.syncPokemonProgression(winnerPokemon, config);
-
-    const summary = winnerPokemon.originalSummary;
-    if (!summary || summary.level >= 100) {
-      return [];
+    if (level >= 100) {
+      return 0;
     }
 
-    const gainedExperience = computeBattleExperience(config, summary.level, loserPokemon.level);
-    if (gainedExperience <= 0) {
-      return [`${getPokemonDisplayName(winnerPokemon)} gained no EXP.`];
+    if (pokemon.growthRate) {
+      return expToNextLevel(pokemon.growthRate, level);
     }
 
-    const nextLevelRequirement = summary.nextLevelExperience;
-    const currentExperience = Math.max(0, Math.round(summary.experience));
-    const nextExperience = currentExperience + gainedExperience;
-    const log = [`${getPokemonDisplayName(winnerPokemon)} gained ${gainedExperience} EXP.`];
+    return getExperienceForNextLevel(level, config);
+  }
 
-    if (nextLevelRequirement > 0 && nextExperience >= nextLevelRequirement) {
-      const statIncrease: PokemonStatBonuses = {
-        hp: getRandomStatIncrease(),
-        attack: getRandomStatIncrease(),
-        defense: getRandomStatIncrease(),
-        specialAttack: getRandomStatIncrease(),
-        specialDefense: getRandomStatIncrease(),
-        speed: getRandomStatIncrease()
-      };
-      const nextLevel = Math.min(100, summary.level + 1);
-      const nextBonuses: PokemonStatBonuses = {
-        hp: winnerPokemon.statBonuses.hp + statIncrease.hp,
-        attack: winnerPokemon.statBonuses.attack + statIncrease.attack,
-        defense: winnerPokemon.statBonuses.defense + statIncrease.defense,
-        specialAttack: winnerPokemon.statBonuses.specialAttack + statIncrease.specialAttack,
-        specialDefense: winnerPokemon.statBonuses.specialDefense + statIncrease.specialDefense,
-        speed: winnerPokemon.statBonuses.speed + statIncrease.speed
-      };
-      const nextStats = calculateStats(winnerPokemon.baseStats, nextLevel, nextBonuses);
+  private async awardExperienceForFaint(
+    battle: BattleSession,
+    faintedSide: BattleSide,
+    faintedPokemon: BattlePokemon
+  ) {
+    const winnerSide = this.getOpponentSide(battle, faintedSide);
+    if (typeof winnerSide.userId !== "number") {
+      return;
+    }
 
-      summary.level = nextLevel;
-      summary.experience = 0;
-      summary.statBonuses = nextBonuses;
-      summary.nextLevelExperience = getExperienceForNextLevel(nextLevel, config);
-      if (nextLevel >= 100) {
-        summary.nextLevelExperience = 0;
+    const catalogs = await this.loadCatalogs();
+    const participantIds = battle.participation.get(faintedPokemon.id) ?? new Set<string>();
+    let participants = winnerSide.party.filter(
+      (pokemon) =>
+        participantIds.has(pokemon.id) &&
+        !isFainted(pokemon) &&
+        pokemon.originalSummary &&
+        pokemon.level < 100
+    );
+
+    if (participants.length === 0) {
+      const active = getActivePokemon(winnerSide);
+      participants =
+        active && !isFainted(active) && active.originalSummary && active.level < 100 ? [active] : [];
+    }
+
+    if (participants.length === 0) {
+      return;
+    }
+
+    for (const participant of participants) {
+      this.applyEvYield(participant, faintedPokemon);
+
+      const gained =
+        faintedPokemon.baseExp > 0
+          ? computeFoeExperience({
+              baseExp: faintedPokemon.baseExp,
+              foeLevel: faintedPokemon.level,
+              isTrainerBattle: battle.kind === "trainer",
+              participantCount: participants.length
+            })
+          : computeBattleExperience(catalogs.levelingCurveConfig, participant.level, faintedPokemon.level);
+
+      if (gained <= 0) {
+        continue;
       }
-      summary.maxHp = nextStats.hp;
-      summary.hp = nextStats.hp;
-      summary.movePp = winnerPokemon.moves.reduce<Record<string, number>>((accumulator, move) => {
-        accumulator[move.name] = move.maxPp;
-        return accumulator;
-      }, {});
 
-      winnerPokemon.level = nextLevel;
-      winnerPokemon.statBonuses = nextBonuses;
-      winnerPokemon.stats = nextStats;
-      winnerPokemon.maxHp = nextStats.hp;
-      winnerPokemon.hp = nextStats.hp;
-      winnerPokemon.moves = winnerPokemon.moves.map((move) => ({
-        ...move,
-        currentPp: move.maxPp
-      }));
+      await this.grantExperience(battle, winnerSide, participant, gained, catalogs);
+    }
+  }
 
-      log.push(`${getPokemonDisplayName(winnerPokemon)} grew to level ${nextLevel}.`);
-      log.push(this.formatStatBonusLog(statIncrease));
-      log.push(`${getPokemonDisplayName(winnerPokemon)} was fully healed and recovered all PP.`);
-      return log;
+  private applyEvYield(participant: BattlePokemon, faintedPokemon: BattlePokemon) {
+    const summary = participant.originalSummary;
+    if (!summary) {
+      return;
     }
 
-    summary.experience = nextExperience;
-    return log;
+    (Object.entries(faintedPokemon.evYield) as Array<[BattleStatKey, number]>).forEach(
+      ([stat, amount]) => {
+        if (!amount || amount <= 0) {
+          return;
+        }
+        participant.evs[stat] = clamp(participant.evs[stat] + amount, 0, MAX_EV_PER_STAT);
+      }
+    );
+    summary.evs = { ...participant.evs };
+  }
+
+  private async grantExperience(
+    battle: BattleSession,
+    side: BattleSide,
+    pokemon: BattlePokemon,
+    gained: number,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ) {
+    const summary = pokemon.originalSummary;
+    if (!summary || summary.level >= 100) {
+      return;
+    }
+
+    this.syncPokemonProgression(pokemon, catalogs.levelingCurveConfig);
+
+    let remaining = gained;
+    summary.experience += remaining;
+    pokemon.experience = summary.experience;
+    this.pushEvent(
+      battle,
+      {
+        kind: "exp-gain",
+        sideId: side.id,
+        pokemonId: pokemon.id,
+        amount: gained,
+        experience: Math.min(summary.experience, summary.nextLevelExperience || summary.experience),
+        nextLevelExperience: summary.nextLevelExperience
+      },
+      `${getPokemonDisplayName(pokemon)} gained ${gained} EXP.`
+    );
+    await this.emitBattleStep(battle);
+
+    while (
+      battle.status === "active" &&
+      summary.level < 100 &&
+      summary.nextLevelExperience > 0 &&
+      summary.experience >= summary.nextLevelExperience
+    ) {
+      summary.experience -= summary.nextLevelExperience;
+      await this.levelUpPokemon(battle, side, pokemon, catalogs);
+    }
+
+    pokemon.experience = summary.experience;
+    pokemon.nextLevelExperience = summary.nextLevelExperience;
+  }
+
+  private async levelUpPokemon(
+    battle: BattleSession,
+    side: BattleSide,
+    pokemon: BattlePokemon,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ) {
+    const summary = pokemon.originalSummary;
+    if (!summary) {
+      return;
+    }
+
+    const statsBefore = calculateStats(
+      pokemon.baseStats,
+      summary.level,
+      pokemon.statBonuses,
+      pokemon.ivs,
+      pokemon.evs
+    );
+    const nextLevel = Math.min(100, summary.level + 1);
+    const statsAfter = calculateStats(
+      pokemon.baseStats,
+      nextLevel,
+      pokemon.statBonuses,
+      pokemon.ivs,
+      pokemon.evs
+    );
+
+    const statGains = {} as Record<BattleStatKey, BattleStatGain>;
+    (Object.keys(statsAfter) as BattleStatKey[]).forEach((stat) => {
+      statGains[stat] = {
+        before: statsBefore[stat],
+        after: statsAfter[stat],
+        gain: statsAfter[stat] - statsBefore[stat]
+      };
+    });
+
+    const hpGain = Math.max(0, statsAfter.hp - statsBefore.hp);
+    summary.level = nextLevel;
+    summary.maxHp = statsAfter.hp;
+    summary.hp = clamp(pokemon.hp + hpGain, 1, statsAfter.hp);
+    summary.nextLevelExperience = this.getExperienceRequirement(pokemon, nextLevel, catalogs.levelingCurveConfig);
+    if (nextLevel >= 100) {
+      summary.experience = 0;
+      summary.nextLevelExperience = 0;
+    }
+
+    pokemon.level = nextLevel;
+    pokemon.stats = statsAfter;
+    pokemon.maxHp = statsAfter.hp;
+    pokemon.hp = summary.hp;
+    pokemon.nextLevelExperience = summary.nextLevelExperience;
+    battle.leveledPokemonIds.add(pokemon.id);
+
+    this.pushEvent(
+      battle,
+      {
+        kind: "level-up",
+        sideId: side.id,
+        pokemonId: pokemon.id,
+        pokemonName: getPokemonDisplayName(pokemon),
+        level: nextLevel,
+        statGains
+      },
+      `${getPokemonDisplayName(pokemon)} grew to level ${nextLevel}!`
+    );
+    await this.emitBattleStep(battle);
+    await this.learnMovesAtLevel(battle, side, pokemon, nextLevel, catalogs);
+  }
+
+  private async learnMovesAtLevel(
+    battle: BattleSession,
+    side: BattleSide,
+    pokemon: BattlePokemon,
+    level: number,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ) {
+    const summary = pokemon.originalSummary;
+    if (!summary) {
+      return;
+    }
+
+    const learnable = pokemon.learnset.filter((entry) => entry.level === level);
+
+    for (const entry of learnable) {
+      if (pokemon.moves.some((move) => move.name === entry.skillName)) {
+        continue;
+      }
+
+      const skillDefinition =
+        catalogs.skillsById.get(entry.skillId) ??
+        catalogs.skillsByName.get(entry.skillName.toLowerCase());
+      if (!skillDefinition) {
+        continue;
+      }
+
+      if (pokemon.moves.length < 4) {
+        const move = this.buildBattleMove(skillDefinition);
+        pokemon.moves = [...pokemon.moves, move];
+        summary.moves = [...summary.moves, move.name];
+        summary.movePp = { ...(summary.movePp ?? {}), [move.name]: move.currentPp };
+        this.pushEvent(
+          battle,
+          { kind: "move-learned", sideId: side.id, pokemonId: pokemon.id, moveName: move.name },
+          `${getPokemonDisplayName(pokemon)} learned ${move.name}!`
+        );
+        await this.emitBattleStep(battle);
+        continue;
+      }
+
+      const pending = summary.pendingMoveLearns ?? [];
+      if (!pending.includes(entry.skillName)) {
+        summary.pendingMoveLearns = [...pending, entry.skillName];
+      }
+      this.pushEvent(
+        battle,
+        {
+          kind: "move-learn-prompt",
+          sideId: side.id,
+          pokemonId: pokemon.id,
+          pokemonName: getPokemonDisplayName(pokemon),
+          moveName: entry.skillName,
+          currentMoves: pokemon.moves.map((move) => move.name)
+        },
+        `${getPokemonDisplayName(pokemon)} wants to learn ${entry.skillName}.`
+      );
+      await this.emitBattleStep(battle);
+    }
   }
 
   private async finishBattle(
@@ -1521,27 +2653,54 @@ export default class BattleManager {
         ...battle.log,
         `${winner.trainerName} received $${transferAmount}.`
       ];
+    } else if (battle.kind === "trainer" && winner?.userId && loser?.isAi && loser.money > 0) {
+      const prize = loser.money;
+      loser.money = 0;
+      winner.money += prize;
+      this.pushEvent(
+        battle,
+        { kind: "message", text: `${winner.trainerName} got $${prize} for winning!` },
+        `${winner.trainerName} got $${prize} for winning!`
+      );
     }
 
     const catalogs = await this.loadCatalogs();
     battle.sides.forEach((side) => {
       side.party.forEach((pokemon) => this.syncPokemonProgression(pokemon, catalogs.levelingCurveConfig));
     });
-    if (winner && loser) {
-      battle.log = [
-        ...battle.log,
-        ...this.awardWinnerExperience(winner, loser, catalogs.levelingCurveConfig)
-      ];
-    }
+
+    await this.applyEvolutions(battle, catalogs);
+
+    this.pushEvent(battle, {
+      kind: "battle-end",
+      result,
+      winnerSideId: winner?.id ?? null
+    });
 
     battle.summary = this.createBattleSummary(battle, result, winner, loser);
+
+    // A player whose whole team faints "blacks out": their party is healed and
+    // they are returned to a safe spot after the battle (classic Pokemon rule),
+    // so a wipe can never leave them stuck with no way to heal.
+    const whiteoutSides: BattleSide[] = [];
 
     await Promise.all(
       battle.sides
         .filter((side) => typeof side.userId === "number")
         .map(async (side) => {
+          const wipedOut = Boolean(side.playerId) && !this.hasAvailablePokemon(side);
+          let partySummaries = this.toPokemonPartySummaries(side);
+          if (wipedOut) {
+            partySummaries = partySummaries.map((pokemon) => ({
+              ...pokemon,
+              hp: pokemon.maxHp,
+              status: null,
+              movePp: this.restorePokemonMovePp(pokemon, catalogs.skillsByName)
+            }));
+            whiteoutSides.push(side);
+          }
           await this.auth.saveBattleState(side.userId!, {
-            pokemonParty: this.toPokemonPartySummaries(side),
+            pokemonParty: partySummaries,
             inventory: side.inventory,
             money: side.money
           });
@@ -1564,6 +2723,7 @@ export default class BattleManager {
     );
 
     this.emitBattleState(battle);
+    this.flushEvents(battle);
     battle.sides.forEach((side) => {
       if (!side.playerId) {
         return;
@@ -1577,6 +2737,171 @@ export default class BattleManager {
     });
     this.battles.delete(battle.id);
     battle.sides.forEach((side) => this.emitToSide(side, "battle:ended", { battleId: battle.id }));
+
+    // Perform the blackout teleport after the battle has fully torn down.
+    for (const side of whiteoutSides) {
+      const player = this.world.getPlayerByUserId(side.userId!);
+      if (!player) {
+        continue;
+      }
+      const mapsState = this.world.getPlayableMapsState();
+      // Classic rule: return to the last visited Pokemon Center; fall back to
+      // the initial spawn when none has been visited yet.
+      const respawn = await this.auth.getRespawnPoint(side.userId!);
+      const spawn =
+        respawn && mapsState?.editorDataByMapId[respawn.mapId]
+          ? respawn
+          : mapsState
+            ? resolveInitialSpawnFromPlayableMapsState(mapsState)
+            : null;
+      if (spawn) {
+        player.teleport(spawn.mapId, spawn.x, spawn.y);
+        this.world.players.set(player.socketId, player);
+        this.world.presentPlayerToMap(player);
+        player.socketConnections.forEach((socketId) => {
+          this.world.presentPlayersOnMapTo(socketId, player.currentMapId);
+        });
+      }
+      this.emitToPlayer(player, "auth:info", {
+        message: "You blacked out! Your team was healed and you were returned to a safe place."
+      });
+    }
+
+    // Wake anything awaiting this battle's outcome (scripted trainer events).
+    const endListeners = this.battleEndListeners.get(battle.id);
+    if (endListeners) {
+      this.battleEndListeners.delete(battle.id);
+      endListeners.forEach((listener) => {
+        try {
+          listener(winner?.id ?? null);
+        } catch {
+          // A bad listener must not break battle teardown.
+        }
+      });
+    }
+  }
+
+  private async applyEvolutions(
+    battle: BattleSession,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ) {
+    for (const side of battle.sides) {
+      if (typeof side.userId !== "number") {
+        continue;
+      }
+
+      for (const pokemon of side.party) {
+        const summary = pokemon.originalSummary;
+        if (!summary || !battle.leveledPokemonIds.has(pokemon.id) || isFainted(pokemon)) {
+          continue;
+        }
+
+        const target = this.findLevelEvolutionTarget(pokemon, catalogs);
+        if (!target) {
+          continue;
+        }
+
+        const fromName = getPokemonDisplayName(pokemon);
+        const newStats = calculateStats(
+          target.baseStats,
+          pokemon.level,
+          pokemon.statBonuses,
+          pokemon.ivs,
+          pokemon.evs
+        );
+        const missingHp = pokemon.maxHp - pokemon.hp;
+
+        summary.sourcePokemonId = target.id;
+        summary.name = target.name;
+        summary.types = target.types;
+        summary.maxHp = newStats.hp;
+        summary.hp = clamp(newStats.hp - missingHp, 1, newStats.hp);
+
+        pokemon.sourcePokemonId = target.id;
+        pokemon.name = target.name;
+        pokemon.types = target.types;
+        pokemon.baseStats = target.baseStats;
+        pokemon.stats = newStats;
+        pokemon.maxHp = newStats.hp;
+        pokemon.hp = summary.hp;
+        pokemon.frontImageSrc = target.frontImageSrc || pokemon.frontImageSrc;
+        pokemon.backImageSrc = target.backImageSrc || pokemon.backImageSrc;
+        pokemon.growthRate = target.growthRate ?? pokemon.growthRate;
+        pokemon.baseExp = target.baseExp;
+        pokemon.catchRate = target.catchRate;
+        pokemon.evYield = target.evYield;
+        pokemon.learnset = target.skills;
+        pokemon.evolutions = target.evolutions;
+
+        this.pushEvent(
+          battle,
+          {
+            kind: "evolution",
+            sideId: side.id,
+            pokemonId: pokemon.id,
+            fromName,
+            toName: target.name,
+            frontImageSrc: pokemon.frontImageSrc,
+            backImageSrc: pokemon.backImageSrc
+          },
+          `${fromName} evolved into ${target.name}!`
+        );
+      }
+    }
+  }
+
+  private findLevelEvolutionTarget(
+    pokemon: BattlePokemon,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): PokemonDefinition | null {
+    for (const evolution of pokemon.evolutions) {
+      const method = evolution.method.trim().toLowerCase().replace(/[\s_-]/g, "");
+      if (method !== "level" && method !== "levelup") {
+        continue;
+      }
+
+      const requiredLevel =
+        typeof evolution.parameter === "number"
+          ? evolution.parameter
+          : Number.parseInt(String(evolution.parameter ?? ""), 10);
+      if (!Number.isFinite(requiredLevel) || requiredLevel <= 0 || pokemon.level < requiredLevel) {
+        continue;
+      }
+
+      const target = this.resolvePokemonDefinition(evolution.targetId, catalogs);
+      if (target && target.id !== pokemon.sourcePokemonId) {
+        return target;
+      }
+    }
+
+    return null;
+  }
+
+  private resolvePokemonDefinition(
+    reference: string,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): PokemonDefinition | null {
+    const trimmed = reference.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const byId = catalogs.pokemonById.get(trimmed);
+    if (byId) {
+      return byId;
+    }
+
+    const lowered = trimmed.toLowerCase();
+    for (const definition of catalogs.pokemonById.values()) {
+      if (
+        definition.essentialsId.toLowerCase() === lowered ||
+        definition.name.toLowerCase() === lowered
+      ) {
+        return definition;
+      }
+    }
+
+    return null;
   }
 
   private sanitizeAction(action: BattleClientAction | undefined): BattleQueuedAction | null {
@@ -1633,8 +2958,20 @@ export default class BattleManager {
 
     if (action.type === "bag") {
       const item = side.inventory.find((candidate) => candidate.id === action.itemId);
-      if (!item || item.quantity <= 0 || !["usable", "berries"].includes(item.category)) {
+      const definition = item ? this.getCachedItemDefinition(item.id, item.name) : null;
+      const isPokeball = Boolean(definition?.isPokeball);
+
+      if (!item || item.quantity <= 0 || (!isPokeball && !["usable", "berries"].includes(item.category))) {
         return "That item cannot be used in battle.";
+      }
+
+      if (isPokeball) {
+        if (battle.kind !== "wild") {
+          return "You can't catch another trainer's Pokemon!";
+        }
+        if (side.party.length >= MAX_PARTY_SIZE) {
+          return "Your party is full.";
+        }
       }
     }
 
@@ -1674,11 +3011,11 @@ export default class BattleManager {
     }
 
     const targetPokemon = getActivePokemon(opponent);
-    const bestMove = [...moves].sort((left, right) => {
-      const leftScore = left.power * getMoveEffectiveness(left.type, targetPokemon.types) * (activePokemon.types.includes(left.type) ? 1.5 : 1);
-      const rightScore = right.power * getMoveEffectiveness(right.type, targetPokemon.types) * (activePokemon.types.includes(right.type) ? 1.5 : 1);
-      return rightScore - leftScore;
-    })[0];
+    const scoreMove = (move: BattleMove) => {
+      const stab = activePokemon.types.some((type) => isSameType(this.typeChart, type, move.type)) ? 1.5 : 1;
+      return Math.max(1, move.power) * this.getEffectiveness(move.type, targetPokemon.types) * stab;
+    };
+    const bestMove = [...moves].sort((left, right) => scoreMove(right) - scoreMove(left))[0];
 
     return {
       type: "fight",
@@ -1686,32 +3023,223 @@ export default class BattleManager {
     };
   }
 
-  private applyItemAction(side: BattleSide, action: Extract<BattleQueuedAction, { type: "bag" }>) {
+  /** Applies a bag action. Returns true when the item ended the battle (capture). */
+  private async applyItemAction(
+    battle: BattleSession,
+    side: BattleSide,
+    action: Extract<BattleQueuedAction, { type: "bag" }>
+  ): Promise<boolean> {
     const item = side.inventory.find((candidate) => candidate.id === action.itemId);
     const itemDefinition = this.getCachedItemDefinition(item?.id ?? "", item?.name ?? "");
+
+    if (!item || !itemDefinition || item.quantity <= 0) {
+      this.say(battle, `${side.trainerName} could not use that item.`);
+      return false;
+    }
+
+    if (itemDefinition.isPokeball) {
+      return this.applyPokeballAction(battle, side, item, itemDefinition);
+    }
+
     const targetPokemon =
       side.party.find((pokemon) => pokemon.id === action.targetPokemonId) ??
       getActivePokemon(side);
 
-    if (!item || !itemDefinition || item.quantity <= 0) {
-      return `${side.trainerName} could not use that item.`;
+    item.quantity -= 1;
+    this.pushEvent(
+      battle,
+      {
+        kind: "item-used",
+        sideId: side.id,
+        itemId: item.id,
+        itemName: item.name,
+        targetPokemonId: targetPokemon.id
+      },
+      `${side.trainerName} used ${item.name} on ${getPokemonDisplayName(targetPokemon)}.`
+    );
+
+    const displayName = getPokemonDisplayName(targetPokemon);
+    const modifiers = itemDefinition.statModifiers;
+
+    if (modifiers.hp > 0 && targetPokemon.hp > 0) {
+      const beforeHp = targetPokemon.hp;
+      targetPokemon.hp = clamp(targetPokemon.hp + modifiers.hp, 0, targetPokemon.maxHp);
+      if (targetPokemon.hp > beforeHp) {
+        this.pushEvent(
+          battle,
+          {
+            kind: "heal",
+            sideId: side.id,
+            pokemonId: targetPokemon.id,
+            amount: targetPokemon.hp - beforeHp,
+            hpAfter: targetPokemon.hp,
+            maxHp: targetPokemon.maxHp,
+            source: "item"
+          },
+          `${displayName} recovered ${targetPokemon.hp - beforeHp} HP.`
+        );
+      }
+    }
+
+    if (itemDefinition.curesStatuses && targetPokemon.status) {
+      const cures =
+        itemDefinition.curesStatuses === "any" ||
+        itemDefinition.curesStatuses.includes(targetPokemon.status.id);
+      if (cures) {
+        this.pushEvent(
+          battle,
+          {
+            kind: "status-cured",
+            sideId: side.id,
+            pokemonId: targetPokemon.id,
+            status: targetPokemon.status.id
+          },
+          `${displayName} is no longer ${STATUS_DISPLAY_NAMES[targetPokemon.status.id]}.`
+        );
+        targetPokemon.status = null;
+      }
+    }
+
+    if (itemDefinition.curesConfusion && targetPokemon.volatile.confusionTurns > 0) {
+      targetPokemon.volatile.confusionTurns = 0;
+      this.pushEvent(
+        battle,
+        { kind: "confusion-end", sideId: side.id, pokemonId: targetPokemon.id },
+        `${displayName} snapped out of its confusion.`
+      );
+    }
+
+    const stageKeys: Array<Exclude<BattleStageKey, "accuracy" | "evasion">> = [
+      "attack",
+      "defense",
+      "specialAttack",
+      "specialDefense",
+      "speed"
+    ];
+    stageKeys.forEach((stat) => {
+      const delta = modifiers[stat];
+      if (delta !== 0) {
+        this.applyStatStageChange(battle, side, targetPokemon, stat, delta, false);
+      }
+    });
+
+    return false;
+  }
+
+  private async applyPokeballAction(
+    battle: BattleSession,
+    side: BattleSide,
+    item: InventoryItem,
+    itemDefinition: ItemDefinition
+  ): Promise<boolean> {
+    const opponent = this.getOpponentSide(battle, side);
+    const wildPokemon = getActivePokemon(opponent);
+
+    if (battle.kind !== "wild" || !opponent.isAi || !wildPokemon || isFainted(wildPokemon)) {
+      this.say(battle, `${side.trainerName} can't use ${item.name} right now.`);
+      return false;
+    }
+
+    if (side.party.length >= MAX_PARTY_SIZE) {
+      this.say(battle, `${side.trainerName} has no room for another Pokemon.`);
+      return false;
     }
 
     item.quantity -= 1;
-    const modifiers = itemDefinition.statModifiers;
-    const beforeHp = targetPokemon.hp;
-    targetPokemon.hp = clamp(targetPokemon.hp + modifiers.hp, 0, targetPokemon.maxHp);
-    targetPokemon.stages.attack = clamp(targetPokemon.stages.attack + modifiers.attack, -6, 6);
-    targetPokemon.stages.defense = clamp(targetPokemon.stages.defense + modifiers.defense, -6, 6);
-    targetPokemon.stages.specialAttack = clamp(targetPokemon.stages.specialAttack + modifiers.specialAttack, -6, 6);
-    targetPokemon.stages.specialDefense = clamp(targetPokemon.stages.specialDefense + modifiers.specialDefense, -6, 6);
-    targetPokemon.stages.speed = clamp(targetPokemon.stages.speed + modifiers.speed, -6, 6);
+    this.pushEvent(
+      battle,
+      { kind: "item-used", sideId: side.id, itemId: item.id, itemName: item.name, targetPokemonId: null },
+      `${side.trainerName} threw a ${item.name}!`
+    );
 
-    if (targetPokemon.hp > beforeHp) {
-      return `${side.trainerName} used ${item.name}. ${getPokemonDisplayName(targetPokemon)} recovered ${targetPokemon.hp - beforeHp} HP.`;
+    const catchRate = wildPokemon.catchRate > 0 ? wildPokemon.catchRate : 45;
+    const ballBonus = itemDefinition.pokeballBonusRatio > 0 ? itemDefinition.pokeballBonusRatio : 1;
+    const statusBonus = getStatusCatchBonus(wildPokemon.status);
+    const captureValue = clamp(
+      Math.floor(
+        ((3 * wildPokemon.maxHp - 2 * wildPokemon.hp) * catchRate * ballBonus * statusBonus) /
+          (3 * wildPokemon.maxHp)
+      ),
+      1,
+      255
+    );
+
+    let shakes = 0;
+    let caught = false;
+    if (captureValue >= 255) {
+      shakes = 4;
+      caught = true;
+    } else {
+      const shakeThreshold = Math.floor(
+        1048560 / Math.sqrt(Math.sqrt(Math.floor(16711680 / captureValue)))
+      );
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        if (Math.floor(Math.random() * 65536) >= shakeThreshold) {
+          break;
+        }
+        shakes += 1;
+      }
+      caught = shakes === 4;
     }
 
-    return `${side.trainerName} used ${item.name}.`;
+    this.pushEvent(
+      battle,
+      {
+        kind: "catch-attempt",
+        pokemonId: wildPokemon.id,
+        pokemonName: getPokemonDisplayName(wildPokemon),
+        ballName: item.name,
+        shakes,
+        caught
+      },
+      caught
+        ? `Gotcha! ${getPokemonDisplayName(wildPokemon)} was caught!`
+        : shakes === 0
+          ? `Oh no! ${getPokemonDisplayName(wildPokemon)} broke free immediately!`
+          : `Oh no! ${getPokemonDisplayName(wildPokemon)} broke free!`
+    );
+    await this.emitBattleStep(battle);
+
+    if (!caught) {
+      return false;
+    }
+
+    const caughtSummary: PokemonSummary = {
+      id: crypto.randomUUID(),
+      sourcePokemonId: wildPokemon.sourcePokemonId,
+      name: wildPokemon.name,
+      level: wildPokemon.level,
+      types: wildPokemon.types,
+      hp: Math.max(1, wildPokemon.hp),
+      maxHp: wildPokemon.maxHp,
+      moves: wildPokemon.moves.map((move) => move.name),
+      movePp: wildPokemon.moves.reduce<Record<string, number>>((accumulator, move) => {
+        accumulator[move.name] = move.currentPp;
+        return accumulator;
+      }, {}),
+      experience: 0,
+      experienceCurve: "medium",
+      nextLevelExperience: this.getExperienceRequirement(
+        wildPokemon,
+        wildPokemon.level,
+        await this.getLevelingCurveConfig()
+      ),
+      statBonuses: createEmptyPokemonStatBonuses(),
+      ivs: { ...wildPokemon.ivs },
+      evs: { ...wildPokemon.evs },
+      status: wildPokemon.status ? { ...wildPokemon.status } : undefined,
+      heldItemId: undefined,
+      heldItemName: undefined
+    };
+
+    side.party.push({ ...wildPokemon, id: caughtSummary.id, originalSummary: caughtSummary });
+    await this.finishBattle(battle, `${getPokemonDisplayName(wildPokemon)} was caught!`, side, opponent);
+    return true;
+  }
+
+  private async getLevelingCurveConfig() {
+    const catalogs = await this.loadCatalogs();
+    return catalogs.levelingCurveConfig;
   }
 
   private cachedItemDefinitions: ItemDefinition[] = [];
@@ -1894,41 +3422,515 @@ export default class BattleManager {
     return true;
   }
 
-  private applyMoveAction(side: BattleSide, target: BattleSide, moveId: string) {
-    const attackerPokemon = getActivePokemon(side);
-    const targetPokemon = getActivePokemon(target);
-    const move = attackerPokemon.moves.find((candidate) => candidate.id === moveId);
+  private async executeMoveAction(
+    battle: BattleSession,
+    side: BattleSide,
+    target: BattleSide,
+    moveId: string
+  ) {
+    const attacker = getActivePokemon(side);
+    const defender = getActivePokemon(target);
+    const move = attacker.moves.find((candidate) => candidate.id === moveId);
+    const attackerName = getPokemonDisplayName(attacker);
+    const defenderName = getPokemonDisplayName(defender);
 
     if (!move || move.currentPp <= 0) {
-      return `${getPokemonDisplayName(attackerPokemon)} had no skill to use.`;
+      this.say(battle, `${attackerName} had no skill to use.`);
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    if (attacker.volatile.flinched) {
+      this.pushEvent(
+        battle,
+        { kind: "flinch", sideId: side.id, pokemonId: attacker.id },
+        `${attackerName} flinched and couldn't move!`
+      );
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    const statusCheck = checkStatusBeforeMove(attacker.status, attackerName);
+    if (statusCheck.cured && attacker.status) {
+      this.pushEvent(
+        battle,
+        { kind: "status-cured", sideId: side.id, pokemonId: attacker.id, status: attacker.status.id },
+        statusCheck.message
+      );
+      attacker.status = null;
+    } else if (statusCheck.message) {
+      this.say(battle, statusCheck.message);
+    }
+    if (!statusCheck.canMove) {
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    if (attacker.volatile.confusionTurns > 0) {
+      attacker.volatile.confusionTurns -= 1;
+      if (attacker.volatile.confusionTurns <= 0) {
+        this.pushEvent(
+          battle,
+          { kind: "confusion-end", sideId: side.id, pokemonId: attacker.id },
+          `${attackerName} snapped out of its confusion!`
+        );
+      } else {
+        this.say(battle, `${attackerName} is confused!`);
+        if (Math.random() < 0.5) {
+          const confusionDamage = this.calculateConfusionDamage(attacker);
+          attacker.hp = Math.max(0, attacker.hp - confusionDamage);
+          this.pushEvent(
+            battle,
+            {
+              kind: "damage",
+              sideId: side.id,
+              pokemonId: attacker.id,
+              amount: confusionDamage,
+              hpAfter: attacker.hp,
+              maxHp: attacker.maxHp,
+              effectiveness: 1,
+              critical: false,
+              source: "confusion"
+            },
+            `${attackerName} hurt itself in its confusion!`
+          );
+          await this.emitBattleStep(battle);
+          return;
+        }
+      }
     }
 
     move.currentPp -= 1;
+    const spec = parseMoveEffect(resolveFunctionCode(move.functionCode ?? ""));
+    this.pushEvent(
+      battle,
+      {
+        kind: "move-used",
+        sideId: side.id,
+        pokemonId: attacker.id,
+        moveId: move.id,
+        moveName: move.name,
+        moveType: move.type,
+        skillGfxId: move.skillGfxId || null,
+        skillGfxName: move.skillGfxName || null,
+        animationId: move.animationId || null,
+        animationName: move.animationName || null
+      },
+      `${attackerName} used ${move.name}!`
+    );
 
-    if (move.accuracy < 100 && Math.random() * 100 > move.accuracy) {
-      return `${getPokemonDisplayName(attackerPokemon)} used ${move.name}, but it missed.`;
+    if (spec.protectUser) {
+      attacker.volatile.protected = true;
+      this.say(battle, `${attackerName} protected itself!`);
+      await this.emitBattleStep(battle);
+      return;
     }
 
-    if (move.damageClass === "status" || move.power <= 0) {
-      return `${getPokemonDisplayName(attackerPokemon)} used ${move.name}.`;
+    const isDamaging = move.damageClass !== "status" && (move.power > 0 || spec.fixedDamage !== null || spec.ohko);
+    const affectsTarget =
+      isDamaging ||
+      spec.statChanges.some((change) => change.target === "target") ||
+      (spec.status !== null && spec.status.target === "target") ||
+      spec.confuseTarget ||
+      spec.resetTargetStats;
+
+    if (affectsTarget && defender.volatile.protected) {
+      this.say(battle, `${defenderName} protected itself!`);
+      await this.emitBattleStep(battle);
+      return;
     }
 
-    const damage = this.calculateDamage(attackerPokemon, targetPokemon, move);
-    targetPokemon.hp = Math.max(0, targetPokemon.hp - damage);
-    const effectiveness = getMoveEffectiveness(move.type, targetPokemon.types);
-    const effectivenessText =
-      effectiveness === 0
-        ? " It had no effect."
-        : effectiveness > 1
-          ? " It was super effective."
-          : effectiveness < 1
-            ? " It was not very effective."
-            : "";
+    if (affectsTarget && !this.rollAccuracy(attacker, defender, move, spec)) {
+      this.pushEvent(
+        battle,
+        { kind: "move-missed", sideId: side.id, pokemonId: attacker.id, moveName: move.name },
+        `${attackerName}'s attack missed!`
+      );
+      await this.emitBattleStep(battle);
+      return;
+    }
 
-    return `${getPokemonDisplayName(attackerPokemon)} used ${move.name} for ${damage} damage.${effectivenessText}`;
+    let totalDamage = 0;
+    if (isDamaging) {
+      const effectiveness = this.getEffectiveness(move.type, defender.types);
+      if (effectiveness === 0) {
+        this.say(battle, `It doesn't affect ${defenderName}...`);
+        await this.emitBattleStep(battle);
+        return;
+      }
+
+      const result = this.applyDamagePhase(battle, side, target, attacker, defender, move, spec, effectiveness);
+      totalDamage = result.totalDamage;
+
+      if (result.hits > 1) {
+        this.say(battle, `Hit ${result.hits} time(s)!`);
+      }
+      if (result.anyCritical) {
+        this.say(battle, "A critical hit!");
+      }
+      if (effectiveness > 1) {
+        this.say(battle, "It's super effective!");
+      } else if (effectiveness < 1) {
+        this.say(battle, "It's not very effective...");
+      }
+
+      if (spec.drainFraction > 0 && totalDamage > 0 && attacker.hp > 0 && attacker.hp < attacker.maxHp) {
+        const healed = Math.max(1, Math.floor(totalDamage * spec.drainFraction));
+        attacker.hp = Math.min(attacker.maxHp, attacker.hp + healed);
+        this.pushEvent(
+          battle,
+          {
+            kind: "heal",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: healed,
+            hpAfter: attacker.hp,
+            maxHp: attacker.maxHp,
+            source: "move"
+          },
+          `${defenderName} had its energy drained!`
+        );
+      }
+
+      if (spec.recoilFraction > 0 && totalDamage > 0) {
+        const recoil = Math.max(1, Math.floor(totalDamage * spec.recoilFraction));
+        attacker.hp = Math.max(0, attacker.hp - recoil);
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: recoil,
+            hpAfter: attacker.hp,
+            maxHp: attacker.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "recoil"
+          },
+          `${attackerName} was damaged by the recoil!`
+        );
+      }
+    }
+
+    const isPureStatusMove = !isDamaging;
+    const secondaryChance = isPureStatusMove ? 100 : move.effectChance > 0 ? move.effectChance : 100;
+    const applySecondary =
+      (isPureStatusMove || totalDamage > 0) && Math.random() * 100 < secondaryChance;
+
+    if (applySecondary) {
+      this.applyMoveEffects(battle, side, target, attacker, defender, spec, isPureStatusMove);
+    }
+
+    if (isPureStatusMove && !spec.recognized) {
+      this.say(battle, "But nothing happened...");
+    }
+
+    await this.emitBattleStep(battle);
   }
 
-  private calculateDamage(attacker: BattlePokemon, defender: BattlePokemon, move: BattleMove) {
+  private applyDamagePhase(
+    battle: BattleSession,
+    side: BattleSide,
+    target: BattleSide,
+    attacker: BattlePokemon,
+    defender: BattlePokemon,
+    move: BattleMove,
+    spec: MoveEffectSpec,
+    effectiveness: number
+  ) {
+    let hits = 1;
+    if (spec.multiHit) {
+      hits = rollMultiHitCount(spec.multiHit);
+    }
+
+    let totalDamage = 0;
+    let landedHits = 0;
+    let anyCritical = false;
+
+    for (let hit = 0; hit < hits && !isFainted(defender) && !isFainted(attacker); hit += 1) {
+      let damage = 0;
+      let critical = false;
+
+      if (spec.ohko) {
+        if (attacker.level < defender.level) {
+          this.say(battle, `It failed to affect ${getPokemonDisplayName(defender)}!`);
+          break;
+        }
+        damage = defender.hp;
+      } else if (spec.fixedDamage) {
+        damage =
+          spec.fixedDamage.kind === "amount"
+            ? spec.fixedDamage.amount
+            : spec.fixedDamage.kind === "user-level"
+              ? attacker.level
+              : Math.max(1, Math.floor(defender.hp / 2));
+      } else {
+        critical = this.rollCritical(move, spec);
+        damage = this.calculateDamage(attacker, defender, move, effectiveness, critical);
+      }
+
+      damage = Math.max(1, Math.floor(damage));
+      defender.hp = Math.max(0, defender.hp - damage);
+      totalDamage += damage;
+      landedHits += 1;
+      anyCritical = anyCritical || critical;
+
+      this.pushEvent(
+        battle,
+        {
+          kind: "damage",
+          sideId: target.id,
+          pokemonId: defender.id,
+          amount: damage,
+          hpAfter: defender.hp,
+          maxHp: defender.maxHp,
+          effectiveness,
+          critical,
+          source: "move"
+        },
+        `${getPokemonDisplayName(defender)} took ${damage} damage.`
+      );
+    }
+
+    return { totalDamage, hits: landedHits, anyCritical };
+  }
+
+  private applyMoveEffects(
+    battle: BattleSession,
+    side: BattleSide,
+    target: BattleSide,
+    attacker: BattlePokemon,
+    defender: BattlePokemon,
+    spec: MoveEffectSpec,
+    isPureStatusMove: boolean
+  ) {
+    const viaSecondary = !isPureStatusMove;
+
+    spec.statChanges.forEach((change) => {
+      const receiverSide = change.target === "user" ? side : target;
+      const receiver = change.target === "user" ? attacker : defender;
+      if (!isFainted(receiver) || change.target === "user") {
+        this.applyStatStageChange(battle, receiverSide, receiver, change.stat, change.delta, viaSecondary);
+      }
+    });
+
+    if (spec.healUserFraction > 0) {
+      const healed = Math.max(1, Math.floor(attacker.maxHp * spec.healUserFraction));
+      const beforeHp = attacker.hp;
+      attacker.hp = Math.min(attacker.maxHp, attacker.hp + healed);
+      if (attacker.hp > beforeHp) {
+        this.pushEvent(
+          battle,
+          {
+            kind: "heal",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: attacker.hp - beforeHp,
+            hpAfter: attacker.hp,
+            maxHp: attacker.maxHp,
+            source: "move"
+          },
+          `${getPokemonDisplayName(attacker)} regained health!`
+        );
+      } else if (isPureStatusMove) {
+        this.say(battle, `${getPokemonDisplayName(attacker)}'s HP is already full!`);
+      }
+
+      if (spec.sleepUserAfterFullHeal && attacker.hp > beforeHp) {
+        attacker.status = { id: "sleep", counter: 2 };
+        this.pushEvent(
+          battle,
+          { kind: "status-applied", sideId: side.id, pokemonId: attacker.id, status: "sleep" },
+          `${getPokemonDisplayName(attacker)} slept and became healthy!`
+        );
+      }
+    }
+
+    if (spec.status && !spec.sleepUserAfterFullHeal) {
+      const receiverSide = spec.status.target === "user" ? side : target;
+      const receiver = spec.status.target === "user" ? attacker : defender;
+      const statusId = spec.status.random
+        ? spec.status.random[Math.floor(Math.random() * spec.status.random.length)]
+        : spec.status.id;
+      if (!isFainted(receiver)) {
+        this.applyStatusCondition(battle, receiverSide, receiver, statusId, viaSecondary);
+      }
+    }
+
+    if (spec.confuseTarget && !isFainted(defender)) {
+      if (defender.volatile.confusionTurns > 0) {
+        if (!viaSecondary) {
+          this.say(battle, `${getPokemonDisplayName(defender)} is already confused!`);
+        }
+      } else {
+        defender.volatile.confusionTurns = 2 + Math.floor(Math.random() * 4);
+        this.pushEvent(
+          battle,
+          { kind: "confusion-start", sideId: target.id, pokemonId: defender.id },
+          `${getPokemonDisplayName(defender)} became confused!`
+        );
+      }
+    }
+
+    if (spec.flinchTarget && !isFainted(defender)) {
+      defender.volatile.flinched = true;
+    }
+
+    if (spec.resetTargetStats) {
+      defender.stages = createEmptyStages();
+      this.say(battle, `${getPokemonDisplayName(defender)}'s stat changes were removed!`);
+    }
+
+    if (spec.resetAllStats) {
+      attacker.stages = createEmptyStages();
+      defender.stages = createEmptyStages();
+      this.say(battle, "All stat changes were eliminated!");
+    }
+  }
+
+  private applyStatStageChange(
+    battle: BattleSession,
+    side: BattleSide,
+    pokemon: BattlePokemon,
+    stat: BattleStageKey,
+    delta: number,
+    viaSecondary: boolean
+  ) {
+    const current = pokemon.stages[stat];
+    const next = clamp(current + delta, -6, 6);
+    const actual = next - current;
+    const displayName = getPokemonDisplayName(pokemon);
+    const statLabel = STAGE_DISPLAY_NAMES[stat];
+
+    if (actual === 0) {
+      if (!viaSecondary) {
+        this.say(
+          battle,
+          delta > 0
+            ? `${displayName}'s ${statLabel} won't go any higher!`
+            : `${displayName}'s ${statLabel} won't go any lower!`
+        );
+      }
+      return;
+    }
+
+    pokemon.stages[stat] = next;
+    const magnitudeText =
+      actual >= 3 ? "rose drastically" :
+      actual === 2 ? "rose sharply" :
+      actual === 1 ? "rose" :
+      actual === -1 ? "fell" :
+      actual === -2 ? "harshly fell" : "severely fell";
+
+    this.pushEvent(
+      battle,
+      {
+        kind: "stat-change",
+        sideId: side.id,
+        pokemonId: pokemon.id,
+        stat,
+        delta: actual,
+        stageAfter: next
+      },
+      `${displayName}'s ${statLabel} ${magnitudeText}!`
+    );
+  }
+
+  private applyStatusCondition(
+    battle: BattleSession,
+    side: BattleSide,
+    pokemon: BattlePokemon,
+    statusId: BattleStatusId,
+    viaSecondary: boolean
+  ) {
+    const displayName = getPokemonDisplayName(pokemon);
+
+    if (pokemon.status) {
+      if (!viaSecondary) {
+        this.say(battle, `${displayName} is already ${STATUS_DISPLAY_NAMES[pokemon.status.id]}!`);
+      }
+      return;
+    }
+
+    const typeIds = pokemon.types.map((type) => resolveTypeId(this.typeChart, type));
+    if (isImmuneToStatus(statusId, typeIds)) {
+      if (!viaSecondary) {
+        this.say(battle, `It doesn't affect ${displayName}...`);
+      }
+      return;
+    }
+
+    pokemon.status = createStatusState(statusId);
+    const statusText: Record<BattleStatusId, string> = {
+      poison: `${displayName} was poisoned!`,
+      toxic: `${displayName} was badly poisoned!`,
+      burn: `${displayName} was burned!`,
+      paralysis: `${displayName} is paralyzed! It may be unable to move!`,
+      sleep: `${displayName} fell asleep!`,
+      freeze: `${displayName} was frozen solid!`
+    };
+
+    this.pushEvent(
+      battle,
+      { kind: "status-applied", sideId: side.id, pokemonId: pokemon.id, status: statusId },
+      statusText[statusId]
+    );
+
+    this.applyHeldItemTriggers(battle, side, pokemon);
+  }
+
+  private rollAccuracy(
+    attacker: BattlePokemon,
+    defender: BattlePokemon,
+    move: BattleMove,
+    spec: MoveEffectSpec
+  ): boolean {
+    if (spec.ohko) {
+      const chance = 30 + (attacker.level - defender.level);
+      return Math.random() * 100 < chance;
+    }
+
+    if (move.accuracy <= 0) {
+      return true;
+    }
+
+    const stageDelta = clamp(attacker.stages.accuracy - defender.stages.evasion, -6, 6);
+    const chance = move.accuracy * getAccuracyStageMultiplier(stageDelta);
+    return Math.random() * 100 < chance;
+  }
+
+  private rollCritical(move: BattleMove, spec: MoveEffectSpec): boolean {
+    if (spec.alwaysCrit) {
+      return true;
+    }
+
+    const flags = (move.flags ?? []).map((flag) => flag.toLowerCase());
+    const highCritRate = flags.includes("h") || flags.includes("highcriticalhitrate");
+    return Math.random() < (highCritRate ? 1 / 8 : 1 / 16);
+  }
+
+  private getEffectiveness(moveType: string, defenderTypes: string[]) {
+    return getTypeEffectiveness(this.typeChart, moveType, defenderTypes);
+  }
+
+  private calculateConfusionDamage(pokemon: BattlePokemon) {
+    const attackStat = this.getModifiedStat(pokemon, "attack");
+    const defenseStat = this.getModifiedStat(pokemon, "defense");
+    const baseDamage =
+      Math.floor(
+        Math.floor((Math.floor((2 * pokemon.level) / 5 + 2) * 40 * attackStat) / Math.max(1, defenseStat)) / 50
+      ) + 2;
+    return Math.max(1, Math.floor(baseDamage * (0.85 + Math.random() * 0.15)));
+  }
+
+  private calculateDamage(
+    attacker: BattlePokemon,
+    defender: BattlePokemon,
+    move: BattleMove,
+    effectiveness: number,
+    critical: boolean
+  ) {
     const attackStat =
       move.damageClass === "physical"
         ? this.getModifiedStat(attacker, "attack")
@@ -1940,11 +3942,10 @@ export default class BattleManager {
     const baseDamage = Math.floor(
       Math.floor((Math.floor((2 * attacker.level) / 5 + 2) * move.power * attackStat) / Math.max(1, defenseStat)) / 50
     ) + 2;
-    const stab = attacker.types.map(normalizeType).includes(normalizeType(move.type)) ? 1.5 : 1;
-    const effectiveness = getMoveEffectiveness(move.type, defender.types);
-    const critical = Math.random() < 1 / 24 ? 1.5 : 1;
+    const stab = attacker.types.some((type) => isSameType(this.typeChart, type, move.type)) ? 1.5 : 1;
+    const criticalMultiplier = critical ? 1.5 : 1;
     const randomFactor = 0.85 + Math.random() * 0.15;
-    const modifier = stab * effectiveness * critical * randomFactor;
+    const modifier = stab * effectiveness * criticalMultiplier * randomFactor;
 
     if (effectiveness === 0) {
       return 0;
@@ -1953,8 +3954,11 @@ export default class BattleManager {
     return Math.max(1, Math.floor(baseDamage * modifier));
   }
 
-  private getModifiedStat(pokemon: BattlePokemon, stat: keyof BattleStatStages) {
-    return Math.max(1, Math.floor(pokemon.stats[stat] * getStageMultiplier(pokemon.stages[stat])));
+  private getModifiedStat(pokemon: BattlePokemon, stat: Exclude<BattleStageKey, "accuracy" | "evasion">) {
+    const stageValue = Math.floor(pokemon.stats[stat] * getStageMultiplier(pokemon.stages[stat]));
+    const statusMultiplier =
+      stat === "attack" || stat === "speed" ? getStatusStatMultiplier(pokemon.status, stat) : 1;
+    return Math.max(1, Math.floor(stageValue * statusMultiplier));
   }
 
   private tryEscape(side: BattleSide, opponent: BattleSide) {
@@ -1995,23 +3999,23 @@ export default class BattleManager {
   }
 
   private hasAvailablePokemon(side: BattleSide) {
-    const activeIndex = side.party.findIndex((pokemon) => !isFainted(pokemon));
-    if (activeIndex < 0) {
-      return false;
-    }
-
-    side.activeIndex = activeIndex;
-    return true;
+    // Pure check: it must NOT touch activeIndex. finishBattle calls this on
+    // every side, and the old index reset snapped the display back to the
+    // first party slot at battle end (e.g. right after a catch).
+    return side.party.some((pokemon) => !isFainted(pokemon));
   }
 
   private async loadCatalogs() {
-    const [pokemonPayload, skillsPayload, itemsPayload, levelingCurvePayload, npcsPayload] = await Promise.all([
+    const [pokemonPayload, skillsPayload, itemsPayload, levelingCurvePayload, npcsPayload, typesPayload] = await Promise.all([
       this.designerSectionStore.read("pokemons"),
       this.designerSectionStore.read("skills"),
       this.designerSectionStore.read("items"),
       this.designerSectionStore.read("levelingCurve"),
-      this.designerSectionStore.read("npcs")
+      this.designerSectionStore.read("npcs"),
+      this.designerSectionStore.read("types")
     ]);
+
+    this.typeChart = buildTypeChart(typesPayload?.state.items ?? []);
     const skillsById = new Map<string, SkillDefinition>();
     const skillsByName = new Map<string, SkillDefinition>();
     const pokemonById = new Map<string, PokemonDefinition>();
@@ -2050,6 +4054,7 @@ export default class BattleManager {
 
   private toPokemonDefinition(item: DesignerSectionItem): PokemonDefinition | null {
     const profile = item.pokemonProfile as {
+      essentialsId?: unknown;
       hp?: unknown;
       attack?: unknown;
       defense?: unknown;
@@ -2058,6 +4063,11 @@ export default class BattleManager {
       speed?: unknown;
       elements?: unknown;
       skills?: unknown;
+      growthRate?: unknown;
+      baseExp?: unknown;
+      catchRate?: unknown;
+      evs?: unknown;
+      evolutions?: unknown;
       frontImageSrc?: unknown;
       backImageSrc?: unknown;
     } | undefined;
@@ -2085,9 +4095,40 @@ export default class BattleManager {
           }))
       : [];
 
+    const evYield: Partial<Record<BattleStatKey, number>> = {};
+    if (Array.isArray(profile.evs)) {
+      profile.evs.forEach((entry) => {
+        const candidate = entry as { stat?: unknown; value?: unknown };
+        if (typeof candidate.stat !== "string" || typeof candidate.value !== "number") {
+          return;
+        }
+        const statKey = normalizeStatKey(candidate.stat);
+        if (statKey && Number.isFinite(candidate.value) && candidate.value > 0) {
+          evYield[statKey] = Math.round(candidate.value);
+        }
+      });
+    }
+
+    const evolutions: PokemonEvolutionDefinition[] = Array.isArray(profile.evolutions)
+      ? profile.evolutions
+          .map((entry) => {
+            const candidate = entry as { targetId?: unknown; method?: unknown; parameter?: unknown };
+            if (typeof candidate.targetId !== "string" || typeof candidate.method !== "string") {
+              return null;
+            }
+            const parameter =
+              typeof candidate.parameter === "number" || typeof candidate.parameter === "string"
+                ? candidate.parameter
+                : null;
+            return { targetId: candidate.targetId, method: candidate.method, parameter };
+          })
+          .filter((entry): entry is PokemonEvolutionDefinition => Boolean(entry))
+      : [];
+
     return {
       id: item.id,
       name: item.name,
+      essentialsId: normalizeText(profile.essentialsId),
       types,
       baseStats: {
         hp: Math.max(1, parseNumber(profile.hp, 1)),
@@ -2097,6 +4138,11 @@ export default class BattleManager {
         specialDefense: Math.max(1, parseNumber(profile.specialDefense, 1)),
         speed: Math.max(1, parseNumber(profile.speed, 1))
       },
+      growthRate: normalizeGrowthRate(profile.growthRate),
+      baseExp: Math.max(0, parseNumber(profile.baseExp, 0)),
+      catchRate: Math.max(0, parseNumber(profile.catchRate, 0)),
+      evYield,
+      evolutions,
       skills,
       frontImageSrc: normalizeText(profile.frontImageSrc),
       backImageSrc: normalizeText(profile.backImageSrc)
@@ -2114,6 +4160,7 @@ export default class BattleManager {
       functionCode?: unknown;
       flags?: unknown;
       priority?: unknown;
+      effectChance?: unknown;
       description?: unknown;
       effectText?: unknown;
       skillGfxId?: unknown;
@@ -2153,6 +4200,7 @@ export default class BattleManager {
             .filter(Boolean)
         : [],
       priority: Math.round(parseNumber(profile.priority, 0)),
+      effectChance: clamp(parseNumber(profile.effectChance, 0), 0, 100),
       description: typeof profile.description === "string" ? profile.description : "",
       effectText: typeof profile.effectText === "string" ? profile.effectText : "",
       skillGfxId: typeof profile.skillGfxId === "string" ? profile.skillGfxId : "",
@@ -2164,11 +4212,16 @@ export default class BattleManager {
 
   private toItemDefinition(item: DesignerSectionItem): ItemDefinition | null {
     const profile = item.itemProfile as {
+      essentialsId?: unknown;
       type?: unknown;
+      pocket?: unknown;
       description?: unknown;
       iconSrc?: unknown;
       skillId?: unknown;
       skillName?: unknown;
+      effectKind?: unknown;
+      useCondition?: unknown;
+      pokeballBonusRatio?: unknown;
       statModifiers?: {
         hp?: unknown;
         attack?: unknown;
@@ -2183,23 +4236,54 @@ export default class BattleManager {
       return null;
     }
 
+    const essentialsId = normalizeText(profile.essentialsId).toUpperCase();
+    const effectKind = normalizeText(profile.effectKind);
+    const useCondition = normalizeText(profile.useCondition);
+    const pocket = normalizeText(profile.pocket).toLowerCase();
+    const pokeballBonusRatio =
+      typeof profile.pokeballBonusRatio === "number" && Number.isFinite(profile.pokeballBonusRatio)
+        ? Math.max(0, profile.pokeballBonusRatio)
+        : 0;
+    const isPokeball =
+      effectKind.toLowerCase() === "pokeball" ||
+      pocket.includes("ball") ||
+      /(?:^|[^A-Z])BALL$/.test(essentialsId) ||
+      pokeballBonusRatio > 0;
+
+    const statModifiers = {
+      hp: parseNumber(profile.statModifiers.hp, 0),
+      attack: parseNumber(profile.statModifiers.attack, 0),
+      defense: parseNumber(profile.statModifiers.defense, 0),
+      specialAttack: parseNumber(profile.statModifiers.specialAttack, 0),
+      specialDefense: parseNumber(profile.statModifiers.specialDefense, 0),
+      speed: parseNumber(profile.statModifiers.speed, 0)
+    };
+
+    const cures = STATUS_CURE_ITEMS[essentialsId] ?? null;
+
     return {
       id: item.id,
       name: item.name,
+      essentialsId,
       type: normalizeText(profile.type),
       category: toInventoryCategory(normalizeText(profile.type)),
       description: typeof profile.description === "string" ? profile.description : "",
       iconSrc: typeof profile.iconSrc === "string" ? profile.iconSrc : "",
       skillId: typeof profile.skillId === "string" ? profile.skillId : "",
       skillName: typeof profile.skillName === "string" ? profile.skillName : "",
-      statModifiers: {
-        hp: parseNumber(profile.statModifiers.hp, 0),
-        attack: parseNumber(profile.statModifiers.attack, 0),
-        defense: parseNumber(profile.statModifiers.defense, 0),
-        specialAttack: parseNumber(profile.statModifiers.specialAttack, 0),
-        specialDefense: parseNumber(profile.statModifiers.specialDefense, 0),
-        speed: parseNumber(profile.statModifiers.speed, 0)
-      }
+      effectKind,
+      useCondition,
+      isPokeball,
+      pokeballBonusRatio,
+      curesStatuses: cures ? cures.statuses : effectKind.toLowerCase() === "cure-status" ? "any" : null,
+      curesConfusion: cures ? cures.confusion : effectKind.toLowerCase() === "cure-status",
+      heldEffect: resolveHeldItemEffect({
+        essentialsId,
+        effectKind,
+        useCondition,
+        healAmount: statModifiers.hp
+      }),
+      statModifiers
     };
   }
 
@@ -2208,6 +4292,10 @@ export default class BattleManager {
       npcType?: unknown;
       healPrice?: unknown;
       storeItems?: unknown;
+      trainerTypeId?: unknown;
+      trainerTypeName?: unknown;
+      loseText?: unknown;
+      trainerPokemons?: unknown;
     } | undefined;
 
     if (!profile) {
@@ -2259,12 +4347,42 @@ export default class BattleManager {
           }))
       : [];
 
+    const trainerPokemons: NpcTrainerPokemonDefinition[] = Array.isArray(profile.trainerPokemons)
+      ? profile.trainerPokemons
+          .map((entry) => {
+            const candidate = entry as {
+              pokemonId?: unknown;
+              pokemonName?: unknown;
+              level?: unknown;
+              moves?: unknown;
+              itemId?: unknown;
+            };
+            if (typeof candidate.pokemonId !== "string" || candidate.pokemonId.length === 0) {
+              return null;
+            }
+            return {
+              pokemonId: candidate.pokemonId,
+              pokemonName: normalizeText(candidate.pokemonName),
+              level: clamp(parseNumber(candidate.level, 5), 1, 100),
+              moves: Array.isArray(candidate.moves)
+                ? candidate.moves.filter((move): move is string => typeof move === "string")
+                : [],
+              itemId: typeof candidate.itemId === "string" ? candidate.itemId : ""
+            };
+          })
+          .filter((entry): entry is NpcTrainerPokemonDefinition => Boolean(entry))
+      : [];
+
     return {
       id: item.id,
       name: item.name,
       npcType,
       healPrice: Math.max(0, parseNumber(profile.healPrice, 0)),
       storeItems,
+      trainerTypeId: normalizeText(profile.trainerTypeId),
+      trainerTypeName: normalizeText(profile.trainerTypeName),
+      loseText: normalizeText(profile.loseText),
+      trainerPokemons
     };
   }
 
@@ -2292,7 +4410,8 @@ export default class BattleManager {
       money: user.money,
       inventory: user.inventory.map((item) => ({ ...item })),
       party,
-      activeIndex: 0,
+      // Start with the first mon able to battle (a fainted lead can't open).
+      activeIndex: Math.max(0, party.findIndex((pokemon) => !isFainted(pokemon))),
       action: null,
       escapeAttempts: 0
     };
@@ -2306,6 +4425,8 @@ export default class BattleManager {
   ): BattlePokemon {
     const level = clamp(pokemon.level, 1, 100);
     const statBonuses = sanitizePokemonStatBonuses(pokemon.statBonuses);
+    const ivs = sanitizeBattleStats(pokemon.ivs, 31);
+    const evs = sanitizeBattleStats(pokemon.evs, MAX_EV_PER_STAT);
     const baseStats = definition?.baseStats ?? {
       hp: pokemon.maxHp,
       attack: Math.max(1, pokemon.maxHp),
@@ -2314,7 +4435,7 @@ export default class BattleManager {
       specialDefense: Math.max(1, pokemon.maxHp),
       speed: Math.max(1, pokemon.maxHp)
     };
-    const stats = calculateStats(baseStats, level, statBonuses);
+    const stats = calculateStats(baseStats, level, statBonuses, ivs, evs);
     const learnedMoveNames = pokemon.moves.length > 0
       ? pokemon.moves
       : (definition?.skills ?? [])
@@ -2334,6 +4455,7 @@ export default class BattleManager {
       })
       .filter((move): move is BattleMove => Boolean(move))
       .slice(0, 4);
+    const growthRate = definition?.growthRate ?? null;
 
     return {
       id: pokemon.id,
@@ -2344,10 +4466,24 @@ export default class BattleManager {
       types: pokemon.types.length > 0 ? pokemon.types.map(normalizeType) : definition?.types ?? [],
       hp: clamp(pokemon.hp, 0, stats.hp),
       maxHp: stats.hp,
+      experience: Math.max(0, Math.round(pokemon.experience)),
+      nextLevelExperience: Math.max(0, Math.round(pokemon.nextLevelExperience)),
+      growthRate,
+      baseExp: definition?.baseExp ?? 0,
+      catchRate: definition?.catchRate ?? 0,
+      evYield: definition?.evYield ?? {},
       baseStats,
       stats,
       statBonuses,
+      ivs,
+      evs,
       stages: createEmptyStages(),
+      status: sanitizeStatusState(pokemon.status),
+      volatile: createEmptyVolatile(),
+      heldItemId: typeof pokemon.heldItemId === "string" ? pokemon.heldItemId : null,
+      heldItemName: typeof pokemon.heldItemName === "string" ? pokemon.heldItemName : null,
+      learnset: definition?.skills ?? [],
+      evolutions: definition?.evolutions ?? [],
       moves,
       frontImageSrc: definition?.frontImageSrc ?? "",
       backImageSrc: definition?.backImageSrc ?? "",
@@ -2361,7 +4497,9 @@ export default class BattleManager {
     skillsById: Map<string, SkillDefinition>
   ): BattlePokemon {
     const statBonuses = createEmptyPokemonStatBonuses();
-    const stats = calculateStats(definition.baseStats, level, statBonuses);
+    const ivs = rollIvs();
+    const evs = createEmptyBattleStats();
+    const stats = calculateStats(definition.baseStats, level, statBonuses, ivs, evs);
     const moves = definition.skills
       .filter((skill) => skill.level <= level)
       .slice(-4)
@@ -2379,10 +4517,24 @@ export default class BattleManager {
       types: definition.types,
       hp: stats.hp,
       maxHp: stats.hp,
+      experience: 0,
+      nextLevelExperience: 0,
+      growthRate: definition.growthRate,
+      baseExp: definition.baseExp,
+      catchRate: definition.catchRate,
+      evYield: definition.evYield,
       baseStats: definition.baseStats,
       stats,
       statBonuses,
+      ivs,
+      evs,
       stages: createEmptyStages(),
+      status: null,
+      volatile: createEmptyVolatile(),
+      heldItemId: null,
+      heldItemName: null,
+      learnset: definition.skills,
+      evolutions: definition.evolutions,
       moves,
       frontImageSrc: definition.frontImageSrc,
       backImageSrc: definition.backImageSrc
@@ -2416,7 +4568,8 @@ export default class BattleManager {
         ? "status"
         : skill.category.toLowerCase() === "special"
           ? "special"
-          : "physical"
+          : "physical",
+      effectChance: skill.effectChance
     };
   }
 
@@ -2434,6 +4587,11 @@ export default class BattleManager {
           hp: pokemon.hp,
           maxHp: pokemon.maxHp,
           statBonuses: pokemon.statBonuses,
+          ivs: { ...pokemon.ivs },
+          evs: { ...pokemon.evs },
+          status: pokemon.status ? { ...pokemon.status } : undefined,
+          heldItemId: pokemon.heldItemId ?? undefined,
+          heldItemName: pokemon.heldItemName ?? undefined,
           moves,
           movePp: moves.reduce<Record<string, number>>((accumulator, moveName) => {
             const battleMove = pokemon.moves.find((move) => move.name === moveName);
@@ -2496,15 +4654,32 @@ export default class BattleManager {
       self: this.toPublicSide(self),
       opponent: this.toPublicSide(opponent),
       availableItems: self.inventory
-        .filter((item) => item.quantity > 0 && ["usable", "berries"].includes(item.category))
-        .map((item) => ({
-          id: item.id,
-          name: item.name,
-          category: item.category,
-          quantity: item.quantity,
-          description: item.description,
-          canUse: Boolean(this.getCachedItemDefinition(item.id, item.name))
-        })),
+        .filter((item) => {
+          if (item.quantity <= 0) {
+            return false;
+          }
+          if (["usable", "berries"].includes(item.category)) {
+            return true;
+          }
+          return Boolean(this.getCachedItemDefinition(item.id, item.name)?.isPokeball);
+        })
+        .map((item) => {
+          const definition = this.getCachedItemDefinition(item.id, item.name);
+          const canUse = definition
+            ? definition.isPokeball
+              ? battle.kind === "wild" && self.party.length < MAX_PARTY_SIZE
+              : true
+            : false;
+
+          return {
+            id: item.id,
+            name: item.name,
+            category: item.category,
+            quantity: item.quantity,
+            description: item.description,
+            canUse
+          };
+        }),
       canAct,
       waitingForOpponent: battle.status === "active" && Boolean(self.action) && battle.sides.some((side) => !side.isAi && !side.action),
       selectedActionType,

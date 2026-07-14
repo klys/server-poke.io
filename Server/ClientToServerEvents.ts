@@ -61,7 +61,6 @@ interface AuthUpdateProfilePayload {
 }
 
 interface AuthChooseStarterPayload {
-  gender: string;
   pokemonId: string;
   nickname: string;
 }
@@ -88,10 +87,17 @@ export default interface ClientToServerEvents {
   "battle:trade-request": (data: BattleTradeRequestPayload) => void;
   "battle:trade-response": (data: BattleTradeResponsePayload) => void;
   "battle:action": (data: BattleActionRequest) => void;
+  "battle:learn-move": (data: { pokemonId: string; moveName: string; replaceMoveName?: string }) => void;
   "inventory:use-item": (data: { itemId: string; targetPokemonId: string }) => void;
   "inventory:teach-move": (data: { itemId: string; targetPokemonId: string }) => void;
+  "inventory:hold-item": (data: { pokemonId: string; itemId: string }) => void;
+  "inventory:take-held-item": (data: { pokemonId: string }) => void;
   "inventory:throw-away": (data: { itemId: string; quantity: number }) => void;
   "npc:heal-party": (data: { npcPlacementId: string }) => void;
+  "npc:battle": (data: { npcPlacementId: string }) => void;
+  "event:interact": (data: { npcPlacementId: string }) => void;
+  "event:advance": (data?: { text?: string }) => void;
+  "event:choice": (data: { index: number }) => void;
   "npc:store-buy": (data: { npcPlacementId: string; itemId: string; quantity: number }) => void;
   "npc:store-sell": (data: { npcPlacementId: string; itemId: string; quantity: number }) => void;
   "pokemon:name": (data: AuthNamePokemonPayload) => void;
@@ -216,6 +222,17 @@ export default interface ClientToServerEvents {
    * Persists the full playable maps snapshot to Redis and publishes a new version.
    */
   "designer:maps:update": (data: { state: PlayableMapsStateSnapshot }) => void;
+
+  /**
+   * Uploads baked map surface images (png/webp/jpeg data URLs) for one map.
+   * Files are stored on disk and served at GET /map-assets/<mapId>/<file>.
+   * `replace` (default true) clears the map's previous asset set first.
+   */
+  "designer:mapAssets:update": (data: {
+    mapId: string;
+    files: Array<{ name?: string; dataUrl: string }>;
+    replace?: boolean;
+  }) => void;
   "admin:users:list": (data?: {
     search?: string;
     page?: number;
@@ -223,11 +240,19 @@ export default interface ClientToServerEvents {
   }) => void;
   "admin:user:get": (data: { userId: number }) => void;
   "admin:user:update": (data: { userId: number; updates: AdminUserUpdatePayload }) => void;
+  "admin:user:reset-progress": (data: { userId: number }) => void;
   "admin:roles:list": () => void;
   "admin:role:update": (data: {
     roleKey: UserRoleKey;
     description?: string;
     permissions?: RolePermission[];
   }) => void;
+  "admin:apikeys:list": () => void;
+  "admin:apikeys:create": (data: {
+    name: string;
+    scopes: Array<"read" | "write" | "admin">;
+    expiresInDays?: number;
+  }) => void;
+  "admin:apikeys:revoke": (data: { id: number }) => void;
   "moderation:maps:list": () => void;
 }

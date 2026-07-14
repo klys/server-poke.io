@@ -27,23 +27,27 @@ jobs:
       - name: Build Docker image
         run: docker build -t "$IMAGE_NAME:${{ github.sha }}" -t "$IMAGE_NAME:latest" .
 
-      - name: Replace running container
+      - name: Deploy with Docker Compose
         run: |
-          docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          # Remove any container left over from the old `docker run` deploy so it
+          # doesn't collide with the compose service's container_name.
+          if ! docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "$CONTAINER_NAME" 2>/dev/null | grep -q .; then
+            docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+          fi
 
-          docker run -d \
-            --name "$CONTAINER_NAME" \
-            --restart unless-stopped \
-            --env-file .env \
-            --network host \
-            "$IMAGE_NAME:${{ github.sha }}"
+          # compose.yml references image: server-poke-io:latest, which we just built.
+          docker compose up -d --force-recreate --remove-orphans
 
       - name: Show container status
         run: |
           sleep 3
-          docker ps --filter "name=$CONTAINER_NAME"
+          docker compose ps
 
           if ! docker ps --filter "name=$CONTAINER_NAME" --filter "status=running" --format '{{.Names}}' | grep -q "^$CONTAINER_NAME$"; then
-            docker logs "$CONTAINER_NAME"
+            docker compose logs
             exit 1
           fi
+
+      - name: Prune old images
+        if: always()
+        run: docker image prune -f

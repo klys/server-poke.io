@@ -21,7 +21,9 @@ export type DesignerSectionKey =
   | "assets"
   | "battleBackgrounds"
   | "audio"
-  | "fonts";
+  | "fonts"
+  | "tilesets"
+  | "battleInterface";
 
 export interface DesignerItemDetail {
   label: string;
@@ -142,6 +144,28 @@ export interface DesignerSkillGfxProfile {
   mediaSrc: string;
   applyTo: string;
   appear: number;
+  essentialsAnimationId?: number;
+  essentialsAnimationIndex?: number;
+  essentialsAnimationName?: string;
+  animationKind?: "sheet" | "record" | "battle-animation" | "other";
+  graphic?: string;
+  sourcePath?: string;
+  outputPath?: string;
+  sheetSourcePath?: string;
+  sheetOutputPath?: string;
+  sourceWidth?: number;
+  sourceHeight?: number;
+  cellSize?: number;
+  columns?: number;
+  rows?: number;
+  frameCount?: number;
+  fps?: number;
+  durationMs?: number;
+  hue?: number;
+  position?: number;
+  speed?: number;
+  warnings?: string[];
+  linkedMoveIds?: string[];
   source?: DesignerEssentialsSourceProfile;
 }
 
@@ -364,6 +388,8 @@ export interface DesignerAssetFrameProfile {
 export interface DesignerAssetProfile {
   assetId: string;
   sourcePath: string;
+  dataUri?: string;
+  imageSrc?: string;
   kind: "image" | "gif" | "sprite-sheet" | "tileset" | "battleback" | "animation" | "ui" | "audio" | "font" | "other";
   width?: number;
   height?: number;
@@ -379,6 +405,12 @@ export interface DesignerBattleBackgroundProfile extends DesignerAssetProfile {
   kind: "battleback";
   environment?: string;
   mapIds?: string[];
+  componentAssetIds?: string[];
+  componentAssets?: Array<DesignerAssetProfile & {
+    role?: string;
+    filename?: string;
+    byteSize?: number;
+  }>;
 }
 
 export interface DesignerAudioProfile {
@@ -395,6 +427,29 @@ export interface DesignerFontProfile {
   assetId: string;
   sourcePath: string;
   familyName?: string;
+  source?: DesignerEssentialsSourceProfile;
+}
+
+export interface DesignerTilesetAutotileSlot {
+  name: string;
+  imageSrc: string;
+}
+
+/**
+ * RPG Maker XP tileset profile. `passages`, `priorities`, and `terrainTags`
+ * are indexed by tile id (autotiles occupy ids 0..383, tileset tiles start at
+ * 384). See MAP_TILEMAP_CONTRACT.md at the workspace root.
+ */
+export interface DesignerTilesetProfile {
+  tileSize: number;
+  tilesetImageSrc: string;
+  tilesetHeightTiles: number;
+  autotiles: Array<DesignerTilesetAutotileSlot | null>;
+  passages: number[];
+  priorities: number[];
+  terrainTags: number[];
+  essentialsTilesetId?: number;
+  tilesetGraphicName?: string;
   source?: DesignerEssentialsSourceProfile;
 }
 
@@ -422,6 +477,8 @@ export interface DesignerSectionItem {
   battleBackgroundProfile?: DesignerBattleBackgroundProfile;
   audioProfile?: DesignerAudioProfile;
   fontProfile?: DesignerFontProfile;
+  tilesetProfile?: DesignerTilesetProfile;
+  battleInterfaceProfile?: unknown;
 }
 
 export interface DesignerSectionState {
@@ -478,7 +535,9 @@ const VALID_SECTION_KEYS: DesignerSectionKey[] = [
   "assets",
   "battleBackgrounds",
   "audio",
-  "fonts"
+  "fonts",
+  "tilesets",
+  "battleInterface"
 ];
 
 export function isDesignerSectionKey(value: unknown): value is DesignerSectionKey {
@@ -593,6 +652,11 @@ function normalizeStoredPayload(
 
 export default class DesignerSectionStore {
   private readonly redis: RedisClientType;
+  // Sections can be tens of MB (maps, assets, pokemons); parsing them from
+  // Redis on every read starves the event loop under client churn. Reads are
+  // cached per section with a short TTL so external importers still land.
+  private readonly cache = new Map<string, { payload: DesignerSectionSyncPayload | null; fetchedAt: number }>();
+  private static CACHE_TTL_MS = 5000;
 
   constructor(redis: RedisClientType) {
     this.redis = redis;
@@ -628,19 +692,28 @@ export default class DesignerSectionStore {
     };
 
     await this.redis.set(getRedisKey(sectionKey), JSON.stringify(payload));
+    this.cache.set(sectionKey, { payload, fetchedAt: Date.now() });
 
     return payload;
   }
 
   async read(sectionKey: DesignerSectionKey): Promise<DesignerSectionSyncPayload | null> {
+    const cached = this.cache.get(sectionKey);
+    if (cached && Date.now() - cached.fetchedAt < DesignerSectionStore.CACHE_TTL_MS) {
+      return cached.payload;
+    }
+
     const raw = await this.redis.get(getRedisKey(sectionKey));
 
     if (!raw) {
+      this.cache.set(sectionKey, { payload: null, fetchedAt: Date.now() });
       return null;
     }
 
     try {
-      return normalizeStoredPayload(sectionKey, JSON.parse(raw));
+      const payload = normalizeStoredPayload(sectionKey, JSON.parse(raw));
+      this.cache.set(sectionKey, { payload, fetchedAt: Date.now() });
+      return payload;
     } catch (error) {
       console.error(`Unable to parse stored designer ${sectionKey} state:`, error);
       return null;

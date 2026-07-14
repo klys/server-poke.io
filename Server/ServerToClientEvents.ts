@@ -6,6 +6,7 @@ import type {
 import type {
   BattlePublicState
 } from "../components/BattleManager";
+import type { BattleEventsPayload } from "../components/battle/events";
 import type {
   DesignerSectionSyncPayload,
   DesignerSectionVersionPayload
@@ -14,6 +15,37 @@ import type {
   PlayableMapsSyncPayload,
   PlayableMapsVersionPayload
 } from "../components/PlayableMapsStore";
+import type { ApiKeySummary } from "../components/PokecraftApiClient";
+
+export type EventStatePayload = {
+  switches: Record<string, boolean>;
+  variables: Record<string, number>;
+  selfSwitches: Record<string, boolean>;
+};
+
+export type EventStepPayload =
+  | { type: "text"; npcName: string; text: string; portraitSrc?: string; portraitPokemonId?: string }
+  | { type: "choices"; npcName: string; text: string; choices: string[]; portraitSrc?: string; portraitPokemonId?: string }
+  | { type: "info"; npcName: string; text: string; portraitSrc?: string; portraitPokemonId?: string }
+  // Asks the player to type a name (e.g. pbTrainerName); answered via
+  // event:advance with { text }.
+  | { type: "nameInput"; npcName: string; text: string; defaultName: string }
+  // Non-blocking presentation cues (RMXP Show/Move/Erase Picture, sounds,
+  // screen fades/tones). The client applies them and does NOT reply.
+  | {
+      type: "picture";
+      op: "show" | "move" | "erase";
+      slot: number;
+      name?: string;
+      origin?: number;
+      x?: number;
+      y?: number;
+      opacity?: number;
+      durationMs?: number;
+    }
+  | { type: "sound"; kind: "SE" | "ME" | "BGM" | "BGS" | "BGMStop" | "BGSStop"; name?: string; volume?: number }
+  | { type: "screen"; effect: "fadeout" | "fadein" | "tone"; durationMs?: number; darken?: number }
+  | { type: "end" };
 
 interface PlayerData {
   playerId: string;
@@ -121,8 +153,11 @@ export default interface ServerToClientEvents {
   "world:item-picked-up": (data: { groundItemId: string }) => void;
   test: (data: { test: string }) => void;
   "battle:state": (data: BattlePublicState) => void;
+  "battle:events": (data: BattleEventsPayload) => void;
   "battle:ended": (data: { battleId: string }) => void;
   "battle:error": (data: { message: string }) => void;
+  "event:step": (data: EventStepPayload) => void;
+  "event:state": (data: EventStatePayload) => void;
   "battle:challenge-received": (data: { challengeId: string; fromPlayerId: string; fromUsername: string }) => void;
   "battle:challenge-sent": (data: { challengeId: string; targetPlayerId: string; targetUsername: string }) => void;
   "battle:challenge-declined": (data: { challengeId: string; targetPlayerId: string }) => void;
@@ -191,9 +226,23 @@ export default interface ServerToClientEvents {
    * Playable map sync error for both game clients and the designer.
    */
   "playableMaps:error": (data: { message: string }) => void;
+
+  /**
+   * Result of a designer:mapAssets:update upload. `path` values are
+   * root-relative asset paths ("/map-assets/<mapId>/<file>") to store in the
+   * map snapshot; clients resolve them against their configured
+   * asset-storage base URL (assetStorageBaseUrl in config.json).
+   */
+  "designer:mapAssets:state": (data: {
+    mapId: string;
+    files: Array<{ name: string; path: string }>;
+  }) => void;
   "admin:users:list": (data: AdminUserListPayload) => void;
   "admin:user:details": (data: { user: AdminUserDetails | null }) => void;
   "admin:roles:list": (data: { roles: RoleDefinitionWithCount[] }) => void;
+  "admin:apikeys:list": (data: { keys: ApiKeySummary[] }) => void;
+  /** One-time reveal of a freshly minted key's plaintext secret. */
+  "admin:apikeys:created": (data: { key: string; meta: ApiKeySummary }) => void;
   "admin:error": (data: { message: string }) => void;
   "moderation:maps:list": (data: {
     maps: Array<{

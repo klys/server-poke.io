@@ -5,12 +5,14 @@ import Auth, {
   type UserRoleKey
 } from "../components/Auth";
 import BattleManager from "../components/BattleManager";
+import EventRuntime from "../components/EventRuntime";
 import DesignerSectionStore, {
   isDesignerSectionKey,
   type DesignerSectionKey,
   type DesignerSectionSyncPayload,
 } from "../components/DesignerSectionStore";
 import type GroundItemStore from "../components/GroundItemStore";
+import type MapAssetStore from "../components/MapAssetStore";
 import PlayableMapsStore, {
   applyPlayableMapsStateToWorld,
   type PlayableMapsSyncPayload,
@@ -19,6 +21,10 @@ import {
   resolveInitialSpawnFromPlayableMapsState,
 } from "../components/PlayableMapsState";
 import World from "../components/world";
+import PokecraftApiClient, {
+  PokecraftApiError,
+  type ApiKeyScope,
+} from "../components/PokecraftApiClient";
 import ClientToServerEvents from "./ClientToServerEvents";
 import InterServerEvents from "./InterServerEvents";
 import ServerToClientEvents from "./ServerToClientEvents";
@@ -167,6 +173,20 @@ function requireModeratorAccess(socket:ServerSocket) {
     "moderation:error",
     "You must be a moderator to use the moderator tools."
   );
+}
+
+/**
+ * Surface a pokecraft-api failure to the admin client. Validation/permission
+ * errors from the API (4xx) carry a safe, human message we can forward; other
+ * failures fall back to a generic message and are logged server-side.
+ */
+function emitApiKeyError(socket:ServerSocket, error:unknown, fallback:string) {
+  if (error instanceof PokecraftApiError && error.status >= 400 && error.status < 500) {
+    socket.emit("admin:error", { message: error.message });
+    return;
+  }
+  console.error("pokecraft-api key operation failed:", error);
+  socket.emit("admin:error", { message: fallback });
 }
 
 function emitPlayableMapsVersion(
@@ -385,7 +405,10 @@ function createConnectionHandler(
   auth:Auth,
   designerSectionStore:DesignerSectionStore,
   playableMapsStore:PlayableMapsStore,
-  battleManager:BattleManager
+  battleManager:BattleManager,
+  eventRuntime:EventRuntime,
+  mapAssetStore?:MapAssetStore,
+  pokecraftApi?:PokecraftApiClient
 ) {
   return (socket:ServerSocket) => {
     console.log("Client connected!", socket.id);
@@ -692,7 +715,13 @@ function createConnectionHandler(
       const sectionKey = data.sectionKey;
       const canReadSharedSection =
         socket.data.authenticated &&
-        (sectionKey === "pokemons" || sectionKey === "npcs" || sectionKey === "players");
+        (sectionKey === "pokemons" ||
+          sectionKey === "npcs" ||
+          sectionKey === "players" ||
+          sectionKey === "skillsGfx" ||
+          sectionKey === "audio" ||
+          sectionKey === "types" ||
+          sectionKey === "battleInterface");
 
       if (!canReadSharedSection && !requireDesignerSectionAccess(socket)) {
         return;
@@ -832,6 +861,32 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("designer:mapAssets:update", async (data) => {
+      if (!requireDesignerMapsAccess(socket)) {
+        return;
+      }
+
+      if (!mapAssetStore) {
+        socket.emit("playableMaps:error", {
+          message: "Map asset storage is not available on this server."
+        });
+        return;
+      }
+
+      try {
+        const files = await mapAssetStore.saveFiles(data.mapId, data.files, {
+          replace: data.replace !== false
+        });
+
+        socket.emit("designer:mapAssets:state", { mapId: data.mapId, files });
+      } catch (error) {
+        console.error("Unable to save map assets:", error);
+        socket.emit("playableMaps:error", {
+          message: "Unable to save the baked map assets."
+        });
+      }
+    });
+
     socket.on("admin:users:list", async (data) => {
       try {
         if (!socket.data.authenticated && readSocketToken(socket)) {
@@ -942,6 +997,79 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("admin:user:reset-progress", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", {
+            message: "Choose a valid user."
+          });
+          return;
+        }
+
+        const player = world.getPlayerByUserId(userId);
+        if (player && battleManager.isPlayerBattling(player.socketId)) {
+          socket.emit("admin:error", {
+            message: "That trainer is battling right now. Wait for the battle to end before resetting."
+          });
+          return;
+        }
+
+        const result = await auth.resetUserProgress(userId);
+        if ("error" in result) {
+          socket.emit("admin:error", {
+            message: result.error
+          });
+          return;
+        }
+
+        // If the trainer is online, send them straight to the initial spawn.
+        if (player) {
+          const playableMapsState = world.getPlayableMapsState();
+          const spawn = playableMapsState
+            ? resolveInitialSpawnFromPlayableMapsState(playableMapsState)
+            : null;
+          if (spawn) {
+            player.teleport(spawn.mapId, spawn.x, spawn.y);
+            world.players.set(player.socketId, player);
+            world.presentPlayerToMap(player);
+            player.socketConnections.forEach((socketId) => {
+              world.presentPlayersOnMapTo(socketId, player.currentMapId);
+            });
+          }
+          // Reset cleared all event switches — refresh the client's copy so
+          // conditional NPCs return to their new-game state.
+          void eventRuntime.emitEventState(userId);
+        }
+
+        socket.emit("admin:user:details", {
+          user: result.user
+        });
+        socket.emit("auth:info", {
+          message: `Reset ${result.user.username}'s adventure to the beginning.`
+        });
+        await emitRefreshedAuthSessionToUserSockets(
+          _io,
+          auth,
+          designerSectionStore,
+          userId
+        );
+      } catch (error) {
+        console.error("Unable to reset admin user progress:", error);
+        socket.emit("admin:error", {
+          message: "Unable to reset the selected user."
+        });
+      }
+    });
+
     socket.on("admin:roles:list", async () => {
       try {
         if (!socket.data.authenticated && readSocketToken(socket)) {
@@ -1005,6 +1133,119 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("admin:apikeys:list", async () => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        if (!pokecraftApi?.isConfigured()) {
+          socket.emit("admin:error", {
+            message: "pokecraft-api is not configured on the server (set POKECRAFT_API_ADMIN_KEY)."
+          });
+          return;
+        }
+
+        socket.emit("admin:apikeys:list", {
+          keys: await pokecraftApi.listApiKeys()
+        });
+      } catch (error) {
+        emitApiKeyError(socket, error, "Unable to load API keys right now.");
+      }
+    });
+
+    socket.on("admin:apikeys:create", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        if (!pokecraftApi?.isConfigured()) {
+          socket.emit("admin:error", {
+            message: "pokecraft-api is not configured on the server (set POKECRAFT_API_ADMIN_KEY)."
+          });
+          return;
+        }
+
+        const name = typeof data?.name === "string" ? data.name.trim() : "";
+        if (!name) {
+          socket.emit("admin:error", { message: "Give the API key a name." });
+          return;
+        }
+
+        const allowedScopes:ApiKeyScope[] = ["read", "write", "admin"];
+        const scopes = Array.isArray(data?.scopes)
+          ? data.scopes.filter((scope):scope is ApiKeyScope => allowedScopes.includes(scope as ApiKeyScope))
+          : [];
+        if (scopes.length === 0) {
+          socket.emit("admin:error", { message: "Pick at least one scope (read, write, admin)." });
+          return;
+        }
+
+        let expiresInDays:number | undefined;
+        if (data?.expiresInDays !== undefined && data.expiresInDays !== null) {
+          const parsed = Number(data.expiresInDays);
+          if (!Number.isFinite(parsed) || parsed <= 0) {
+            socket.emit("admin:error", { message: "Expiry (days) must be a positive number." });
+            return;
+          }
+          expiresInDays = Math.floor(parsed);
+        }
+
+        const created = await pokecraftApi.createApiKey({
+          name,
+          scopes,
+          createdBy: socket.data.username ?? socket.data.email ?? `user#${socket.data.userId ?? "?"}`,
+          expiresInDays
+        });
+
+        socket.emit("admin:apikeys:created", created);
+        socket.emit("admin:apikeys:list", { keys: await pokecraftApi.listApiKeys() });
+        socket.emit("auth:info", { message: `Created API key "${created.meta.name}".` });
+      } catch (error) {
+        emitApiKeyError(socket, error, "Unable to create the API key.");
+      }
+    });
+
+    socket.on("admin:apikeys:revoke", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        if (!pokecraftApi?.isConfigured()) {
+          socket.emit("admin:error", {
+            message: "pokecraft-api is not configured on the server (set POKECRAFT_API_ADMIN_KEY)."
+          });
+          return;
+        }
+
+        const id = Number(data?.id);
+        if (!Number.isInteger(id) || id <= 0) {
+          socket.emit("admin:error", { message: "Choose a valid API key to revoke." });
+          return;
+        }
+
+        await pokecraftApi.revokeApiKey(id);
+        socket.emit("admin:apikeys:list", { keys: await pokecraftApi.listApiKeys() });
+        socket.emit("auth:info", { message: "Revoked the API key." });
+      } catch (error) {
+        emitApiKeyError(socket, error, "Unable to revoke the API key.");
+      }
+    });
+
     socket.on("moderation:maps:list", async () => {
       try {
         if (!socket.data.authenticated && readSocketToken(socket)) {
@@ -1048,11 +1289,22 @@ function createConnectionHandler(
         if (
           session.authenticated &&
           session.user &&
-          (session.user.pokemonParty.length === 0 || !session.user.characterSkinId)
+          !session.user.characterSkinId
         ) {
-          applySocketAuth(socket.data, session.user);
-          socket.emit("auth:session", session);
-          return;
+          // New adventurers start with the default protagonist skin; the intro
+          // event's gender question (pbChangePlayer) lets them switch to the
+          // female protagonist, and the profile page allows changes any time.
+          await auth.setCharacterSkin(session.user.id, "player-player-a-pokemontrainer-red");
+          const refreshed = await sanitizeAuthSessionInventory(
+            await auth.resolveSession(socket.data.token),
+            auth,
+            designerSectionStore
+          );
+          if (refreshed.authenticated && refreshed.user) {
+            applySocketAuth(socket.data, refreshed.user);
+            socket.emit("auth:session", refreshed);
+            Object.assign(session, refreshed);
+          }
         }
       } catch (error) {
         console.error("Unable to hydrate auth before addPlayer:", error);
@@ -1092,6 +1344,10 @@ function createConnectionHandler(
         socket.emit("myPlayer", { playerId: playerRegistration.player.socketId });
         world.presentPlayersTo(socket.id);
         battleManager.resumeBattleForPlayer(playerRegistration.player);
+        if (typeof socket.data.userId === "number") {
+          void eventRuntime.emitEventState(socket.data.userId);
+          void eventRuntime.runAutorunForMap(socket.data.userId);
+        }
       }
     });
 
@@ -1134,6 +1390,10 @@ function createConnectionHandler(
       player.socketConnections.forEach((socketId) => {
         world.presentPlayersOnMapTo(socketId, player.currentMapId);
       });
+      // Play any autorun events on the destination map (e.g. the lab intro).
+      if (typeof socket.data.userId === "number") {
+        void eventRuntime.runAutorunForMap(socket.data.userId);
+      }
     });
 
     socket.on("shotProjectil", (data) => {
@@ -1159,6 +1419,66 @@ function createConnectionHandler(
 
     socket.on("battle:action", (data) => {
       battleManager.submitAction(socket.id, data);
+    });
+
+    socket.on("battle:learn-move", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to manage moves." });
+        return;
+      }
+
+      const result = await battleManager.resolveMoveLearn(
+        socket.data.userId,
+        data.pokemonId,
+        data.moveName,
+        data.replaceMoveName
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("inventory:hold-item", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to manage held items." });
+        return;
+      }
+
+      const result = await battleManager.setHeldItem(
+        socket.data.userId,
+        data.pokemonId,
+        data.itemId
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("inventory:take-held-item", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to manage held items." });
+        return;
+      }
+
+      const result = await battleManager.takeHeldItem(socket.data.userId, data.pokemonId);
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
     });
 
     socket.on("inventory:use-item", async (data) => {
@@ -1251,6 +1571,47 @@ function createConnectionHandler(
       socket.emit("auth:info", { message: result.message });
     });
 
+    socket.on("npc:battle", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to battle NPCs." });
+        return;
+      }
+
+      const result = await battleManager.startNpcTrainerBattle(
+        socket.data.userId,
+        data?.npcPlacementId
+      );
+
+      if (!result.ok) {
+        socket.emit("battle:error", { message: result.message });
+        return;
+      }
+    });
+
+    socket.on("event:interact", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to talk with NPCs." });
+        return;
+      }
+
+      const result = await eventRuntime.startEvent(socket.data.userId, data?.npcPlacementId);
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+      }
+    });
+
+    socket.on("event:advance", (data) => {
+      if (typeof socket.data.userId === "number") {
+        eventRuntime.submitAdvance(socket.data.userId, data?.text);
+      }
+    });
+
+    socket.on("event:choice", (data) => {
+      if (typeof socket.data.userId === "number" && typeof data?.index === "number") {
+        eventRuntime.submitChoice(socket.data.userId, Math.round(data.index));
+      }
+    });
+
     socket.on("npc:store-buy", async (data) => {
       if (typeof socket.data.userId !== "number") {
         socket.emit("auth:error", { message: "Log in to shop with NPCs." });
@@ -1323,6 +1684,14 @@ function createConnectionHandler(
         console.error("Unable to reconcile battle on disconnect:", error);
       }
 
+      if (
+        typeof socket.data.userId === "number" &&
+        player?.socketConnections.size === 1 &&
+        player.socketConnections.has(socket.id)
+      ) {
+        eventRuntime.handleDisconnect(socket.data.userId);
+      }
+
       world.removePlayer(socket.id);
     });
   };
@@ -1334,9 +1703,31 @@ export default function registerSocketHandlers(
   auth:Auth,
   designerSectionStore:DesignerSectionStore,
   playableMapsStore:PlayableMapsStore,
-  _groundItemStore:GroundItemStore
+  _groundItemStore:GroundItemStore,
+  mapAssetStore?:MapAssetStore,
+  pokecraftApi?:PokecraftApiClient
 ) {
   const battleManager = new BattleManager(io, world, auth, designerSectionStore);
   world.setBattleManager(battleManager);
-  io.on("connection", createConnectionHandler(io, world, auth, designerSectionStore, playableMapsStore, battleManager));
+  const eventRuntime = new EventRuntime(io, world, auth);
+  // Event scripts can start real trainer battles (pbTrainerBattle).
+  eventRuntime.setBattleManager(battleManager);
+  // RMXP touch triggers (doors, cave mouths, floor events): the world detects
+  // the bump/step, the event runtime plays the event. Cooldown keeps a held
+  // arrow key from re-firing the same event every tick.
+  const touchCooldowns = new Map<number, { placementId:string; at:number }>();
+  world.setEventTouchHandler((player, placementId) => {
+    const userId = player.userId;
+    if (typeof userId !== "number" || player.inBattle || eventRuntime.isRunning(userId)) {
+      return;
+    }
+    const last = touchCooldowns.get(userId);
+    const now = Date.now();
+    if (last && last.placementId === placementId && now - last.at < 1500) {
+      return;
+    }
+    touchCooldowns.set(userId, { placementId, at: now });
+    void eventRuntime.startEvent(userId, placementId, { touch: true });
+  });
+  io.on("connection", createConnectionHandler(io, world, auth, designerSectionStore, playableMapsStore, battleManager, eventRuntime, mapAssetStore, pokecraftApi));
 }

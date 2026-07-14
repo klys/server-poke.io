@@ -24,6 +24,16 @@ export default class Player {
     inBattle:boolean;
     path:number[][];
     path_pos:number;
+    /** Cached RPG Maker event state (switches etc.), refreshed by the event
+     * runtime; used synchronously for conditional NPC collision. */
+    eventState:{
+        switches:Record<string, boolean>;
+        variables:Record<string, number>;
+        selfSwitches:Record<string, boolean>;
+    } | null = null;
+    /** Last cell a standing-touch check ran for (touch events fire on cell
+     * entry, and teleports seed this so arrivals don't instantly re-fire). */
+    lastTouchCellKey:string = "";
     angle:number; 
     life:number;
     death:boolean;
@@ -117,45 +127,63 @@ export default class Player {
         const toX = this.path[this.path_pos][0]*World.moveScale;
         const toY = this.path[this.path_pos][1]*World.moveScale;
 
-        
-        
-        
-        let colliding = false;
-        const mapObjects = this.world.getMapObjects(this.currentMapId);
-        for (let i = 0; i < mapObjects.length; i++) {
-            if (this.world.checkCollision({
-                x:toX,
-                y:toY,
-                width:this.width,
-                height:this.height
-            },
-            mapObjects[i]
-            )) {
-                colliding = true;
-                break;
+        const isBlocked = (x:number, y:number) =>
+            this.world.isRectBlockedForPlayer(this, x, y, this.width, this.height);
+
+        let nextX = toX;
+        let nextY = toY;
+        let advancePath = true;
+
+        if (isBlocked(toX, toY)) {
+            // Wall slide: a diagonal step that clips a wall corner decomposes
+            // into its free axis instead of dead-stopping the walk.
+            const canSlideX = toX !== this.x && !isBlocked(toX, this.y);
+            const canSlideY = toY !== this.y && !isBlocked(this.x, toY);
+
+            if (canSlideX || canSlideY) {
+                nextX = canSlideX ? toX : this.x;
+                nextY = canSlideX ? this.y : toY;
+                advancePath = false; // keep aiming at the same node next tick
+            } else {
+                // Fully blocked: still TURN toward the obstacle so the player
+                // can face walls/NPCs (and interact with what's in front).
+                const blockedDirection = GameMath.point_direction(this.x, this.y, toX, toY) + 180;
+                this.angle = GameMath.roundToQuadrant(blockedDirection);
+                this.path = [];
+                this.path_pos = 0;
+                World.socketServer.emit("move"+this.socketId, {
+                    x:this.x,
+                    y:this.y,
+                    angle:this.angle,
+                    playerId:this.socketId,
+                    id:this.id,
+                    currentMapId:this.currentMapId,
+                    stopped:true
+                })
+                // RMXP bump-touch: walking into a blocked trigger-1/2 event
+                // (a door) fires it even though the step itself is denied.
+                this.world.notifyBlockedTouch(this, toX, toY);
+                return;
             }
         }
 
-        if (colliding) {
-            console.log("colliding: unable to move." ,{x:toX,y:toY})
-            this.path = [];
-            this.path_pos = 0;
+        const direction = GameMath.point_direction(this.x, this.y, nextX, nextY) + 180;
+        this.angle = GameMath.roundToQuadrant(direction);
+        this.x = nextX;
+        this.y = nextY;
+
+        if (!advancePath) {
             World.socketServer.emit("move"+this.socketId, {
                 x:this.x,
                 y:this.y,
                 angle:this.angle,
                 playerId:this.socketId,
                 id:this.id,
-                currentMapId:this.currentMapId,
-                stopped:true
+                currentMapId:this.currentMapId
             })
+            this.world.handlePlayerStep(this);
             return;
         }
-
-        const direction = GameMath.point_direction(this.x, this.y, toX, toY) + 180;
-        this.angle = GameMath.roundToQuadrant(direction);
-        this.x = toX;
-        this.y = toY;
 
         this.path_pos = this.path_pos + 1;
         World.socketServer.emit("move"+this.socketId, {
@@ -227,6 +255,23 @@ export default class Player {
 
         this.path = this.createDirectPath(fromX, fromY, toX, toY);
         this.path_pos = 0;
+
+        // Aiming outside the map (edge-clamped to the current cell) still
+        // turns the player toward the requested direction, so facing-based
+        // interaction works at map borders.
+        if (this.path.length === 0 && (x !== this.x || y !== this.y)) {
+            const direction = GameMath.point_direction(this.x, this.y, x, y) + 180;
+            this.angle = GameMath.roundToQuadrant(direction);
+            World.socketServer.emit("move"+this.socketId, {
+                x:this.x,
+                y:this.y,
+                angle:this.angle,
+                playerId:this.socketId,
+                id:this.id,
+                currentMapId:this.currentMapId,
+                stopped:true
+            })
+        }
     }
 
     private normalizeGridCoordinate(value:number, max:number) {
@@ -307,6 +352,9 @@ export default class Player {
         this.y = nextPosition.y;
         this.path = [];
         this.path_pos = 0;
+        // Seed the touch cell so landing on a touch event (door mats, cave
+        // mouths) doesn't instantly fire it back — classic transfer behavior.
+        this.lastTouchCellKey = `${mapId}:${Math.floor((this.x + this.width / 2) / 32)}:${Math.floor((this.y + this.height / 2) / 32)}`;
 
         World.socketServer.emit("move"+this.socketId, {
             x:this.x,

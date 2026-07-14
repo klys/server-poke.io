@@ -63,6 +63,8 @@ function normalizeStoredPayload(value: unknown): PlayableMapsSyncPayload | null 
   };
 }
 
+let lastAppliedWorldState: PlayableMapsStateSnapshot | null = null;
+
 export function applyPlayableMapsStateToWorld(
   world: World,
   payload: PlayableMapsSyncPayload | null
@@ -70,6 +72,12 @@ export function applyPlayableMapsStateToWorld(
   if (!payload) {
     return;
   }
+  // Re-applying the same (cached) snapshot is wasted work — rebuilding the
+  // map definitions for 250+ maps on every addPlayer starves the event loop.
+  if (payload.state === lastAppliedWorldState) {
+    return;
+  }
+  lastAppliedWorldState = payload.state;
 
   world.setPlayableMapsState(payload.state);
   world.registerMapDefinitions(buildPlayableMapDefinitions(payload.state));
@@ -77,6 +85,13 @@ export function applyPlayableMapsStateToWorld(
 
 export default class PlayableMapsStore {
   private readonly redis: RedisClientType;
+
+  // The maps payload is tens of MB; parsing it from Redis on every read used
+  // to burn a CPU core whenever clients churned (each addPlayer / maps sync
+  // re-parsed it). Reads are served from this cache and refreshed on a short
+  // TTL so external importers still get picked up within seconds.
+  private cache: { payload: PlayableMapsSyncPayload | null; fetchedAt: number } | null = null;
+  private static CACHE_TTL_MS = 5000;
 
   constructor(redis: RedisClientType) {
     this.redis = redis;
@@ -119,19 +134,27 @@ export default class PlayableMapsStore {
     };
 
     await this.redis.set(REDIS_KEY, JSON.stringify(payload));
+    this.cache = { payload, fetchedAt: Date.now() };
 
     return payload;
   }
 
   async read(): Promise<PlayableMapsSyncPayload | null> {
+    if (this.cache && Date.now() - this.cache.fetchedAt < PlayableMapsStore.CACHE_TTL_MS) {
+      return this.cache.payload;
+    }
+
     const raw = await this.redis.get(REDIS_KEY);
 
     if (!raw) {
+      this.cache = { payload: null, fetchedAt: Date.now() };
       return null;
     }
 
     try {
-      return normalizeStoredPayload(JSON.parse(raw));
+      const payload = normalizeStoredPayload(JSON.parse(raw));
+      this.cache = { payload, fetchedAt: Date.now() };
+      return payload;
     } catch (error) {
       console.error("Unable to parse stored playable maps state:", error);
       return null;

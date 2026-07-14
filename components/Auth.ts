@@ -164,6 +164,12 @@ export interface PokemonSummary {
     experienceCurve:"fast" | "medium" | "slow";
     nextLevelExperience:number;
     statBonuses:PokemonStatBonuses;
+    ivs?:Record<string, number>;
+    evs?:Record<string, number>;
+    status?:{ id:string; counter:number } | null;
+    heldItemId?:string;
+    heldItemName?:string;
+    pendingMoveLearns?:string[];
 }
 
 export interface BattleHistoryEntry {
@@ -225,7 +231,6 @@ interface UpdateProfilePayload {
 }
 
 interface ChooseStarterPayload {
-    gender:string;
     nickname:string;
 }
 
@@ -242,27 +247,29 @@ interface StarterPokemonDefinition {
     iconImageSrc:string;
 }
 
+// Ids/names must match the migrated designer:section:items records so the
+// battle engine can resolve their definitions.
 const DEFAULT_INVENTORY:InventoryItem[] = [
     {
-        id: "potion",
-        name: "Potion",
+        id: "item-potion",
+        name: "Arepa de diablito",
         category: "usable",
         quantity: 3,
         description: "Restores a small amount of HP."
     },
     {
-        id: "oran-berry",
-        name: "Oran Berry",
+        id: "item-oranberry",
+        name: "Baya Aranja",
         category: "berries",
         quantity: 2,
         description: "A bright berry used by Pokemon in a pinch."
     },
     {
-        id: "town-map",
-        name: "Town Map",
+        id: "item-pokeball",
+        name: "Nación Ball",
         category: "quest",
-        quantity: 1,
-        description: "A handy map for tracking discovered regions."
+        quantity: 10,
+        description: "A ball for catching wild Pokemon."
     }
 ];
 
@@ -760,18 +767,25 @@ export default class Auth {
             return { error: "You already have Pokemon in hand." };
         }
 
-        const gender = typeof payload.gender === "string" ? payload.gender.trim() : "";
-        if (!["female", "male", "nonbinary"].includes(gender)) {
-            return { error: "Select a trainer gender before choosing a Pokemon." };
-        }
-
         const nickname = this.normalizePokemonNickname(payload.nickname);
-        const nicknameValidationMessage = this.validatePokemonNickname(nickname);
+        const nicknameValidationMessage = nickname ? this.validatePokemonNickname(nickname) : null;
         if (nicknameValidationMessage) {
             return { error: nicknameValidationMessage };
         }
 
         const levelingCurveConfig = await readLevelingCurveConfigFromRedis(this.redis);
+        const rollIv = () => Math.floor(Math.random() * 32);
+        const ivs = {
+            hp: rollIv(),
+            attack: rollIv(),
+            defense: rollIv(),
+            specialAttack: rollIv(),
+            specialDefense: rollIv(),
+            speed: rollIv()
+        };
+        // Level-1 HP stat from the species base HP (same formula as the battle engine).
+        const baseHp = Math.max(1, Math.round(starterPokemon.hp));
+        const hpStat = Math.max(1, Math.floor((2 * baseHp + ivs.hp) / 100) + 1 + 10);
         const starter:PokemonSummary = {
             id: crypto.randomUUID(),
             sourcePokemonId: starterPokemon.id,
@@ -779,8 +793,9 @@ export default class Auth {
             nickname,
             level: 1,
             types: starterPokemon.elements,
-            hp: Math.max(1, Math.round(starterPokemon.hp)),
-            maxHp: Math.max(1, Math.round(starterPokemon.hp)),
+            hp: hpStat,
+            maxHp: hpStat,
+            ivs,
             moves: starterPokemon.skills
                 .filter((skill) => skill.level <= 1)
                 .slice(0, 4)
@@ -794,7 +809,6 @@ export default class Auth {
         };
 
         await this.redis.hSet(this.userKey(authenticatedUser.id), {
-            trainer_gender: gender,
             pokemon_party: JSON.stringify([starter])
         });
 
@@ -1051,6 +1065,317 @@ export default class Auth {
         };
     }
 
+    /**
+     * Sends an account back to the start of the adventure: empty party (so the
+     * starter selection runs again), default inventory/money, cleared battle
+     * history, and no saved location (next world join uses the initial map
+     * spawn). Profile, credentials, and character skin are kept.
+     */
+    public async resetUserProgress(
+        userId:number
+    ):Promise<{ user:AdminUserDetails } | { error:string }> {
+        const storedUser = await this.getStoredUserById(String(userId));
+        if (!storedUser) {
+            return { error: "User not found." };
+        }
+
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
+            inventory: JSON.stringify(DEFAULT_INVENTORY),
+            money: String(DEFAULT_MONEY),
+            battle_history: JSON.stringify(DEFAULT_BATTLE_HISTORY),
+            // Clear RPG Maker event progression so scripted events (e.g. the lab
+            // starter) can be replayed from the beginning after a reset.
+            event_switches: JSON.stringify({}),
+            event_variables: JSON.stringify({}),
+            event_self_switches: JSON.stringify({})
+        });
+        await this.redis.hDel(this.userKey(userId), ["last_map_id", "last_x", "last_y", "respawn_point"]);
+
+        const updatedUser = await this.getUserAdminDetails(userId);
+        if (!updatedUser) {
+            return { error: "Unable to refresh the reset user." };
+        }
+
+        return {
+            user: updatedUser
+        };
+    }
+
+
+    // ---- RPG Maker event state: switches / variables / self-switches ----
+    // Persisted per user so multi-page events (page conditions) and progression
+    // gating (e.g. "professor gave permission") survive across sessions.
+    public async getEventState(userId:number):Promise<{
+        switches:Record<string, boolean>;
+        variables:Record<string, number>;
+        selfSwitches:Record<string, boolean>;
+    }> {
+        const raw = await this.redis.hmGet(this.userKey(userId), [
+            "event_switches", "event_variables", "event_self_switches"
+        ]);
+        const parse = (value:string | null | undefined) => {
+            try {
+                const parsed = value ? JSON.parse(value) : {};
+                return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : {};
+            } catch {
+                return {} as Record<string, unknown>;
+            }
+        };
+        return {
+            switches: parse(raw[0]) as Record<string, boolean>,
+            variables: parse(raw[1]) as Record<string, number>,
+            selfSwitches: parse(raw[2]) as Record<string, boolean>
+        };
+    }
+
+    public async setEventSwitches(userId:number, startId:number, endId:number, on:boolean) {
+        const state = await this.getEventState(userId);
+        const lo = Math.min(startId, endId);
+        const hi = Math.max(startId, endId);
+        for (let id = lo; id <= hi; id += 1) {
+            if (on) {
+                state.switches[String(id)] = true;
+            } else {
+                delete state.switches[String(id)];
+            }
+        }
+        await this.redis.hSet(this.userKey(userId), {
+            event_switches: JSON.stringify(state.switches)
+        });
+    }
+
+    public async setEventVariable(userId:number, id:number, value:number) {
+        const state = await this.getEventState(userId);
+        state.variables[String(id)] = value;
+        await this.redis.hSet(this.userKey(userId), {
+            event_variables: JSON.stringify(state.variables)
+        });
+    }
+
+    public async setEventSelfSwitch(userId:number, key:string, on:boolean) {
+        const state = await this.getEventState(userId);
+        if (on) {
+            state.selfSwitches[key] = true;
+        } else {
+            delete state.selfSwitches[key];
+        }
+        await this.redis.hSet(this.userKey(userId), {
+            event_self_switches: JSON.stringify(state.selfSwitches)
+        });
+    }
+
+    public async getPublicUserData(userId:number) {
+        return this.getUserById(String(userId));
+    }
+
+    /**
+     * Fully heals the user's party (HP, status, PP) — the RPG Maker
+     * "Recover All" event command used by Pokemon Center nurses.
+     */
+    public async healPokemonParty(userId:number):Promise<boolean> {
+        const user = await this.getUserById(String(userId));
+        if (!user || !Array.isArray(user.pokemonParty) || user.pokemonParty.length === 0) {
+            return false;
+        }
+
+        const ppByMoveName = new Map<string, number>();
+        try {
+            const raw = await this.redis.get("designer:section:skills");
+            const items = raw ? JSON.parse(raw)?.state?.items : null;
+            if (Array.isArray(items)) {
+                for (const item of items) {
+                    const name = typeof item?.name === "string" ? item.name.toLowerCase() : null;
+                    const pp = Number(item?.pokemonSkillProfile?.powerPoint);
+                    if (name && Number.isFinite(pp) && pp > 0) {
+                        ppByMoveName.set(name, Math.round(pp));
+                    }
+                }
+            }
+        } catch {
+            // PP restore falls back to current values below.
+        }
+
+        const healed = user.pokemonParty.map((pokemon) => ({
+            ...pokemon,
+            hp: pokemon.maxHp,
+            status: null,
+            movePp: (pokemon.moves ?? []).reduce<Record<string, number>>((accumulator, moveName) => {
+                const known = ppByMoveName.get(moveName.toLowerCase());
+                const current = pokemon.movePp?.[moveName];
+                accumulator[moveName] = known ?? (typeof current === "number" ? Math.max(1, current) : 1);
+                return accumulator;
+            }, {})
+        }));
+
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_party: JSON.stringify(healed)
+        });
+        return true;
+    }
+
+    /** Renames the player (pbTrainerName from the intro event). */
+    public async setUserName(userId:number, name:string):Promise<boolean> {
+        const trimmed = String(name ?? "").trim().slice(0, 30);
+        if (!trimmed) {
+            return false;
+        }
+        await this.redis.hSet(this.userKey(userId), { name: trimmed });
+        return true;
+    }
+
+    /** Sets the character skin (pbChangePlayer gender pick from the intro). */
+    public async setCharacterSkin(userId:number, characterSkinId:string):Promise<boolean> {
+        const trimmed = String(characterSkinId ?? "").trim().slice(0, 120);
+        if (!trimmed) {
+            return false;
+        }
+        await this.redis.hSet(this.userKey(userId), { character_skin_id: trimmed });
+        return true;
+    }
+
+    // ---- Pokemon Center respawn point (Kernel.pbSetPokemonCenter) ----
+    // Where a blacked-out player is returned to; falls back to the initial
+    // spawn when no center has been visited yet.
+    public async setRespawnPoint(userId:number, point:{ mapId:string; x:number; y:number }) {
+        await this.redis.hSet(this.userKey(userId), {
+            respawn_point: JSON.stringify(point)
+        });
+    }
+
+    public async getRespawnPoint(userId:number):Promise<{ mapId:string; x:number; y:number } | null> {
+        const raw = await this.redis.hGet(this.userKey(userId), "respawn_point");
+        if (!raw) {
+            return null;
+        }
+        try {
+            const parsed = JSON.parse(raw);
+            if (
+                parsed && typeof parsed.mapId === "string" && parsed.mapId.length > 0 &&
+                Number.isFinite(parsed.x) && Number.isFinite(parsed.y)
+            ) {
+                return { mapId: parsed.mapId, x: Number(parsed.x), y: Number(parsed.y) };
+            }
+        } catch {
+            // Treat unreadable respawn data as unset.
+        }
+        return null;
+    }
+
+    private async readPokemonProfileById(pokemonId:string) {
+        const raw = await this.redis.get("designer:section:pokemons");
+        if (!raw) {
+            return null;
+        }
+        try {
+            const parsed = JSON.parse(raw);
+            const items = parsed?.state?.items;
+            if (!Array.isArray(items)) {
+                return null;
+            }
+            const item = items.find((candidate:{ id?:unknown }) => candidate?.id === pokemonId);
+            if (!item || typeof item !== "object") {
+                return null;
+            }
+            return {
+                id: String((item as { id:string }).id),
+                name: String((item as { name?:string }).name ?? pokemonId),
+                profile: ((item as { pokemonProfile?:Record<string, unknown> }).pokemonProfile ?? {})
+            };
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Gives a Pokemon of the given Essentials species internal name (e.g.
+     * "BULBASAUR") at a level, mirroring chooseStarter's stat rules. Used by the
+     * event runtime for `pbAddPokemon`. Species ids follow `pokemon-<NAME>`.
+     */
+    public async givePokemonBySpecies(
+        userId:number,
+        internalName:string,
+        level:number
+    ):Promise<{ ok:true; pokemonName:string; boxed:boolean } | { ok:false; message:string }> {
+        const pokemonId = `pokemon-${String(internalName).toUpperCase()}`;
+        const resolved = await this.readPokemonProfileById(pokemonId);
+        if (!resolved) {
+            return { ok: false, message: `Unknown species ${internalName}.` };
+        }
+
+        const profile = resolved.profile as {
+            hp?:unknown;
+            elements?:unknown;
+            skills?:Array<{ skillName?:unknown; level?:unknown }>;
+        };
+        const lvl = Math.max(1, Math.min(100, Math.round(level)));
+        const levelingCurveConfig = await readLevelingCurveConfigFromRedis(this.redis);
+        const rollIv = () => Math.floor(Math.random() * 32);
+        const ivs = {
+            hp: rollIv(), attack: rollIv(), defense: rollIv(),
+            specialAttack: rollIv(), specialDefense: rollIv(), speed: rollIv()
+        };
+        const baseHp = Math.max(1, Math.round(Number(profile.hp) || 1));
+        const hpStat = Math.max(1, Math.floor(((2 * baseHp + ivs.hp) * lvl) / 100) + lvl + 10);
+        const elements = Array.isArray(profile.elements)
+            ? profile.elements.filter((element):element is string => typeof element === "string")
+            : [];
+        const moves = (Array.isArray(profile.skills) ? profile.skills : [])
+            .filter((skill) =>
+                typeof skill?.level === "number" &&
+                skill.level <= lvl &&
+                typeof skill?.skillName === "string" &&
+                skill.skillName.length > 0)
+            .sort((left, right) => (left.level as number) - (right.level as number))
+            .map((skill) => skill.skillName as string)
+            .slice(-4);
+
+        const summary:PokemonSummary = {
+            id: crypto.randomUUID(),
+            sourcePokemonId: resolved.id,
+            name: resolved.name,
+            level: lvl,
+            types: elements,
+            hp: hpStat,
+            maxHp: hpStat,
+            ivs,
+            moves,
+            movePp: {},
+            experience: 0,
+            experienceCurve: "medium",
+            nextLevelExperience: getExperienceForNextLevel(lvl, levelingCurveConfig),
+            statBonuses: createEmptyPokemonStatBonuses()
+        };
+
+        const user = await this.getUserById(String(userId));
+        if (!user) {
+            return { ok: false, message: "Account not found." };
+        }
+
+        const party = Array.isArray(user.pokemonParty) ? [...user.pokemonParty] : [];
+        if (party.length < 6) {
+            party.push(summary);
+            await this.redis.hSet(this.userKey(userId), {
+                pokemon_party: JSON.stringify(party)
+            });
+            return { ok: true, pokemonName: resolved.name, boxed: false };
+        }
+
+        // Party full: stash in a simple overflow box so nothing is lost.
+        const boxRaw = await this.redis.hGet(this.userKey(userId), "pokemon_box");
+        let box:PokemonSummary[] = [];
+        try {
+            const parsed = boxRaw ? JSON.parse(boxRaw) : [];
+            box = Array.isArray(parsed) ? parsed : [];
+        } catch {
+            box = [];
+        }
+        box.push(summary);
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_box: JSON.stringify(box)
+        });
+        return { ok: true, pokemonName: resolved.name, boxed: true };
+    }
 
     private async sendPostRegistrationEmails(user:AuthenticatedUser) {
         const results = await Promise.allSettled([

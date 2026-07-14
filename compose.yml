@@ -1,0 +1,23 @@
+services:
+  server-poke-io:
+    image: server-poke-io:latest
+    container_name: server-poke-io
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./.env:/app/.env:ro
+    ports:
+      - "3001:3001"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    networks:
+      - pangolin
+      - outbound
+
+networks:
+  pangolin:
+    external: true
+  outbound:
+    driver: bridge

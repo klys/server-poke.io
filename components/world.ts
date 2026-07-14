@@ -3,8 +3,14 @@ import Projectil from "./projectil"
 import GameMath from "./gameMath";
 import Pathfinding = require("pathfinding")
 import type { PlayableMapsStateSnapshot } from "./PlayableMapsState";
+import { isSolidCollisionCell, type MapCollisionGrid } from "./TileMapGrid";
 import type BattleManager from "./BattleManager";
 import GroundItemStore, { type GroundItem } from "./GroundItemStore";
+import {
+    EMPTY_EVENT_PLAYER_STATE,
+    selectConditionMetPage,
+    type EssentialsEventRecord
+} from "./eventPageSelection";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -38,9 +44,14 @@ export default class World {
     grid:Pathfinding.Grid;
     objectsByMapId: Map<string, MapObstacle[]>;
     mapBoundsByMapId: Map<string, MapBounds>;
+    collisionGridsByMapId: Map<string, MapCollisionGrid>;
     playableMapsState: PlayableMapsStateSnapshot | null;
     battleManager: BattleManager | null;
     groundItems: Map<string, GroundItem>;
+    /** Per-snapshot cache of NPC collision rectangles by map. */
+    private npcBlockerCache = new WeakMap<object, Map<string, Array<{ id:string; x:number; y:number; essentials:EssentialsEventRecord | null }>>>();
+    /** Fires trigger-1/2 (touch) events; wired to the event runtime. */
+    private eventTouchHandler:((player:Player, placementId:string) => void) | null = null;
     groundItemStore: GroundItemStore | null;
     //finder:Pathfinding.Finder;
     //grid_backup:Pathfinding.Grid;
@@ -62,6 +73,7 @@ export default class World {
         this.projectiles = new Map<number, Projectil>();
         this.objectsByMapId = new Map<string, MapObstacle[]>();
         this.mapBoundsByMapId = new Map<string, MapBounds>();
+        this.collisionGridsByMapId = new Map<string, MapCollisionGrid>();
         this.playableMapsState = null;
         this.battleManager = null;
         this.groundItems = new Map<string, GroundItem>();
@@ -195,6 +207,7 @@ export default class World {
                 width:number;
                 height:number;
             }>;
+            collisionGrid?:MapCollisionGrid;
         }>
     ) {
         mapDefinitions.forEach((definition) => {
@@ -239,11 +252,266 @@ export default class World {
                 : [];
 
             this.objectsByMapId.set(definition.mapId, sanitizedObstacles);
+
+            const collisionGrid = definition.collisionGrid;
+            if (
+                collisionGrid &&
+                collisionGrid.width > 0 &&
+                collisionGrid.height > 0 &&
+                collisionGrid.cellSize > 0 &&
+                collisionGrid.cells.length === collisionGrid.width * collisionGrid.height
+            ) {
+                this.collisionGridsByMapId.set(definition.mapId, collisionGrid);
+            } else {
+                this.collisionGridsByMapId.delete(definition.mapId);
+            }
         });
     }
 
     getMapObjects(mapId:string) {
         return this.objectsByMapId.get(mapId) ?? [];
+    }
+
+    getMapCollisionGrid(mapId:string) {
+        return this.collisionGridsByMapId.get(mapId) ?? null;
+    }
+
+    private isRectBlockedByCollisionGrid(
+        mapId:string,
+        x:number,
+        y:number,
+        width:number,
+        height:number
+    ) {
+        const grid = this.collisionGridsByMapId.get(mapId);
+        if (!grid) {
+            return false;
+        }
+
+        // Inset the hitbox so a tile-sized player can traverse one-tile
+        // corridors and doors without pixel-perfect alignment.
+        const inset = Math.min(grid.cellSize / 4, width / 2 - 1, height / 2 - 1);
+        const left = x + inset;
+        const top = y + inset;
+        const right = x + width - inset;
+        const bottom = y + height - inset;
+
+        const firstColumn = Math.max(0, Math.floor(left / grid.cellSize));
+        const firstRow = Math.max(0, Math.floor(top / grid.cellSize));
+        const lastColumn = Math.min(grid.width - 1, Math.floor((right - 1) / grid.cellSize));
+        const lastRow = Math.min(grid.height - 1, Math.floor((bottom - 1) / grid.cellSize));
+
+        for (let row = firstRow; row <= lastRow; row += 1) {
+            for (let column = firstColumn; column <= lastColumn; column += 1) {
+                if (isSolidCollisionCell(grid.cells[row * grid.width + column])) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    isRectBlocked(
+        mapId:string,
+        x:number,
+        y:number,
+        width:number,
+        height:number
+    ) {
+        const bounds = { x, y, width, height };
+
+        if (this.getMapObjects(mapId).some((object) => this.checkCollision(bounds, object))) {
+            return true;
+        }
+
+        return this.isRectBlockedByCollisionGrid(mapId, x, y, width, height);
+    }
+
+    /**
+     * Movement collision for a specific player: static map collision plus
+     * dynamic obstacles — other players on the map and NPC events whose active
+     * page (for THIS player's event state) shows a sprite, like RPG Maker.
+     *
+     * Anti-trap rule: a dynamic obstacle that already overlaps the player's
+     * CURRENT position never blocks — you can always walk out of a door tile
+     * or another player you were dropped onto, just never into one.
+     */
+    isRectBlockedForPlayer(
+        player:Player,
+        x:number,
+        y:number,
+        width:number,
+        height:number
+    ) {
+        if (this.isRectBlocked(player.currentMapId, x, y, width, height)) {
+            return true;
+        }
+
+        // Other players are solid (small inset so near-misses don't jam walkways).
+        const inset = 2;
+        const bounds = { x: x + inset, y: y + inset, width: width - inset * 2, height: height - inset * 2 };
+        const currentBounds = {
+            x: player.x + inset,
+            y: player.y + inset,
+            width: player.width - inset * 2,
+            height: player.height - inset * 2
+        };
+        for (const other of Array.from(this.players.values())) {
+            if (other.socketId === player.socketId || other.currentMapId !== player.currentMapId) {
+                continue;
+            }
+            const otherBounds = { x: other.x + inset, y: other.y + inset, width: other.width - inset * 2, height: other.height - inset * 2 };
+            if (this.checkCollision(currentBounds, otherBounds)) {
+                continue; // already overlapping: let them separate
+            }
+            if (this.checkCollision(bounds, otherBounds)) {
+                return true;
+            }
+        }
+
+        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
+            const blockerBounds = { x: blocker.x + inset, y: blocker.y + inset, width: 32 - inset * 2, height: 32 - inset * 2 };
+            if (this.checkCollision(currentBounds, blockerBounds)) {
+                continue; // standing on it (e.g. arrived through a door): walk off freely
+            }
+            if (!this.checkCollision(bounds, blockerBounds)) {
+                continue;
+            }
+            if (!blocker.essentials) {
+                return true; // designer-authored NPC: always visible and solid
+            }
+            const page = selectConditionMetPage(
+                blocker.essentials,
+                player.eventState ?? EMPTY_EVENT_PLAYER_STATE
+            );
+            if (page && page.graphic?.characterName && !page.move?.through) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    setEventTouchHandler(handler:(player:Player, placementId:string) => void) {
+        this.eventTouchHandler = handler;
+    }
+
+    /**
+     * RMXP player-touch (bump): walking INTO a blocked event tile fires the
+     * event when its active page is trigger 1/2 — this is how doors work (the
+     * door sprite blocks the tile AND the touch transfer runs on contact).
+     */
+    notifyBlockedTouch(player:Player, x:number, y:number) {
+        if (!this.eventTouchHandler) {
+            return;
+        }
+
+        const inset = 2;
+        const bounds = { x: x + inset, y: y + inset, width: player.width - inset * 2, height: player.height - inset * 2 };
+        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
+            if (!blocker.essentials) {
+                continue;
+            }
+            if (!this.checkCollision(bounds, { x: blocker.x + inset, y: blocker.y + inset, width: 32 - inset * 2, height: 32 - inset * 2 })) {
+                continue;
+            }
+            const page = selectConditionMetPage(
+                blocker.essentials,
+                player.eventState ?? EMPTY_EVENT_PLAYER_STATE
+            );
+            if (page && (page.trigger === 1 || page.trigger === 2)) {
+                this.eventTouchHandler(player, blocker.id);
+                return;
+            }
+        }
+    }
+
+    /**
+     * RMXP standing-touch: entering a walkable tile that hosts a graphicless
+     * trigger 1/2 event (cave mouths, floor triggers) fires it. Tiles owned by
+     * an extracted portal are skipped — the portal runtime handles those.
+     */
+    private handleTouchEventStep(player:Player) {
+        if (!this.eventTouchHandler) {
+            return;
+        }
+
+        const cellX = Math.floor((player.x + player.width / 2) / 32);
+        const cellY = Math.floor((player.y + player.height / 2) / 32);
+        const key = `${player.currentMapId}:${cellX}:${cellY}`;
+        if (key === player.lastTouchCellKey) {
+            return;
+        }
+        player.lastTouchCellKey = key;
+
+        const editorData = this.playableMapsState?.editorDataByMapId[player.currentMapId];
+        if (!editorData) {
+            return;
+        }
+        if ((editorData.portals ?? []).some((portal) => portal.x === cellX && portal.y === cellY)) {
+            return;
+        }
+
+        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
+            if (!blocker.essentials || blocker.x !== cellX * 32 || blocker.y !== cellY * 32) {
+                continue;
+            }
+            const page = selectConditionMetPage(
+                blocker.essentials,
+                player.eventState ?? EMPTY_EVENT_PLAYER_STATE
+            );
+            if (
+                page &&
+                (page.trigger === 1 || page.trigger === 2) &&
+                (!page.graphic?.characterName || page.move?.through)
+            ) {
+                this.eventTouchHandler(player, blocker.id);
+                return;
+            }
+        }
+    }
+
+    private getNpcBlockers(mapId:string) {
+        const state = this.playableMapsState;
+        if (!state) {
+            return [] as Array<{ id:string; x:number; y:number; essentials:EssentialsEventRecord | null }>;
+        }
+
+        let byMap = this.npcBlockerCache.get(state);
+        if (!byMap) {
+            byMap = new Map();
+            this.npcBlockerCache.set(state, byMap);
+        }
+
+        let blockers = byMap.get(mapId);
+        if (!blockers) {
+            blockers = [];
+            const npcs = state.editorDataByMapId[mapId]?.npcs ?? [];
+            for (const npc of npcs) {
+                const placement = npc as typeof npc & { essentialsEvent?: EssentialsEventRecord };
+                if (
+                    typeof placement.x !== "number" ||
+                    typeof placement.y !== "number"
+                ) {
+                    continue;
+                }
+                if (placement.essentialsEvent) {
+                    // Conditional blocker; page visibility is resolved per player.
+                    blockers.push({
+                        id: placement.id,
+                        x: placement.x * 32,
+                        y: placement.y * 32,
+                        essentials: placement.essentialsEvent
+                    });
+                } else if (placement.previewImageSrc) {
+                    blockers.push({ id: placement.id, x: placement.x * 32, y: placement.y * 32, essentials: null });
+                }
+            }
+            byMap.set(mapId, blockers);
+        }
+
+        return blockers;
     }
 
     setPlayableMapsState(playableMapsState: PlayableMapsStateSnapshot) {
@@ -257,6 +525,7 @@ export default class World {
     handlePlayerStep(player: Player) {
         this.battleManager?.handlePlayerStep(player);
         void this.handleGroundItemPickup(player);
+        this.handleTouchEventStep(player);
     }
 
     getPlayableMapsState() {
@@ -290,14 +559,7 @@ export default class World {
         playerWidth:number,
         playerHeight:number
     ) {
-        const playerBounds = {
-            x,
-            y,
-            width: playerWidth,
-            height: playerHeight
-        };
-
-        return this.getMapObjects(mapId).some((object) => this.checkCollision(playerBounds, object));
+        return this.isRectBlocked(mapId, x, y, playerWidth, playerHeight);
     }
 
     isOpenPlayerPosition(

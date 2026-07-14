@@ -1,9 +1,26 @@
+import {
+  decodeCollisionGrid,
+  TILE_MAP_GRID_ENCODING,
+  TILE_MAP_LAYER_ENCODING,
+  type MapCollisionGrid
+} from "./TileMapGrid";
+
 type DesignerItemDetail = {
   label: string;
   value: string;
 };
 
 type DesignerPlayableMapBackgroundImageMode = "repeat" | "centered" | "stretched";
+
+type PlayableMapConnectionDirection = "north" | "south" | "east" | "west";
+
+type PlayableMapConnection = {
+  direction: PlayableMapConnectionDirection;
+  targetMapId: string;
+  /** Neighbor map's top-left cell relative to this map's top-left cell. */
+  offsetXCells: number;
+  offsetYCells: number;
+};
 
 type DesignerPlayableMapConfig = {
   cellSize: number;
@@ -45,6 +62,7 @@ type DesignerPlayableMapConfig = {
   };
   bgm?: string;
   bgs?: string;
+  connections?: PlayableMapConnection[];
   source?: {
     project: "Pokemon Essentials v21.1";
     sourcePath: string;
@@ -136,12 +154,45 @@ type MapEditorNpcPlacement = {
   }>;
 };
 
+export type PlayableMapBakedChunk = {
+  col: number;
+  row: number;
+  src: string;
+  width: number;
+  height: number;
+};
+
+export type PlayableMapTileMapProfile = {
+  version: 1;
+  tilesetItemId: string;
+  width: number;
+  height: number;
+  tileSize: number;
+  layerEncoding: typeof TILE_MAP_LAYER_ENCODING;
+  layers: string[];
+  collisionEncoding: typeof TILE_MAP_GRID_ENCODING;
+  collision: string;
+  terrainTags?: string;
+  baked?: {
+    chunkCells: number;
+    background: PlayableMapBakedChunk[];
+    foreground: PlayableMapBakedChunk[];
+    bakedAt?: string;
+  };
+  essentials?: {
+    mapId?: string;
+    tilesetId?: number;
+    sourcePath?: string;
+  };
+};
+
 export type PlayableMapEditorData = {
   version: 1;
   objects: MapEditorObjectPlacement[];
   portals: MapEditorPortalPlacement[];
   grass: MapEditorGrassPlacement[];
   npcs: MapEditorNpcPlacement[];
+  tileMap?: PlayableMapTileMapProfile;
   essentials?: {
     mapId: string;
     rxdataPath: string;
@@ -182,6 +233,7 @@ export type PlayableMapDefinition = {
     width: number;
     height: number;
   }>;
+  collisionGrid?: MapCollisionGrid;
 };
 
 const DEFAULT_CELL_SIZE = 32;
@@ -302,6 +354,27 @@ function sanitizePlayableMapConfig(value: unknown): DesignerPlayableMapConfig | 
         : undefined,
     bgm: typeof candidate.bgm === "string" ? candidate.bgm : undefined,
     bgs: typeof candidate.bgs === "string" ? candidate.bgs : undefined,
+    connections: Array.isArray(candidate.connections)
+      ? candidate.connections
+          .filter(
+            (connection): connection is PlayableMapConnection =>
+              !!connection &&
+              typeof connection === "object" &&
+              ["north", "south", "east", "west"].includes(connection.direction) &&
+              typeof connection.targetMapId === "string" &&
+              connection.targetMapId.length > 0 &&
+              typeof connection.offsetXCells === "number" &&
+              Number.isFinite(connection.offsetXCells) &&
+              typeof connection.offsetYCells === "number" &&
+              Number.isFinite(connection.offsetYCells)
+          )
+          .map((connection) => ({
+            direction: connection.direction,
+            targetMapId: connection.targetMapId,
+            offsetXCells: Math.round(connection.offsetXCells),
+            offsetYCells: Math.round(connection.offsetYCells),
+          }))
+      : undefined,
     source:
       candidate.source && typeof candidate.source === "object" &&
       candidate.source.project === "Pokemon Essentials v21.1" &&
@@ -340,6 +413,103 @@ function sanitizePlayableMapItems(value: unknown): PlayableMapItem[] {
       playableMapConfig: sanitizePlayableMapConfig(item.playableMapConfig),
     }))
     .filter((item) => item.id.length > 0 && item.name.length > 0 && item.category.length > 0);
+}
+
+function sanitizeBakedChunks(value: unknown): PlayableMapBakedChunk[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter(
+      (chunk): chunk is PlayableMapBakedChunk =>
+        typeof chunk?.col === "number" &&
+        typeof chunk?.row === "number" &&
+        typeof chunk?.src === "string" &&
+        chunk.src.length > 0 &&
+        typeof chunk?.width === "number" &&
+        typeof chunk?.height === "number"
+    )
+    .map((chunk) => ({
+      col: Math.max(0, clampInteger(chunk.col)),
+      row: Math.max(0, clampInteger(chunk.row)),
+      src: chunk.src,
+      width: clampPositiveInteger(chunk.width, 1),
+      height: clampPositiveInteger(chunk.height, 1)
+    }));
+}
+
+function sanitizeTileMapProfile(value: unknown): PlayableMapTileMapProfile | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+
+  const candidate = value as Partial<PlayableMapTileMapProfile>;
+
+  if (
+    candidate.version !== 1 ||
+    typeof candidate.tilesetItemId !== "string" ||
+    candidate.layerEncoding !== TILE_MAP_LAYER_ENCODING ||
+    candidate.collisionEncoding !== TILE_MAP_GRID_ENCODING ||
+    !Array.isArray(candidate.layers) ||
+    typeof candidate.collision !== "string" ||
+    typeof candidate.width !== "number" ||
+    typeof candidate.height !== "number"
+  ) {
+    return undefined;
+  }
+
+  const layers = candidate.layers.filter(
+    (layer): layer is string => typeof layer === "string"
+  );
+
+  if (layers.length === 0 || layers.length > 3) {
+    return undefined;
+  }
+
+  return {
+    version: 1,
+    tilesetItemId: candidate.tilesetItemId,
+    width: clampPositiveInteger(candidate.width, 1),
+    height: clampPositiveInteger(candidate.height, 1),
+    tileSize: clampPositiveInteger(candidate.tileSize, 32),
+    layerEncoding: TILE_MAP_LAYER_ENCODING,
+    layers,
+    collisionEncoding: TILE_MAP_GRID_ENCODING,
+    collision: candidate.collision,
+    terrainTags:
+      typeof candidate.terrainTags === "string" ? candidate.terrainTags : undefined,
+    baked:
+      candidate.baked && typeof candidate.baked === "object"
+        ? {
+            chunkCells: clampPositiveInteger(candidate.baked.chunkCells, 64),
+            background: sanitizeBakedChunks(candidate.baked.background),
+            foreground: sanitizeBakedChunks(candidate.baked.foreground),
+            bakedAt:
+              typeof candidate.baked.bakedAt === "string"
+                ? candidate.baked.bakedAt
+                : undefined
+          }
+        : undefined,
+    essentials:
+      candidate.essentials && typeof candidate.essentials === "object"
+        ? {
+            mapId:
+              typeof candidate.essentials.mapId === "string"
+                ? candidate.essentials.mapId
+                : undefined,
+            tilesetId:
+              typeof candidate.essentials.tilesetId === "number" &&
+              Number.isFinite(candidate.essentials.tilesetId)
+                ? Math.round(candidate.essentials.tilesetId)
+                : undefined,
+            sourcePath:
+              typeof candidate.essentials.sourcePath === "string"
+                ? candidate.essentials.sourcePath
+                : undefined
+          }
+        : undefined
+  };
 }
 
 function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
@@ -459,6 +629,7 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
             y: Math.max(0, clampInteger(item.y)),
           }))
       : [],
+    tileMap: sanitizeTileMapProfile(candidate.tileMap),
     essentials:
       candidate.essentials && typeof candidate.essentials === "object" &&
       typeof candidate.essentials.mapId === "string" &&
@@ -545,7 +716,7 @@ export function resolveInitialSpawnFromPlayableMapsState(snapshot: PlayableMapsS
 
 export function buildPlayableMapDefinitions(snapshot: PlayableMapsStateSnapshot): PlayableMapDefinition[] {
   return snapshot.items
-    .map((item) => {
+    .map((item): PlayableMapDefinition | null => {
       const config = sanitizePlayableMapConfig(item.playableMapConfig);
 
       if (!config) {
@@ -553,6 +724,15 @@ export function buildPlayableMapDefinitions(snapshot: PlayableMapsStateSnapshot)
       }
 
       const editorData = snapshot.editorDataByMapId[item.id] ?? sanitizePlayableMapEditorData(null);
+      const tileMap = editorData.tileMap;
+      const collisionGrid = tileMap
+        ? decodeCollisionGrid(
+            tileMap.collision,
+            tileMap.width,
+            tileMap.height,
+            tileMap.tileSize
+          ) ?? undefined
+        : undefined;
 
       return {
         mapId: item.id,
@@ -566,6 +746,7 @@ export function buildPlayableMapDefinitions(snapshot: PlayableMapsStateSnapshot)
             width: object.width,
             height: object.height,
           })),
+        collisionGrid,
       };
     })
     .filter((definition): definition is PlayableMapDefinition => definition !== null);
