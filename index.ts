@@ -1,7 +1,7 @@
 import "@dotenvx/dotenvx/config";
 import Auth from "./components/Auth";
 import DBInit from "./components/DBInit";
-import DesignerSectionStore from "./components/DesignerSectionStore";
+import DesignerSectionStore, { type DesignerSectionKey } from "./components/DesignerSectionStore";
 import GroundItemStore from "./components/GroundItemStore";
 import MailService from "./components/MailService";
 import MapAssetStore from "./components/MapAssetStore";
@@ -26,10 +26,123 @@ const STARTED_AT = new Date().toISOString();
 // server during local testing.
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN || ["http://localhost:3000","https://pokecraft.klys.dev","https://localhost","capacitor://localhost"];
 
+function buildCorsHeaders(requestOrigin:string | undefined) {
+  const allowedOrigins = Array.isArray(CLIENT_ORIGIN) ? CLIENT_ORIGIN : [CLIENT_ORIGIN];
+  const origin = requestOrigin && allowedOrigins.includes(requestOrigin)
+    ? requestOrigin
+    : allowedOrigins[0];
+
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Vary": "Origin"
+  };
+}
+
 async function bootstrap() {
   const mapAssetStore = new MapAssetStore();
+
+  // The playable-maps payload is tens of MB. Streaming it through Socket.IO
+  // starved the websocket (heartbeats queue behind the transfer → "ping
+  // timeout"/"transport error" storms), so clients fetch it here over plain
+  // HTTP instead: the browser HTTP cache holds it (localStorage can't) and
+  // the ETag turns repeat loads into cheap 304s. The socket sync remains as
+  // a fallback for older clients.
+  let playableMapsHttpCache = { etag: "", body: "" };
+  const servePlayableMaps = async (
+    request:import("http").IncomingMessage,
+    response:import("http").ServerResponse
+  ) => {
+    try {
+      const payload = await playableMapsStore.read();
+      const headers:Record<string, string> = buildCorsHeaders(request.headers.origin);
+
+      if (!payload) {
+        response.writeHead(404, headers);
+        response.end();
+        return;
+      }
+
+      const etag = `"pm-${payload.version}-${playableMapsStore.currentProbe()}"`;
+      headers["ETag"] = etag;
+      headers["Cache-Control"] = "no-cache";
+
+      if (request.headers["if-none-match"] === etag) {
+        response.writeHead(304, headers);
+        response.end();
+        return;
+      }
+
+      if (playableMapsHttpCache.etag !== etag) {
+        playableMapsHttpCache = { etag, body: JSON.stringify(payload) };
+      }
+
+      headers["Content-Type"] = "application/json";
+      response.writeHead(200, headers);
+      response.end(playableMapsHttpCache.body);
+    } catch (error) {
+      console.error("Unable to serve playable maps over HTTP:", error);
+      response.writeHead(500);
+      response.end();
+    }
+  };
+
+  // Shared designer sections every player needs (the same whitelist the
+  // socket layer exposes to authenticated non-designers). Served over HTTP so
+  // the native-app build pipeline can snapshot them into the bundled cache
+  // (and so native clients could refresh them without the socket).
+  const PUBLIC_SECTION_KEYS = new Set([
+    "pokemons",
+    "npcs",
+    "players",
+    "skillsGfx",
+    "audio",
+    "types",
+    "battleInterface"
+  ]);
+  const sectionHttpCache = new Map<string, { etag:string; body:string }>();
+  const serveDesignerSection = async (
+    sectionKey:string,
+    request:import("http").IncomingMessage,
+    response:import("http").ServerResponse
+  ) => {
+    try {
+      const payload = await designerSectionStore.read(sectionKey as DesignerSectionKey);
+      const headers:Record<string, string> = buildCorsHeaders(request.headers.origin);
+
+      if (!payload) {
+        response.writeHead(404, headers);
+        response.end();
+        return;
+      }
+
+      const etag = `"ds-${sectionKey}-${payload.version}-${payload.updatedAt ?? ""}"`;
+      headers["ETag"] = etag;
+      headers["Cache-Control"] = "no-cache";
+
+      if (request.headers["if-none-match"] === etag) {
+        response.writeHead(304, headers);
+        response.end();
+        return;
+      }
+
+      const cached = sectionHttpCache.get(sectionKey);
+      if (!cached || cached.etag !== etag) {
+        sectionHttpCache.set(sectionKey, { etag, body: JSON.stringify(payload) });
+      }
+
+      headers["Content-Type"] = "application/json";
+      response.writeHead(200, headers);
+      response.end(sectionHttpCache.get(sectionKey)!.body);
+    } catch (error) {
+      console.error(`Unable to serve designer section ${sectionKey} over HTTP:`, error);
+      response.writeHead(500);
+      response.end();
+    }
+  };
+
   // Static assets (including /map-assets/...) are served by the standalone
-  // asset-storage nginx server; this process only handles Socket.IO traffic.
+  // asset-storage nginx server; this process only handles Socket.IO traffic
+  // plus the endpoints below.
   const httpServer = createServer((request, response) => {
     if (request.url === "/healthz") {
       response.writeHead(200, { "Content-Type": "text/plain" });
@@ -40,6 +153,17 @@ async function bootstrap() {
     if (request.url === "/version") {
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({ sha: GIT_SHA, startedAt: STARTED_AT }));
+      return;
+    }
+
+    if (request.url === "/playable-maps.json") {
+      void servePlayableMaps(request, response);
+      return;
+    }
+
+    const sectionMatch = request.url?.match(/^\/designer-sections\/([a-zA-Z]+)\.json$/);
+    if (sectionMatch && PUBLIC_SECTION_KEYS.has(sectionMatch[1])) {
+      void serveDesignerSection(sectionMatch[1], request, response);
       return;
     }
 

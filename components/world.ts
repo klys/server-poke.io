@@ -816,6 +816,29 @@ export default class World {
         });
     }
 
+    /**
+     * Emits an event only to the sockets of players currently on the given
+     * map. Movement traffic must stay map-local: a global broadcast makes
+     * every connected client (other maps, admin panels) receive and process
+     * every step of every player in the world.
+     */
+    emitToMap(mapId:string, event:string, payload:unknown) {
+        const socketIds:string[] = [];
+        this.players.forEach((player) => {
+            if (player.currentMapId !== mapId) {
+                return;
+            }
+
+            player.socketConnections.forEach((socketId) => {
+                socketIds.push(socketId);
+            });
+        });
+
+        if (socketIds.length > 0) {
+            World.socketServer.to(socketIds).emit(event, payload);
+        }
+    }
+
     presentPlayerToMap(player:Player, mapId = player.currentMapId) {
         this.players.forEach((targetPlayer) => {
             if (targetPlayer.socketId === player.socketId || targetPlayer.currentMapId !== mapId) {
@@ -833,7 +856,6 @@ export default class World {
      * @param socketId - The socket ID of the targeted client.
      */
     presentObjectsTo(socketId:string) {
-        console.log("sending objects to client...")
         const mapId = this.getPlayerBySocket(socketId)?.currentMapId ?? DEFAULT_PLAYER_MAP_ID;
         this.getMapObjects(mapId).forEach( (object) => {
             World.socketServer.in(socketId).emit("addObject", object)

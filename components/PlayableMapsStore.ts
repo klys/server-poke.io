@@ -21,6 +21,10 @@ export interface PlayableMapsVersionPayload {
 }
 
 const REDIS_KEY = "designer:section:maps";
+// Tiny sidecar marker bumped on every save(); together with STRLEN of the
+// blob it forms a cheap staleness probe so cache refreshes don't have to
+// re-download and re-parse the multi-MB payload when nothing changed.
+const PROBE_KEY = `${REDIS_KEY}:probe`;
 
 function parseVersion(value: unknown) {
   return typeof value === "number" && Number.isFinite(value) && value > 0
@@ -88,13 +92,39 @@ export default class PlayableMapsStore {
 
   // The maps payload is tens of MB; parsing it from Redis on every read used
   // to burn a CPU core whenever clients churned (each addPlayer / maps sync
-  // re-parsed it). Reads are served from this cache and refreshed on a short
-  // TTL so external importers still get picked up within seconds.
-  private cache: { payload: PlayableMapsSyncPayload | null; fetchedAt: number } | null = null;
+  // re-parsed it). Reads are served from this cache; on TTL expiry a cheap
+  // probe (blob byte length + save marker) decides whether the blob actually
+  // changed — only then is it re-downloaded and re-parsed. Serving the SAME
+  // payload object also keeps its identity stable, which is what lets
+  // applyPlayableMapsStateToWorld skip rebuilding the world's map definitions.
+  private cache: {
+    payload: PlayableMapsSyncPayload | null;
+    fetchedAt: number;
+    probe: string;
+  } | null = null;
   private static CACHE_TTL_MS = 5000;
 
   constructor(redis: RedisClientType) {
     this.redis = redis;
+  }
+
+  /**
+   * Cheap change detector: byte length of the stored blob plus the marker
+   * written by save(). External importers that write the blob directly won't
+   * bump the marker, but any realistic content change alters the byte length.
+   */
+  private async fetchProbe() {
+    const [byteLength, marker] = await Promise.all([
+      this.redis.strLen(REDIS_KEY),
+      this.redis.get(PROBE_KEY)
+    ]);
+
+    return `${byteLength}:${marker ?? ""}`;
+  }
+
+  /** Probe of the currently cached payload; used to build cheap HTTP ETags. */
+  currentProbe() {
+    return this.cache?.probe ?? "";
   }
 
   async getOrCreate(seedState?: PlayableMapsStateSnapshot): Promise<PlayableMapsSyncPayload | null> {
@@ -133,8 +163,15 @@ export default class PlayableMapsStore {
       updatedByUsername
     };
 
-    await this.redis.set(REDIS_KEY, JSON.stringify(payload));
-    this.cache = { payload, fetchedAt: Date.now() };
+    const serialized = JSON.stringify(payload);
+    const marker = `${payload.version}:${payload.updatedAt}`;
+    await this.redis.set(REDIS_KEY, serialized);
+    await this.redis.set(PROBE_KEY, marker);
+    this.cache = {
+      payload,
+      fetchedAt: Date.now(),
+      probe: `${Buffer.byteLength(serialized)}:${marker}`
+    };
 
     return payload;
   }
@@ -144,16 +181,25 @@ export default class PlayableMapsStore {
       return this.cache.payload;
     }
 
+    // Probe before the full download: if the blob is byte-identical, keep
+    // serving the already-parsed payload (same object identity) and just
+    // extend the TTL window.
+    const probe = await this.fetchProbe();
+    if (this.cache && this.cache.probe === probe) {
+      this.cache.fetchedAt = Date.now();
+      return this.cache.payload;
+    }
+
     const raw = await this.redis.get(REDIS_KEY);
 
     if (!raw) {
-      this.cache = { payload: null, fetchedAt: Date.now() };
+      this.cache = { payload: null, fetchedAt: Date.now(), probe };
       return null;
     }
 
     try {
       const payload = normalizeStoredPayload(JSON.parse(raw));
-      this.cache = { payload, fetchedAt: Date.now() };
+      this.cache = { payload, fetchedAt: Date.now(), probe };
       return payload;
     } catch (error) {
       console.error("Unable to parse stored playable maps state:", error);

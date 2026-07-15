@@ -37,6 +37,18 @@ export interface SocketData {
   email?: string;
   role?: UserRoleKey;
   permissions?: RolePermission[];
+  /** Client platform from the handshake: "android" | "ios" | "electron" | "web". */
+  platform?: string;
+}
+
+// Native app builds (Capacitor/Electron) ship the heavy shared payloads
+// (playable maps, public designer sections) bundled inside the app, so the
+// server must not stream full states to them — a version payload is enough
+// and the client refreshes over cacheable HTTP when it really is stale.
+const NATIVE_PLATFORMS = new Set(["android", "ios", "electron"]);
+
+function isNativeClient(socket:ServerSocket) {
+  return NATIVE_PLATFORMS.has(socket.data.platform ?? "");
 }
 
 type ServerSocket = Socket<
@@ -306,6 +318,16 @@ async function emitPlayableMapsSyncIfStale(
     return;
   }
 
+  // Native apps carry a bundled snapshot (clientVersion is set); never stream
+  // the multi-MB state to them over the socket — announce the version and let
+  // them refresh via the cacheable /playable-maps.json HTTP endpoint. A null
+  // clientVersion means the client has nothing usable, so the full state is
+  // still sent as a safety valve.
+  if (isNativeClient(socket) && typeof clientVersion === "number") {
+    emitPlayableMapsVersion(socket, payload);
+    return;
+  }
+
   socket.emit("playableMaps:state", payload);
 }
 
@@ -424,6 +446,10 @@ function createConnectionHandler(
 ) {
   return (socket:ServerSocket) => {
     console.log("Client connected!", socket.id);
+
+    const handshakePlatform = socket.handshake.auth?.platform;
+    socket.data.platform =
+      typeof handshakePlatform === "string" ? handshakePlatform.slice(0, 20) : "web";
 
     void hydrateSocketAuth(socket, auth).catch((error) => {
       console.error("Unable to hydrate socket auth state:", error);
@@ -745,6 +771,20 @@ function createConnectionHandler(
         const payload = await designerSectionStore.getOrCreate(sectionKey, data?.seedState);
 
         if (typeof data?.version === "number" && data.version === payload.version) {
+          emitDesignerSectionVersion(socket, payload, sectionKey);
+          return;
+        }
+
+        // Native apps ship these shared sections bundled; when they hold ANY
+        // version, answer with the version payload instead of streaming the
+        // full state (they keep using their bundle until an app update). The
+        // designer-only sections are exempt so designer tooling on desktop
+        // still receives live state.
+        if (
+          canReadSharedSection &&
+          isNativeClient(socket) &&
+          typeof data?.version === "number"
+        ) {
           emitDesignerSectionVersion(socket, payload, sectionKey);
           return;
         }
@@ -1560,7 +1600,6 @@ function createConnectionHandler(
       const player = world.getPlayerBySocket(socket.id);
       if (!player) return;
       if (player.inBattle) return;
-      console.log(socket.id+" moving to "+x+" and "+y);
       player.findPath(world, x,y);
       world.players.set(player.socketId, player);
     });

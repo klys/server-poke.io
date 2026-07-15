@@ -652,14 +652,37 @@ function normalizeStoredPayload(
 
 export default class DesignerSectionStore {
   private readonly redis: RedisClientType;
-  // Sections can be tens of MB (maps, assets, pokemons); parsing them from
-  // Redis on every read starves the event loop under client churn. Reads are
-  // cached per section with a short TTL so external importers still land.
-  private readonly cache = new Map<string, { payload: DesignerSectionSyncPayload | null; fetchedAt: number }>();
+  // Sections can be tens of MB (assets, tilesets, battleBackgrounds); parsing
+  // them from Redis on every read starves the event loop under client churn.
+  // Reads are cached per section; on TTL expiry a cheap probe (blob byte
+  // length + save marker) decides whether the blob actually changed — only
+  // then is it re-downloaded and re-parsed.
+  private readonly cache = new Map<
+    string,
+    { payload: DesignerSectionSyncPayload | null; fetchedAt: number; probe: string }
+  >();
   private static CACHE_TTL_MS = 5000;
 
   constructor(redis: RedisClientType) {
     this.redis = redis;
+  }
+
+  private probeKey(sectionKey: DesignerSectionKey) {
+    return `${getRedisKey(sectionKey)}:probe`;
+  }
+
+  /**
+   * Cheap change detector: byte length of the stored blob plus the marker
+   * written by save(). External importers that write the blob directly won't
+   * bump the marker, but any realistic content change alters the byte length.
+   */
+  private async fetchProbe(sectionKey: DesignerSectionKey) {
+    const [byteLength, marker] = await Promise.all([
+      this.redis.strLen(getRedisKey(sectionKey)),
+      this.redis.get(this.probeKey(sectionKey))
+    ]);
+
+    return `${byteLength}:${marker ?? ""}`;
   }
 
   async getOrCreate(
@@ -691,8 +714,15 @@ export default class DesignerSectionStore {
       updatedByUsername
     };
 
-    await this.redis.set(getRedisKey(sectionKey), JSON.stringify(payload));
-    this.cache.set(sectionKey, { payload, fetchedAt: Date.now() });
+    const serialized = JSON.stringify(payload);
+    const marker = `${payload.version}:${payload.updatedAt}`;
+    await this.redis.set(getRedisKey(sectionKey), serialized);
+    await this.redis.set(this.probeKey(sectionKey), marker);
+    this.cache.set(sectionKey, {
+      payload,
+      fetchedAt: Date.now(),
+      probe: `${Buffer.byteLength(serialized)}:${marker}`
+    });
 
     return payload;
   }
@@ -703,16 +733,24 @@ export default class DesignerSectionStore {
       return cached.payload;
     }
 
+    // Probe before the full download: if the blob is byte-identical, keep
+    // serving the already-parsed payload and just extend the TTL window.
+    const probe = await this.fetchProbe(sectionKey);
+    if (cached && cached.probe === probe) {
+      cached.fetchedAt = Date.now();
+      return cached.payload;
+    }
+
     const raw = await this.redis.get(getRedisKey(sectionKey));
 
     if (!raw) {
-      this.cache.set(sectionKey, { payload: null, fetchedAt: Date.now() });
+      this.cache.set(sectionKey, { payload: null, fetchedAt: Date.now(), probe });
       return null;
     }
 
     try {
       const payload = normalizeStoredPayload(sectionKey, JSON.parse(raw));
-      this.cache.set(sectionKey, { payload, fetchedAt: Date.now() });
+      this.cache.set(sectionKey, { payload, fetchedAt: Date.now(), probe });
       return payload;
     } catch (error) {
       console.error(`Unable to parse stored designer ${sectionKey} state:`, error);

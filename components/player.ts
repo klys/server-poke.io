@@ -151,7 +151,10 @@ export default class Player {
                 this.angle = GameMath.roundToQuadrant(blockedDirection);
                 this.path = [];
                 this.path_pos = 0;
-                World.socketServer.emit("move"+this.socketId, {
+                // Walk/turn/stop updates stay map-local (see World.emitToMap);
+                // only teleport() broadcasts globally, because the map change
+                // is what tells viewers on the old map to hide this player.
+                this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
                     x:this.x,
                     y:this.y,
                     angle:this.angle,
@@ -173,7 +176,7 @@ export default class Player {
         this.y = nextY;
 
         if (!advancePath) {
-            World.socketServer.emit("move"+this.socketId, {
+            this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
                 x:this.x,
                 y:this.y,
                 angle:this.angle,
@@ -186,11 +189,11 @@ export default class Player {
         }
 
         this.path_pos = this.path_pos + 1;
-        World.socketServer.emit("move"+this.socketId, {
+        this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
             x:this.x,
             y:this.y,
             angle:this.angle,
-            playerId:this.socketId, 
+            playerId:this.socketId,
             id:this.id,
             currentMapId:this.currentMapId
         })
@@ -222,7 +225,8 @@ export default class Player {
         this.path = [];
         this.path_pos = 0;
 
-        World.socketServer.emit("move"+this.socketId, {
+        // Same-map relocation: only viewers of this map need the correction.
+        this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
             x:this.x,
             y:this.y,
             angle:this.angle,
@@ -262,7 +266,7 @@ export default class Player {
         if (this.path.length === 0 && (x !== this.x || y !== this.y)) {
             const direction = GameMath.point_direction(this.x, this.y, x, y) + 180;
             this.angle = GameMath.roundToQuadrant(direction);
-            World.socketServer.emit("move"+this.socketId, {
+            this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
                 x:this.x,
                 y:this.y,
                 angle:this.angle,
@@ -315,20 +319,6 @@ export default class Player {
      * @returns An object containing the current player details.
      */
     public data() {
-        const playerData = {
-            playerId:this.socketId,
-            currentMapId:this.currentMapId,
-            x:this.x,
-            y:this.y,
-            angle:this.angle,
-            id:this.id,
-            username:this.username,
-            name:this.name,
-            profileImage:this.profileImage,
-            description:this.description,
-            characterSkinId:this.characterSkinId
-        }
-        console.log("presenting existing player with data:", playerData)
         return{
             playerId:this.socketId,
             currentMapId:this.currentMapId,
@@ -371,7 +361,7 @@ export default class Player {
         this.path = [];
         this.path_pos = 0;
 
-        World.socketServer.emit("move"+this.socketId, {
+        this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
             x:this.x,
             y:this.y,
             angle:this.angle,
