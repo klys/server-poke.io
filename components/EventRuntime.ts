@@ -638,8 +638,10 @@ export default class EventRuntime {
       if (skinId) {
         await this.auth.setCharacterSkin(session.userId, skinId);
         session.player.characterSkinId = skinId;
-        // Re-present so everyone on the map sees the new skin immediately.
+        // Re-present so everyone on the map sees the new skin immediately —
+        // including the acting player, whom presentPlayerToMap skips.
         this.world.presentPlayerToMap(session.player);
+        this.presentPlayerToOwnClient(session.player);
         await this.refreshSession(session);
       }
       return;
@@ -661,6 +663,7 @@ export default class EventRuntime {
       if (await this.auth.setUserName(session.userId, finalName)) {
         session.player.name = finalName;
         this.world.presentPlayerToMap(session.player);
+        this.presentPlayerToOwnClient(session.player);
         await this.refreshSession(session);
       }
       return;
@@ -801,6 +804,20 @@ export default class EventRuntime {
     }
     session.player.socketConnections.forEach((socketId) => {
       this.io.to(socketId).emit("auth:session", { authenticated: true, user });
+    });
+  }
+
+  /**
+   * Push the player's own updated sprite (skin/name) to their own client.
+   * world.presentPlayerToMap intentionally skips the acting socket to avoid
+   * movement echo, so an in-event change (the intro's gender pick, name entry)
+   * would otherwise only show up for *other* players until the acting player
+   * refreshes and re-joins.
+   */
+  private presentPlayerToOwnClient(player: Player) {
+    const data = player.data();
+    player.socketConnections.forEach((socketId) => {
+      this.io.to(socketId).emit("addPlayer", data);
     });
   }
 
