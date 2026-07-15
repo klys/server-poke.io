@@ -107,6 +107,18 @@ async function hydrateSocketAuthWithToken(
 }
 
 const DESIGNER_MAPS_ROOM = "designer:maps";
+const ADMIN_PRESENCE_ROOM = "admin:presence";
+
+/**
+ * Push the current set of online user ids to every admin subscribed to the
+ * live presence room. Called whenever the world's authenticated population
+ * changes (player joins / leaves).
+ */
+function broadcastAdminPresence(io:TypedSocketServer, world:World) {
+  io.to(ADMIN_PRESENCE_ROOM).emit("admin:presence:state", {
+    onlineUserIds: world.getOnlineUserIds()
+  });
+}
 
 function requireDesignerAccess(
   socket:ServerSocket,
@@ -1070,6 +1082,196 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("admin:user:delete", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", { message: "Choose a valid user." });
+          return;
+        }
+
+        if (socket.data.userId === userId) {
+          socket.emit("admin:error", { message: "You cannot delete your own account." });
+          return;
+        }
+
+        const player = world.getPlayerByUserId(userId);
+        if (player && battleManager.isPlayerBattling(player.socketId)) {
+          socket.emit("admin:error", {
+            message: "That trainer is battling right now. Wait for the battle to end before deleting."
+          });
+          return;
+        }
+
+        const result = await auth.deleteUser(userId);
+        if ("error" in result) {
+          socket.emit("admin:error", { message: result.error });
+          return;
+        }
+
+        // Force any live sessions off. Clearing auth on the socket first stops
+        // the disconnect handler from re-persisting a saved location into the
+        // hash we just deleted.
+        const targetSockets = Array.from(_io.sockets.sockets.values()).filter(
+          (candidate) => candidate.data.userId === userId
+        );
+        for (const targetSocket of targetSockets) {
+          world.removePlayer(targetSocket.id);
+          applySocketAuth(targetSocket.data, null);
+          targetSocket.emit("auth:error", {
+            message: "Your account has been removed by an administrator."
+          });
+          targetSocket.disconnect(true);
+        }
+
+        broadcastAdminPresence(_io, world);
+
+        socket.emit("admin:user:deleted", { userId });
+        socket.emit("auth:info", { message: `Deleted ${result.username} and all their data.` });
+      } catch (error) {
+        console.error("Unable to delete admin user:", error);
+        socket.emit("admin:error", {
+          message: "Unable to delete the selected user."
+        });
+      }
+    });
+
+    socket.on("admin:user:set-password", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", { message: "Choose a valid user." });
+          return;
+        }
+
+        const result = await auth.setUserPasswordByAdmin(
+          userId,
+          typeof data?.newPassword === "string" ? data.newPassword : ""
+        );
+        if ("error" in result) {
+          socket.emit("admin:error", { message: result.error });
+          return;
+        }
+
+        socket.emit("auth:info", { message: result.message });
+      } catch (error) {
+        console.error("Unable to set user password:", error);
+        socket.emit("admin:error", {
+          message: "Unable to update the password right now."
+        });
+      }
+    });
+
+    socket.on("admin:user:send-recovery", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", { message: "Choose a valid user." });
+          return;
+        }
+
+        const result = await auth.sendPasswordRecoveryByUserId(userId);
+        if ("error" in result) {
+          socket.emit("admin:error", { message: result.error });
+          return;
+        }
+
+        socket.emit("auth:info", { message: result.message });
+      } catch (error) {
+        console.error("Unable to send password recovery email:", error);
+        socket.emit("admin:error", {
+          message: "Unable to send the recovery email right now."
+        });
+      }
+    });
+
+    socket.on("admin:catalog:get", async () => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const [{ items, pokemons }, playableMaps] = await Promise.all([
+          auth.getAdminCatalogSections(),
+          playableMapsStore.read()
+        ]);
+
+        const maps = (playableMaps?.state.items ?? [])
+          .map((item) => ({
+            mapId: typeof item.id === "string" ? item.id : "",
+            name: typeof item.name === "string" ? item.name : "",
+            category: typeof item.category === "string" ? item.category : ""
+          }))
+          .filter((entry) => entry.mapId.length > 0)
+          .sort((left, right) => left.name.localeCompare(right.name));
+
+        socket.emit("admin:catalog", { items, pokemons, maps });
+      } catch (error) {
+        console.error("Unable to load admin catalog:", error);
+        socket.emit("admin:error", {
+          message: "Unable to load the item and map catalog."
+        });
+      }
+    });
+
+    socket.on("admin:presence:subscribe", async () => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        await socket.join(ADMIN_PRESENCE_ROOM);
+        socket.emit("admin:presence:state", {
+          onlineUserIds: world.getOnlineUserIds()
+        });
+      } catch (error) {
+        console.error("Unable to subscribe to admin presence:", error);
+        socket.emit("admin:error", {
+          message: "Unable to load live online status."
+        });
+      }
+    });
+
+    socket.on("admin:presence:unsubscribe", async () => {
+      try {
+        await socket.leave(ADMIN_PRESENCE_ROOM);
+      } catch (error) {
+        console.error("Unable to unsubscribe from admin presence:", error);
+      }
+    });
+
     socket.on("admin:roles:list", async () => {
       try {
         if (!socket.data.authenticated && readSocketToken(socket)) {
@@ -1347,6 +1549,8 @@ function createConnectionHandler(
         if (typeof socket.data.userId === "number") {
           void eventRuntime.emitEventState(socket.data.userId);
           void eventRuntime.runAutorunForMap(socket.data.userId);
+          // A newly-authenticated player changed the online population.
+          broadcastAdminPresence(_io, world);
         }
       }
     });
@@ -1692,7 +1896,12 @@ function createConnectionHandler(
         eventRuntime.handleDisconnect(socket.data.userId);
       }
 
+      const wasAuthenticated = typeof socket.data.userId === "number";
       world.removePlayer(socket.id);
+      // A player leaving may drop them out of the online set — refresh admins.
+      if (wasAuthenticated) {
+        broadcastAdminPresence(_io, world);
+      }
     });
   };
 }

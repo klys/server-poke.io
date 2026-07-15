@@ -241,6 +241,12 @@ export default interface ClientToServerEvents {
   "admin:user:get": (data: { userId: number }) => void;
   "admin:user:update": (data: { userId: number; updates: AdminUserUpdatePayload }) => void;
   "admin:user:reset-progress": (data: { userId: number }) => void;
+  "admin:user:delete": (data: { userId: number }) => void;
+  "admin:user:set-password": (data: { userId: number; newPassword: string }) => void;
+  "admin:user:send-recovery": (data: { userId: number }) => void;
+  "admin:catalog:get": () => void;
+  "admin:presence:subscribe": () => void;
+  "admin:presence:unsubscribe": () => void;
   "admin:roles:list": () => void;
   "admin:role:update": (data: {
     roleKey: UserRoleKey;

@@ -147,6 +147,10 @@ export interface InventoryItem {
     category:"usable" | "berries" | "moves" | "quest";
     quantity:number;
     description:string;
+    // Read-only enrichment for admin/UX surfaces. Never persisted (the storage
+    // sanitizers drop unknown fields), resolved on read from the designer item
+    // catalog so the client can render an icon instead of a raw id.
+    iconSrc?:string;
 }
 
 export interface PokemonSummary {
@@ -170,6 +174,37 @@ export interface PokemonSummary {
     heldItemId?:string;
     heldItemName?:string;
     pendingMoveLearns?:string[];
+    // Read-only enrichment for admin/UX surfaces (see InventoryItem.iconSrc).
+    iconImageSrc?:string;
+    frontImageSrc?:string;
+}
+
+export interface AdminItemCatalogEntry {
+    id:string;
+    name:string;
+    category:InventoryItem["category"];
+    description:string;
+    iconSrc:string;
+}
+
+export interface AdminPokemonCatalogEntry {
+    id:string;
+    name:string;
+    types:string[];
+    iconImageSrc:string;
+    hp:number;
+}
+
+export interface AdminCatalogPayload {
+    items:AdminItemCatalogEntry[];
+    pokemons:AdminPokemonCatalogEntry[];
+    maps:AdminMapCatalogEntry[];
+}
+
+export interface AdminMapCatalogEntry {
+    mapId:string;
+    name:string;
+    category:string;
 }
 
 export interface BattleHistoryEntry {
@@ -1102,6 +1137,54 @@ export default class Auth {
         };
     }
 
+    /**
+     * Permanently removes an account and every trace of its data: the primary
+     * `auth:user:{id}` hash (party, inventory, money, battle history, saved
+     * location, respawn point, boxed Pokemon, event switches/variables), the
+     * username/email lookup indexes, and any active sessions (which logs the
+     * user out everywhere). One-time reset/validation tokens are left to expire
+     * on their own TTL. This is irreversible.
+     */
+    public async deleteUser(userId:number):Promise<{ username:string } | { error:string }> {
+        const storedUser = await this.getStoredUserById(String(userId));
+        if (!storedUser) {
+            return { error: "User not found." };
+        }
+
+        await this.deleteSessionsForUser(userId);
+
+        const keysToDelete = [this.userKey(userId)];
+        const username = typeof storedUser.username === "string" ? storedUser.username.toLowerCase() : "";
+        const email = typeof storedUser.email === "string" ? storedUser.email.toLowerCase() : "";
+        if (username) {
+            keysToDelete.push(this.usernameIndexKey(username));
+        }
+        if (email) {
+            keysToDelete.push(this.emailIndexKey(email));
+        }
+
+        await this.redis.del(keysToDelete);
+
+        return { username: storedUser.username };
+    }
+
+    private async deleteSessionsForUser(userId:number) {
+        const target = String(userId);
+        const pattern = `${this.sessionKey("")}*`;
+
+        for await (const batch of this.redis.scanIterator({ MATCH: pattern, COUNT: 200 })) {
+            // node-redis may yield a single key or a batch of keys depending on
+            // version; normalize to an array either way.
+            const keys = Array.isArray(batch) ? batch : [batch];
+            for (const key of keys) {
+                const value = await this.redis.get(key);
+                if (value === target) {
+                    await this.redis.del(key);
+                }
+            }
+        }
+    }
+
 
     // ---- RPG Maker event state: switches / variables / self-switches ----
     // Persisted per user so multi-page events (page conditions) and progression
@@ -1812,10 +1895,222 @@ export default class Auth {
     }
 
     private async toAdminUserDetails(user:StoredUser):Promise<AdminUserDetails> {
+        const base = this.toAuthenticatedUser(user);
+        const [itemIcons, pokemonIcons, savedLocation] = await Promise.all([
+            this.readItemIconIndex(),
+            this.readPokemonIconIndex(),
+            this.getSavedPlayerLocation(user.id)
+        ]);
+
         return {
-            ...this.toAuthenticatedUser(user),
+            ...base,
+            inventory: base.inventory.map((item) => {
+                const iconSrc = itemIcons.get(item.id);
+                return iconSrc ? { ...item, iconSrc } : item;
+            }),
+            pokemonParty: base.pokemonParty.map((pokemon) => {
+                const icons =
+                    pokemonIcons.get(pokemon.sourcePokemonId ?? "") ??
+                    pokemonIcons.get(pokemon.id);
+                return icons
+                    ? {
+                          ...pokemon,
+                          iconImageSrc: icons.iconImageSrc || pokemon.iconImageSrc,
+                          frontImageSrc: icons.frontImageSrc || pokemon.frontImageSrc
+                      }
+                    : pokemon;
+            }),
             createdAt: user.created_at,
-            savedLocation: await this.getSavedPlayerLocation(user.id)
+            savedLocation
+        };
+    }
+
+    /**
+     * Reads a designer catalog section straight from Redis (same source the
+     * battle engine reads). Kept dependency-free so Auth can enrich admin
+     * payloads without pulling in DesignerSectionStore.
+     */
+    private async readDesignerSectionItems(sectionKey:string):Promise<Array<Record<string, unknown>>> {
+        const raw = await this.redis.get(`designer:section:${sectionKey}`);
+        if (!raw) {
+            return [];
+        }
+
+        try {
+            const parsed = JSON.parse(raw);
+            const items = parsed?.state?.items;
+            return Array.isArray(items) ? items : [];
+        } catch {
+            return [];
+        }
+    }
+
+    private async readItemIconIndex():Promise<Map<string, string>> {
+        const items = await this.readDesignerSectionItems("items");
+        const index = new Map<string, string>();
+        for (const item of items) {
+            const id = typeof item.id === "string" ? item.id : "";
+            const profile = (item.itemProfile ?? {}) as { iconSrc?:unknown };
+            if (id && typeof profile.iconSrc === "string" && profile.iconSrc) {
+                index.set(id, profile.iconSrc);
+            }
+        }
+        return index;
+    }
+
+    private async readPokemonIconIndex():Promise<Map<string, { iconImageSrc:string; frontImageSrc:string }>> {
+        const items = await this.readDesignerSectionItems("pokemons");
+        const index = new Map<string, { iconImageSrc:string; frontImageSrc:string }>();
+        for (const item of items) {
+            const id = typeof item.id === "string" ? item.id : "";
+            const profile = (item.pokemonProfile ?? {}) as { iconImageSrc?:unknown; frontImageSrc?:unknown };
+            if (!id) {
+                continue;
+            }
+            index.set(id, {
+                iconImageSrc: typeof profile.iconImageSrc === "string" ? profile.iconImageSrc : "",
+                frontImageSrc: typeof profile.frontImageSrc === "string" ? profile.frontImageSrc : ""
+            });
+        }
+        return index;
+    }
+
+    private toAdminInventoryCategory(type:string):InventoryItem["category"] {
+        switch (type.trim().toLowerCase()) {
+            case "berries":
+                return "berries";
+            case "skill item":
+            case "machines":
+                return "moves";
+            case "quest item":
+                return "quest";
+            case "usable":
+            case "medicine":
+            case "battle item":
+            case "battle items":
+            case "pokeball":
+            case "hold items":
+                return "usable";
+            default:
+                return "quest";
+        }
+    }
+
+    /**
+     * Item + Pokemon pickers for the admin panel's "add" controls. Icons are
+     * returned as root-relative asset paths; the client resolves them through
+     * its asset-storage base URL.
+     */
+    public async getAdminCatalogSections():Promise<{
+        items:AdminItemCatalogEntry[];
+        pokemons:AdminPokemonCatalogEntry[];
+    }> {
+        const [itemRecords, pokemonRecords] = await Promise.all([
+            this.readDesignerSectionItems("items"),
+            this.readDesignerSectionItems("pokemons")
+        ]);
+
+        const items:AdminItemCatalogEntry[] = itemRecords
+            .map((record) => {
+                const id = typeof record.id === "string" ? record.id : "";
+                const profile = (record.itemProfile ?? {}) as {
+                    iconSrc?:unknown;
+                    description?:unknown;
+                    type?:unknown;
+                };
+                return {
+                    id,
+                    name: typeof record.name === "string" ? record.name : id,
+                    category: this.toAdminInventoryCategory(
+                        typeof profile.type === "string" ? profile.type : ""
+                    ),
+                    description: typeof profile.description === "string" ? profile.description : "",
+                    iconSrc: typeof profile.iconSrc === "string" ? profile.iconSrc : ""
+                };
+            })
+            .filter((entry) => entry.id.length > 0)
+            .sort((left, right) => left.name.localeCompare(right.name));
+
+        const pokemons:AdminPokemonCatalogEntry[] = pokemonRecords
+            .map((record) => {
+                const id = typeof record.id === "string" ? record.id : "";
+                const profile = (record.pokemonProfile ?? {}) as {
+                    elements?:unknown;
+                    iconImageSrc?:unknown;
+                    hp?:unknown;
+                };
+                return {
+                    id,
+                    name: typeof record.name === "string" ? record.name : id,
+                    types: Array.isArray(profile.elements)
+                        ? profile.elements.filter((element):element is string => typeof element === "string")
+                        : [],
+                    iconImageSrc: typeof profile.iconImageSrc === "string" ? profile.iconImageSrc : "",
+                    hp: typeof profile.hp === "number" && Number.isFinite(profile.hp) ? profile.hp : 0
+                };
+            })
+            .filter((entry) => entry.id.length > 0)
+            .sort((left, right) => left.name.localeCompare(right.name));
+
+        return { items, pokemons };
+    }
+
+    /**
+     * Admin-initiated password reset. Unlike changePassword this does not
+     * require the current password; it is gated by admin.access at the socket
+     * layer.
+     */
+    public async setUserPasswordByAdmin(
+        userId:number,
+        newPassword:string
+    ):Promise<AuthInfoResult | AuthErrorResult> {
+        const storedUser = await this.getStoredUserById(String(userId));
+        if (!storedUser) {
+            return { error: "User not found." };
+        }
+
+        const passwordValidation = this.validatePassword(
+            typeof newPassword === "string" ? newPassword : ""
+        );
+        if (passwordValidation) {
+            return { error: passwordValidation };
+        }
+
+        const passwordSalt = crypto.randomBytes(16).toString("hex");
+        const passwordHash = this.hashPassword(newPassword, passwordSalt);
+        await this.redis.hSet(this.userKey(userId), {
+            password_hash: passwordHash,
+            password_salt: passwordSalt
+        });
+
+        return { message: `Password updated for ${storedUser.username}.` };
+    }
+
+    /**
+     * Sends the standard password-recovery email to a user chosen by an admin.
+     * Returns whether the mail was actually dispatched so the panel can warn
+     * when SMTP is disabled.
+     */
+    public async sendPasswordRecoveryByUserId(
+        userId:number
+    ):Promise<{ message:string; delivered:boolean } | AuthErrorResult> {
+        const storedUser = await this.getStoredUserById(String(userId));
+        if (!storedUser) {
+            return { error: "User not found." };
+        }
+
+        const recoveryToken = await this.createPasswordResetToken(storedUser.id);
+        await this.mailService.sendPasswordRecoveryEmail(
+            this.toAuthenticatedUser(storedUser),
+            recoveryToken
+        );
+
+        const delivered = this.mailService.isEnabled();
+        return {
+            delivered,
+            message: delivered
+                ? `Password recovery email sent to ${storedUser.email}.`
+                : `Recovery link created, but email delivery is disabled on this server.`
         };
     }
 

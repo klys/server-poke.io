@@ -674,6 +674,21 @@ export default class World {
         return this.players.get(this.getAuthenticatedPlayerId(userId));
     }
 
+    /**
+     * Distinct authenticated user ids that currently have at least one live
+     * player in the world. Powers the admin panel's real-time "who is online"
+     * indicator.
+     */
+    getOnlineUserIds():number[] {
+        const userIds = new Set<number>();
+        this.players.forEach((player) => {
+            if (typeof player.userId === "number") {
+                userIds.add(player.userId);
+            }
+        });
+        return Array.from(userIds);
+    }
+
     getOnlineMapsOverview() {
         const maps = new Map<string, {
             mapId:string;

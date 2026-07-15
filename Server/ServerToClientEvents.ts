@@ -1,4 +1,5 @@
 import type {
+  AdminCatalogPayload,
   AdminUserDetails,
   AdminUserListPayload,
   RoleDefinitionWithCount
@@ -239,6 +240,10 @@ export default interface ServerToClientEvents {
   }) => void;
   "admin:users:list": (data: AdminUserListPayload) => void;
   "admin:user:details": (data: { user: AdminUserDetails | null }) => void;
+  "admin:user:deleted": (data: { userId: number }) => void;
+  "admin:catalog": (data: AdminCatalogPayload) => void;
+  /** Real-time set of user ids currently online, pushed to subscribed admins. */
+  "admin:presence:state": (data: { onlineUserIds: number[] }) => void;
   "admin:roles:list": (data: { roles: RoleDefinitionWithCount[] }) => void;
   "admin:apikeys:list": (data: { keys: ApiKeySummary[] }) => void;
   /** One-time reveal of a freshly minted key's plaintext secret. */

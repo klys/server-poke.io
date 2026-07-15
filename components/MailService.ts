@@ -128,6 +128,10 @@ export default class MailService {
         });
     }
 
+    public isEnabled() {
+        return this.transporter !== null;
+    }
+
     private isConfigured() {
         return Boolean(
             this.smtpEnabled &&
