@@ -15,6 +15,11 @@ RUN npm run build
 
 FROM node:22-alpine AS runtime
 
+# The git commit this image was built from. Passed via
+# `docker build --build-arg GIT_SHA=<sha>` and surfaced at /version so the
+# deploy pipeline can confirm prod is running the pushed commit.
+ARG GIT_SHA=unknown
+ENV GIT_SHA=$GIT_SHA
 ENV NODE_ENV=production
 WORKDIR /app
 

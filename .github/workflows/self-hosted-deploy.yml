@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - master # Change this to match your default branch if needed
+  workflow_dispatch: # Allow a manual redeploy of the current branch from the Actions tab
+
+# Never let two deploys race on the same host over `docker compose up`.
+# Queue instead of cancelling so an in-flight deploy always finishes cleanly.
+concurrency:
+  group: deploy-server-poke-io
+  cancel-in-progress: false
 
 jobs:
   run-app:
@@ -25,7 +32,12 @@ jobs:
           echo "$ENV_SECRET" > .env
 
       - name: Build Docker image
-        run: docker build -t "$IMAGE_NAME:${{ github.sha }}" -t "$IMAGE_NAME:latest" .
+        run: |
+          docker build \
+            --build-arg GIT_SHA="${{ github.sha }}" \
+            -t "$IMAGE_NAME:${{ github.sha }}" \
+            -t "$IMAGE_NAME:latest" \
+            .
 
       - name: Deploy with Docker Compose
         run: |
@@ -47,6 +59,28 @@ jobs:
             docker compose logs
             exit 1
           fi
+
+      - name: Verify deployed version
+        # Fail the deploy unless the running container reports the SHA we just
+        # built. This is what makes "prod silently out of date" impossible to
+        # miss: a stale or crash-looping container turns the run red.
+        run: |
+          EXPECTED="${{ github.sha }}"
+          DEPLOYED=""
+          for i in $(seq 1 15); do
+            DEPLOYED=$(curl -fsS http://localhost:3001/version 2>/dev/null \
+              | sed -n 's/.*"sha":"\([^"]*\)".*/\1/p') || true
+            if [ -n "$DEPLOYED" ]; then break; fi
+            sleep 2
+          done
+          echo "Expected SHA: $EXPECTED"
+          echo "Deployed SHA: ${DEPLOYED:-<none>}"
+          if [ "$DEPLOYED" != "$EXPECTED" ]; then
+            echo "::error::Prod is not running $EXPECTED (got '${DEPLOYED:-<none>}'). The image did not update correctly."
+            docker compose logs --tail=80
+            exit 1
+          fi
+          echo "✅ Verified: prod is running $EXPECTED"
 
       - name: Prune old images
         if: always()

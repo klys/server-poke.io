@@ -16,6 +16,11 @@ import InterServerEvents from "./Server/InterServerEvents";
 import registerSocketHandlers, { type SocketData } from "./Server/registerSocketHandlers";
 
 const PORT = Number(process.env.PORT || 3001);
+// The git commit this image was built from, baked in via the Dockerfile
+// `GIT_SHA` build arg. Exposed at /version so the deploy pipeline can verify
+// prod is actually running the pushed commit instead of a stale image.
+const GIT_SHA = process.env.GIT_SHA || "unknown";
+const STARTED_AT = new Date().toISOString();
 // `https://localhost` / `capacitor://localhost` are the origins the Capacitor
 // (Android/iOS) app's WebView uses, so the mobile client can connect to this
 // server during local testing.
@@ -29,6 +34,12 @@ async function bootstrap() {
     if (request.url === "/healthz") {
       response.writeHead(200, { "Content-Type": "text/plain" });
       response.end("ok");
+      return;
+    }
+
+    if (request.url === "/version") {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({ sha: GIT_SHA, startedAt: STARTED_AT }));
       return;
     }
 
@@ -70,6 +81,7 @@ async function bootstrap() {
   registerSocketHandlers(io, world, auth, designerSectionStore, playableMapsStore, groundItemStore, mapAssetStore, pokecraftApi);
 
   httpServer.listen(PORT, () => {
+    console.log(`server-poke.io build ${GIT_SHA} started at ${STARTED_AT}`);
     console.log("Listening on port "+PORT);
   });
 }
