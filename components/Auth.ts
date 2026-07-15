@@ -87,6 +87,15 @@ interface StoredUser extends AuthenticatedUser {
     created_at:string;
 }
 
+/** Minimal projection of a stored user for admin search/count scans. */
+interface UserSearchRow {
+    id:number;
+    name:string;
+    username:string;
+    email:string;
+    role:UserRoleKey;
+}
+
 export interface AdminUserSummary {
     id:number;
     name:string;
@@ -370,6 +379,7 @@ export default class Auth {
     private readonly passwordPepper:string;
     private readonly emailValidationTtlSeconds:number;
     private readonly passwordResetTtlSeconds:number;
+    private roleDefinitionsCache:{ roles:RoleDefinition[]; expiresAt:number } | null = null;
 
     constructor(redis:RedisClientType, mailService:MailService) {
         this.redis = redis;
@@ -868,7 +878,7 @@ export default class Auth {
     public async getRoleDefinitionsWithCounts():Promise<RoleDefinitionWithCount[]> {
         const [roles, users] = await Promise.all([
             this.readRoleDefinitions(),
-            this.getAllStoredUsers()
+            this.getUserSearchRows()
         ]);
         const counts = users.reduce<Record<UserRoleKey, number>>((accumulator, user) => {
             accumulator[user.role] += 1;
@@ -921,6 +931,7 @@ export default class Auth {
         };
 
         await this.redis.set(this.roleDefinitionsKey(), JSON.stringify(roles));
+        this.roleDefinitionsCache = null;
 
         return {
             role: roles[roleIndex]
@@ -941,7 +952,7 @@ export default class Auth {
         const pageSize = typeof payload?.pageSize === "number" && Number.isFinite(payload.pageSize)
             ? Math.max(5, Math.min(50, Math.round(payload.pageSize)))
             : 10;
-        const users = await this.getAllStoredUsers();
+        const users = await this.getUserSearchRows();
         const filteredUsers = users
             .filter((user) => {
                 if (!search) {
@@ -962,8 +973,16 @@ export default class Auth {
         const totalPages = Math.max(1, Math.ceil(total / pageSize));
         const page = Math.min(requestedPage, totalPages);
         const startIndex = (page - 1) * pageSize;
-        const pagedUsers = filteredUsers.slice(startIndex, startIndex + pageSize);
-        const summaries = await Promise.all(pagedUsers.map((user) => this.toAdminUserSummary(user)));
+        const pagedRows = filteredUsers.slice(startIndex, startIndex + pageSize);
+        // Only the visible page pays the cost of full record hydration.
+        const pagedUsers = await Promise.all(
+            pagedRows.map((row) => this.getStoredUserById(String(row.id)))
+        );
+        const summaries = await Promise.all(
+            pagedUsers
+                .filter((user): user is StoredUser => Boolean(user))
+                .map((user) => this.toAdminUserSummary(user))
+        );
 
         return {
             users: summaries,
@@ -1526,16 +1545,35 @@ export default class Auth {
     private async ensureRoleDefinitions() {
         const roles = await this.readRoleDefinitions();
         await this.redis.set(this.roleDefinitionsKey(), JSON.stringify(roles));
+        this.roleDefinitionsCache = null;
     }
 
+    /**
+     * Role definitions are read on nearly every user hydration, so they are
+     * memoized briefly. Definitions only change through updateRoleDefinition
+     * (which invalidates the cache); the TTL is just a safety net in case the
+     * Redis value is edited out-of-band.
+     */
     private async readRoleDefinitions() {
+        const cached = this.roleDefinitionsCache;
+        if (cached && cached.expiresAt > Date.now()) {
+            return cached.roles;
+        }
+
         const parsed = this.sanitizeRoleDefinitions(
             await this.redis.get(this.roleDefinitionsKey())
         );
 
-        return USER_ROLE_KEYS.map((roleKey) => (
+        const roles = USER_ROLE_KEYS.map((roleKey) => (
             parsed.find((role) => role.key === roleKey) ?? DEFAULT_ROLE_DEFINITIONS.find((role) => role.key === roleKey)!
         ));
+
+        this.roleDefinitionsCache = {
+            roles,
+            expiresAt: Date.now() + 5000
+        };
+
+        return roles;
     }
 
     private sanitizeRoleDefinitions(value:string | null) {
@@ -1770,17 +1808,47 @@ export default class Auth {
         return user ? this.toAuthenticatedUser(user) : null;
     }
 
-    private async getAllStoredUsers() {
+    /**
+     * Lightweight scan over every stored user, reading only the small fields
+     * the admin panel filters/sorts/counts on. Full records (with their large
+     * inventory/party/battle-history JSON blobs) must be hydrated per-user via
+     * getStoredUserById for the rows that are actually displayed — hydrating
+     * them for the whole table on every list request stalls the event loop
+     * long enough to trip Socket.IO ping timeouts.
+     */
+    private async getUserSearchRows() {
         const highestUserId = Number.parseInt(await this.redis.get(this.userIdSequenceKey()) ?? "0", 10);
         if (!Number.isFinite(highestUserId) || highestUserId <= 0) {
             return [];
         }
 
-        const users = await Promise.all(
-            Array.from({ length: highestUserId }, (_, index) => this.getStoredUserById(String(index + 1)))
-        );
+        const chunkSize = 200;
+        const rows:UserSearchRow[] = [];
 
-        return users.filter((user): user is StoredUser => Boolean(user));
+        for (let start = 1; start <= highestUserId; start += chunkSize) {
+            const count = Math.min(chunkSize, highestUserId - start + 1);
+            const chunk = await Promise.all(
+                Array.from({ length: count }, (_, index) => (
+                    this.redis.hmGet(this.userKey(start + index), ["id", "name", "username", "email", "role"])
+                ))
+            );
+
+            for (const [id, name, username, email, role] of chunk) {
+                if (!id) {
+                    continue;
+                }
+
+                rows.push({
+                    id: Number(id),
+                    name: name ?? "",
+                    username: username ?? "",
+                    email: email ?? "",
+                    role: this.isUserRoleKey(role) ? role : "user"
+                });
+            }
+        }
+
+        return rows;
     }
 
     private async getStoredUserById(userId:string) {

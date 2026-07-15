@@ -57,7 +57,17 @@ async function bootstrap() {
       credentials: true
     },
     // Baked map surface uploads (designer:mapAssets:update) exceed the 1MB default.
-    maxHttpBufferSize: 32 * 1024 * 1024
+    maxHttpBufferSize: 32 * 1024 * 1024,
+    // Heartbeat tuning: the defaults (20s timeout) drop connections whenever a
+    // large designer upload or a burst of admin queries delays a pong, which
+    // showed up as constant "ping timeout" disconnects in the admin panel.
+    pingInterval: 25000,
+    pingTimeout: 60000,
+    // Let briefly-disconnected clients resume their session (rooms — e.g.
+    // admin:presence — and missed packets) instead of coming back cold.
+    connectionStateRecovery: {
+      maxDisconnectionDuration: 2 * 60 * 1000
+    }
   });
   const redis = await new DBInit().initialize();
   const mailService = new MailService();
