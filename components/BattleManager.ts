@@ -191,6 +191,8 @@ export type BattlePublicState = {
   availableItems: BattlePublicItem[];
   canAct: boolean;
   waitingForOpponent: boolean;
+  /** True when this side's active mon fainted and the player must pick the replacement. */
+  mustSelectReplacement: boolean;
   selectedActionType: BattleActionType | null;
   turnEndsAt: string | null;
   log: string[];
@@ -295,6 +297,12 @@ type BattleSession = {
   startedAt: string;
   endedAt: string | null;
   summary: BattlePublicSummary | null;
+  /** Set while a player must choose which mon replaces their fainted active one. */
+  replacementRequest: {
+    sideId: BattleSideId;
+    resolve: (pokemonId: string | null) => void;
+    timer: NodeJS.Timeout;
+  } | null;
 };
 
 type PokemonEvolutionDefinition = {
@@ -1011,6 +1019,41 @@ export default class BattleManager {
     };
   }
 
+  public async reorderPokemonParty(userId: number, order: string[]) {
+    const player = this.world.getPlayerByUserId(userId);
+    if (player && this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "You can't reorder your party during a battle." };
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    if (!user || user.pokemonParty.length === 0) {
+      return { ok: false, message: "You have no Pokemon to reorder." };
+    }
+
+    const requestedIds = Array.isArray(order)
+      ? order.filter((id): id is string => typeof id === "string")
+      : [];
+    const partyIds = new Set(user.pokemonParty.map((pokemon) => pokemon.id));
+    const isFullPermutation =
+      requestedIds.length === user.pokemonParty.length &&
+      new Set(requestedIds).size === requestedIds.length &&
+      requestedIds.every((id) => partyIds.has(id));
+
+    if (!isFullPermutation) {
+      return { ok: false, message: "That party order is not valid anymore." };
+    }
+
+    const pokemonById = new Map(user.pokemonParty.map((pokemon) => [pokemon.id, pokemon]));
+    const nextParty = requestedIds.map((id) => pokemonById.get(id)!);
+    const nextUser = await this.auth.savePokemonParty(userId, nextParty);
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: `${getPokemonDisplayName(nextParty[0])} now leads your party.`
+    };
+  }
+
   public async takeHeldItem(userId: number, pokemonId: string) {
     const player = this.world.getPlayerByUserId(userId);
     if (player && this.isPlayerBattling(player.socketId)) {
@@ -1459,7 +1502,16 @@ export default class BattleManager {
     }
 
     const side = this.getBattleSideForPlayer(battle, player.socketId);
-    if (!side || side.action) {
+    if (!side) {
+      return;
+    }
+
+    if (battle.replacementRequest?.sideId === side.id) {
+      this.submitReplacementChoice(battle, side, socketId, request.action);
+      return;
+    }
+
+    if (side.action) {
       return;
     }
 
@@ -1899,7 +1951,8 @@ export default class BattleManager {
       result: null,
       startedAt: new Date().toISOString(),
       endedAt: null,
-      summary: null
+      summary: null,
+      replacementRequest: null
     };
 
     this.pushEvent(battle, {
@@ -2170,10 +2223,21 @@ export default class BattleManager {
         return true;
       }
 
-      if (!this.autoSwitchIfPossible(side)) {
+      const replaced = await this.chooseReplacement(battle, side);
+      if ((battle.status as BattleStatus) !== "active") {
+        return true;
+      }
+
+      if (!replaced) {
         const winner = this.getOpponentSide(battle, side);
         await this.finishBattle(battle, `${winner.trainerName} won the battle.`, winner, side);
         return true;
+      }
+
+      // The replacement enters mid-turn; it must not inherit the fainted
+      // mon's queued move (skill ids are shared across species).
+      if (side.action?.type === "fight") {
+        side.action = { type: "pass" };
       }
 
       const sentOut = getActivePokemon(side);
@@ -2644,6 +2708,8 @@ export default class BattleManager {
       this.appendBattleLog(battle, result);
     }
     this.clearBattleTimer(battle);
+    // Unblock a turn that is suspended waiting for a replacement choice.
+    battle.replacementRequest?.resolve(null);
 
     if (battle.kind === "trainer" && winner?.userId && loser?.userId) {
       const transferAmount = Math.max(0, Math.min(PVP_SURRENDER_REWARD, loser.money));
@@ -3990,6 +4056,81 @@ export default class BattleManager {
     return true;
   }
 
+  /**
+   * Replaces a fainted active mon. AI sides and one-option parties switch
+   * instantly; a player with a real choice is prompted and the turn pauses
+   * until they answer (or the timeout falls back to the old auto-switch).
+   * Returns false only when the side has nothing left to send out.
+   */
+  private async chooseReplacement(battle: BattleSession, side: BattleSide): Promise<boolean> {
+    const available = side.party.filter((pokemon) => !isFainted(pokemon));
+    if (available.length === 0) {
+      return false;
+    }
+
+    if (side.isAi || !side.playerId || available.length === 1) {
+      return this.autoSwitchIfPossible(side);
+    }
+
+    this.say(battle, `${side.trainerName}, choose your next Pokemon.`);
+    const chosenId = await this.waitForReplacementChoice(battle, side);
+
+    if (battle.status !== "active") {
+      return true;
+    }
+
+    if (chosenId && this.switchPokemon(side, chosenId)) {
+      return true;
+    }
+
+    return this.autoSwitchIfPossible(side);
+  }
+
+  private waitForReplacementChoice(battle: BattleSession, side: BattleSide) {
+    return new Promise<string | null>((resolve) => {
+      const settle = (pokemonId: string | null) => {
+        if (battle.replacementRequest?.sideId !== side.id) {
+          return;
+        }
+
+        clearTimeout(battle.replacementRequest.timer);
+        battle.replacementRequest = null;
+        battle.turnEndsAt = null;
+        resolve(pokemonId);
+      };
+
+      battle.replacementRequest = {
+        sideId: side.id,
+        resolve: settle,
+        timer: setTimeout(() => settle(null), PLAYER_ACTION_TIMEOUT_MS)
+      };
+      battle.turnEndsAt = Date.now() + PLAYER_ACTION_TIMEOUT_MS;
+      this.emitBattleState(battle);
+      this.flushEvents(battle);
+    });
+  }
+
+  private submitReplacementChoice(
+    battle: BattleSession,
+    side: BattleSide,
+    socketId: string,
+    action: BattleClientAction | undefined
+  ) {
+    const sanitized = this.sanitizeAction(action);
+    if (sanitized?.type !== "pokemon") {
+      this.emitToSocket(socketId, "battle:error", { message: "Choose a Pokemon to send out." });
+      return;
+    }
+
+    const targetIndex = side.party.findIndex((pokemon) => pokemon.id === sanitized.pokemonId);
+    if (targetIndex < 0 || targetIndex === side.activeIndex || isFainted(side.party[targetIndex])) {
+      this.emitToSocket(socketId, "battle:error", { message: "That Pokemon cannot enter battle." });
+      return;
+    }
+
+    battle.replacementRequest?.resolve(sanitized.pokemonId);
+  }
+
   private getBattleSideForPlayer(battle: BattleSession, playerId: string) {
     return battle.sides.find((side) => side.playerId === playerId) ?? null;
   }
@@ -4682,6 +4823,7 @@ export default class BattleManager {
         }),
       canAct,
       waitingForOpponent: battle.status === "active" && Boolean(self.action) && battle.sides.some((side) => !side.isAi && !side.action),
+      mustSelectReplacement: battle.status === "active" && battle.replacementRequest?.sideId === self.id,
       selectedActionType,
       turnEndsAt: battle.turnEndsAt ? new Date(battle.turnEndsAt).toISOString() : null,
       log: battle.log,

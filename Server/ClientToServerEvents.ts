@@ -103,6 +103,13 @@ export default interface ClientToServerEvents {
   "pokemon:name": (data: AuthNamePokemonPayload) => void;
 
   /**
+   * Reorders the player's Pokemon party. `order` must contain every party
+   * member's id exactly once; the first id becomes the battle lead.
+   * Not allowed while the player is in a battle.
+   */
+  "pokemon:reorder": (data: { order: string[] }) => void;
+
+  /**
    * Registers a new player account and starts an authenticated socket session.
    * Validation rules:
    * - `name`: letters only, min 2, max 30

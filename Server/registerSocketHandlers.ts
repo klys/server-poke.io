@@ -1668,6 +1668,26 @@ function createConnectionHandler(
       socket.emit("auth:info", { message: result.message });
     });
 
+    socket.on("pokemon:reorder", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to reorder your party." });
+        return;
+      }
+
+      const result = await battleManager.reorderPokemonParty(
+        socket.data.userId,
+        Array.isArray(data?.order) ? data.order : []
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
     socket.on("inventory:take-held-item", async (data) => {
       if (typeof socket.data.userId !== "number") {
         socket.emit("auth:error", { message: "Log in to manage held items." });
