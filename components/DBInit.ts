@@ -10,7 +10,10 @@ export default class DBInit {
             url: this.redisUrl,
             socket: {
                 connectTimeout: 5000,
-                reconnectStrategy: false
+                // Redis restarts (e.g. a database restore) drop the socket; without
+                // a reconnect strategy the client closes permanently and every auth
+                // call fails until the server is restarted.
+                reconnectStrategy: (retries) => Math.min(retries * 100, 3000)
             }
         });
     }
