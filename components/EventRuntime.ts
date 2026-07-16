@@ -7,6 +7,7 @@ import type ClientToServerEvents from "../Server/ClientToServerEvents";
 import type InterServerEvents from "../Server/InterServerEvents";
 import type ServerToClientEvents from "../Server/ServerToClientEvents";
 import type { SocketData } from "../Server/registerSocketHandlers";
+import { resolveInitialSpawnFromPlayableMapsState } from "./PlayableMapsState";
 
 type TypedSocketServer = Server<
   ClientToServerEvents,
@@ -109,6 +110,12 @@ type Pending =
   | { kind: "choice"; resolve: (index: number) => void }
   | { kind: "name"; resolve: (name: string) => void };
 
+type EventStateWrites = {
+  switches: Record<string, boolean>; // false = clear
+  variables: Record<string, number>;
+  selfSwitches: Record<string, boolean>; // false = clear
+};
+
 type Session = {
   userId: number;
   token: number;
@@ -118,7 +125,20 @@ type Session = {
   selfSwitchPrefix: string; // `${essMapId}:${eventId}:`
   isTouch: boolean; // started by walking into/onto the event (doors, mats)
   nodesRun: number; // hang guard against mis-authored label loops
+  // Switch/variable/self-switch changes buffer here and only persist at
+  // checkpoints (side-effectful nodes and clean session end). An aborted
+  // session (app closed mid-dialog) discards them, so a partially-played
+  // autorun — the intro — replays from the top on the next join instead of
+  // stranding the player with half-applied state.
+  pendingWrites: EventStateWrites;
+  // The most recent step shown, re-emitted when a client (re)joins while the
+  // session is still alive so the dialog reappears instead of a dead screen.
+  lastStep: EventStep | null;
 };
+
+function emptyEventStateWrites(): EventStateWrites {
+  return { switches: {}, variables: {}, selfSwitches: {} };
+}
 
 export default class EventRuntime {
   private io: TypedSocketServer;
@@ -192,20 +212,33 @@ export default class EventRuntime {
    * controller to a follow-up autorun page). Called on map entry and after an
    * interaction ends. A guard cap prevents a mis-authored infinite autorun.
    */
-  public async runAutorunForMap(userId: number) {
+  public async runAutorunForMap(userId: number): Promise<{ ready: boolean; ran: boolean }> {
     if (this.sessions.has(userId)) {
-      return;
+      return { ready: true, ran: false };
     }
     const player = this.world.getPlayerByUserId(userId);
     if (!player) {
-      return;
+      return { ready: false, ran: false };
     }
+    let ranAny = false;
     for (let guard = 0; guard < 16; guard += 1) {
+      // A disconnect aborts the running session, but this loop would then
+      // re-select the same (rolled-back) autorun page and restart it for a
+      // player who is no longer there — a zombie session that blocks every
+      // future join. Stop chaining once the player has no connections left.
+      if (player.socketConnections.size === 0) {
+        break;
+      }
       // Re-resolve placements every round: an autorun can transfer the player
       // to another map (the intro does), and the next round must then look at
       // the destination map's events.
       const snapshot = this.world.getPlayableMapsState();
-      const placements = (snapshot?.editorDataByMapId[player.currentMapId]?.npcs ?? []) as Array<
+      if (!snapshot) {
+        // World map state not hydrated yet — tell the caller so join-time
+        // resume can retry instead of silently skipping the intro autorun.
+        return { ready: false, ran: ranAny };
+      }
+      const placements = (snapshot.editorDataByMapId[player.currentMapId]?.npcs ?? []) as Array<
         Record<string, unknown> & { name?: string; previewImageSrc?: string; essentialsEvent?: EssentialsEvent }
       >;
       const eventPlacements = placements.filter((placement) => placement.essentialsEvent);
@@ -215,7 +248,7 @@ export default class EventRuntime {
         const essentials = placement.essentialsEvent as EssentialsEvent;
         const page = this.selectActivePage(essentials.pages, state, essentials);
         if (page && page.trigger === 3) {
-          await this.executeSession(
+          const outcome = await this.executeSession(
             userId,
             player,
             placement.name ?? "NPC",
@@ -224,7 +257,13 @@ export default class EventRuntime {
             page,
             true
           );
+          if (outcome === "aborted") {
+            // Disconnected (or superseded) mid-event: stop chaining; the
+            // next join replays via resumeEventsOnJoin.
+            return { ready: true, ran: ranAny };
+          }
           ran = true;
+          ranAny = true;
           break; // re-evaluate all events against the new state
         }
       }
@@ -235,6 +274,105 @@ export default class EventRuntime {
     // Autorun may have flipped switches (e.g. the lab intro's permission switch);
     // refresh the client's copy so conditional NPCs update.
     await this.emitEventState(userId);
+    return { ready: true, ran: ranAny };
+  }
+
+  /**
+   * Join-time event recovery, called from addPlayer. Retries transient
+   * failures (maps snapshot not applied yet, redis hiccup) instead of
+   * silently skipping the autorun — a player parked on the intro map with no
+   * running autorun has no exits and nothing to interact with, so a skipped
+   * intro means a black screen with no way out.
+   */
+  public async resumeEventsOnJoin(userId: number) {
+    // A session that survived the reconnect (brief network blip, or a second
+    // device) keeps running server-side; re-show its pending step so the
+    // rejoining client gets the dialog back instead of a dead screen.
+    const existing = this.sessions.get(userId);
+    if (existing) {
+      await this.emitEventState(userId);
+      if (existing.lastStep) {
+        this.emitStep(existing, existing.lastStep);
+      }
+      return;
+    }
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        await this.emitEventState(userId);
+        const result = await this.runAutorunForMap(userId);
+        if (result.ready) {
+          if (!result.ran) {
+            await this.recoverStrandedOnInitialMap(userId);
+          }
+          return;
+        }
+      } catch (error) {
+        console.error(`Join event resume failed for user:${userId}:`, error);
+      }
+      await this.sleep(2000 * (attempt + 1));
+    }
+  }
+
+  /**
+   * Un-brick: a player standing on the initial (intro) map whose autorun is
+   * disabled by that event's own self-switches quit inside the
+   * self-switch→transfer window (or carries legacy half-applied state). The
+   * room is a dead end by construction — its only exit is the autorun's
+   * transfer — so reset the blocking self-switches and replay the event.
+   */
+  private async recoverStrandedOnInitialMap(userId: number) {
+    if (this.sessions.has(userId)) {
+      return;
+    }
+    const player = this.world.getPlayerByUserId(userId);
+    const snapshot = this.world.getPlayableMapsState();
+    if (!player || !snapshot) {
+      return;
+    }
+    const initialMapId = resolveInitialSpawnFromPlayableMapsState(snapshot)?.mapId;
+    if (!initialMapId || player.currentMapId !== initialMapId) {
+      return;
+    }
+
+    const placements = (snapshot.editorDataByMapId[initialMapId]?.npcs ?? []) as Array<
+      Record<string, unknown> & { essentialsEvent?: EssentialsEvent }
+    >;
+    const state = await this.auth.getEventState(userId);
+    let cleared = false;
+
+    for (const placement of placements) {
+      const essentials = placement.essentialsEvent;
+      if (!essentials) {
+        continue;
+      }
+      const prefix = `${essentials.essentialsMapId}:${essentials.eventId}:`;
+      const activePage = this.selectActivePage(essentials.pages, state, essentials);
+      if (activePage && activePage.trigger === 3) {
+        continue; // this autorun would already run — nothing to recover
+      }
+      // Would an autorun page activate if this event's self-switches were
+      // cleared? Only then is the self-switch what strands the player.
+      const strippedState = {
+        ...state,
+        selfSwitches: Object.fromEntries(
+          Object.entries(state.selfSwitches).filter(([key]) => !key.startsWith(prefix))
+        )
+      };
+      const strippedPage = this.selectActivePage(essentials.pages, strippedState, essentials);
+      if (strippedPage && strippedPage.trigger === 3) {
+        if (await this.auth.clearEventSelfSwitchesByPrefix(userId, prefix)) {
+          cleared = true;
+        }
+      }
+    }
+
+    if (cleared) {
+      console.log(
+        `Recovered stranded player user:${userId} on ${initialMapId}: replaying the intro autorun.`
+      );
+      await this.runAutorunForMap(userId);
+    }
   }
 
   private async executeSession(
@@ -256,13 +394,21 @@ export default class EventRuntime {
       npcPortraitSrc: portraitSrc,
       selfSwitchPrefix: `${essentials.essentialsMapId}:${essentials.eventId}:`,
       isTouch,
-      nodesRun: 0
+      nodesRun: 0,
+      pendingWrites: emptyEventStateWrites(),
+      lastStep: null
     };
     this.sessions.set(userId, session);
 
     const nodes = parseCommands(page.commands);
     try {
       await this.run(session, nodes);
+      // Clean end: commit the remaining buffered state changes. Aborted
+      // sessions (stale token) and crashed scripts skip this on purpose —
+      // discarding half-applied state lets the autorun replay next join.
+      if (this.sessions.get(userId)?.token === token) {
+        await this.flushEventWrites(session);
+      }
     } finally {
       if (this.sessions.get(userId)?.token === token) {
         this.emitStep(session, { type: "end" });
@@ -277,6 +423,10 @@ export default class EventRuntime {
         }
       }
     }
+    // Tell callers (the autorun chaining loop) whether this run completed or
+    // was aborted (abort() stamps token = -1), so an abort mid-loop doesn't
+    // restart the same event for a player who just disconnected.
+    return session.token === token ? ("completed" as const) : ("aborted" as const);
   }
 
   public submitAdvance(userId: number, text?: string) {
@@ -420,20 +570,25 @@ export default class EventRuntime {
           }
           break;
         }
-        case "switch":
-          await this.auth.setEventSwitches(session.userId, node.start, node.end, node.on);
+        case "switch": {
+          const lo = Math.min(node.start, node.end);
+          const hi = Math.max(node.start, node.end);
+          for (let id = lo; id <= hi; id += 1) {
+            session.pendingWrites.switches[String(id)] = node.on;
+          }
           break;
+        }
         case "variable":
-          await this.auth.setEventVariable(session.userId, node.id, node.value);
+          session.pendingWrites.variables[String(node.id)] = node.value;
           break;
         case "selfSwitch":
-          await this.auth.setEventSelfSwitch(
-            session.userId,
-            `${session.selfSwitchPrefix}${node.ch}`,
-            node.on
-          );
+          session.pendingWrites.selfSwitches[`${session.selfSwitchPrefix}${node.ch}`] = node.on;
           break;
         case "script":
+          // Scripts can persist things on their own (pokemon grants, skin,
+          // name, battles); checkpoint the buffered state first so those
+          // side effects never outlive a later rollback.
+          await this.flushEventWrites(session);
           await this.applyScript(session, node.text);
           break;
         case "label":
@@ -474,10 +629,17 @@ export default class EventRuntime {
           });
           break;
         case "transfer": {
+          // Commit buffered state BEFORE moving the player: the intro sets
+          // its "don't run again" self-switch a few commands before the
+          // transfer out, and persisting the two together closes the window
+          // where quitting the app left the switch set but the player still
+          // parked in the (black, exit-less) intro room.
+          await this.flushEventWrites(session);
           this.transferPlayer(session, node.mapId, node.x, node.y);
           break;
         }
         case "recoverAll": {
+          await this.flushEventWrites(session);
           const healed = await this.auth.healPokemonParty(session.userId);
           if (healed) {
             await this.refreshSession(session);
@@ -517,8 +679,42 @@ export default class EventRuntime {
     return new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
   }
 
-  private async evaluate(session: Session, test: ConditionTest): Promise<boolean> {
+  /**
+   * Event-state reads inside a running session must see the session's own
+   * buffered (not yet committed) writes, or in-event conditions that test a
+   * switch the event just set would misbehave.
+   */
+  private async getSessionEventState(session: Session) {
     const state = await this.auth.getEventState(session.userId);
+    for (const [id, on] of Object.entries(session.pendingWrites.switches)) {
+      if (on) {
+        state.switches[id] = true;
+      } else {
+        delete state.switches[id];
+      }
+    }
+    for (const [id, value] of Object.entries(session.pendingWrites.variables)) {
+      state.variables[id] = value;
+    }
+    for (const [key, on] of Object.entries(session.pendingWrites.selfSwitches)) {
+      if (on) {
+        state.selfSwitches[key] = true;
+      } else {
+        delete state.selfSwitches[key];
+      }
+    }
+    return state;
+  }
+
+  /** Checkpoint: persist the session's buffered event-state writes. */
+  private async flushEventWrites(session: Session) {
+    const writes = session.pendingWrites;
+    session.pendingWrites = emptyEventStateWrites();
+    await this.auth.applyEventStateWrites(session.userId, writes);
+  }
+
+  private async evaluate(session: Session, test: ConditionTest): Promise<boolean> {
+    const state = await this.getSessionEventState(session);
     switch (test.kind) {
       case "switch":
         return Boolean(state.switches[String(test.id)]) === test.on;
@@ -561,6 +757,10 @@ export default class EventRuntime {
     if (!this.battleManager) {
       return true;
     }
+
+    // Battle results persist immediately (party HP, exp); checkpoint the
+    // buffered event state so a later abort can't roll back behind them.
+    await this.flushEventWrites(session);
 
     // Close the dialog: the battle scene takes over; the event resumes after.
     this.emitStep(session, { type: "end" });
@@ -792,6 +992,11 @@ export default class EventRuntime {
       !("portraitSrc" in step && step.portraitSrc)
         ? { ...step, portraitSrc: session.npcPortraitSrc }
         : step;
+    // Remember what the client should currently show so a reconnect mid-event
+    // can replay it (resumeEventsOnJoin).
+    if (step.type !== "end") {
+      session.lastStep = enriched;
+    }
     session.player.socketConnections.forEach((socketId) => {
       this.io.to(socketId).emit("event:step", enriched);
     });

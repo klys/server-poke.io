@@ -1267,6 +1267,73 @@ export default class Auth {
         });
     }
 
+    /**
+     * Applies a batch of buffered event-state writes in one round trip. The
+     * event runtime buffers switch/variable/self-switch changes per session
+     * and commits them at checkpoints, so a session aborted mid-dialog (app
+     * closed during the intro) leaves no half-applied state behind. A `false`
+     * switch/self-switch value means "clear it".
+     */
+    public async applyEventStateWrites(userId:number, writes:{
+        switches:Record<string, boolean>;
+        variables:Record<string, number>;
+        selfSwitches:Record<string, boolean>;
+    }) {
+        if (
+            Object.keys(writes.switches).length === 0 &&
+            Object.keys(writes.variables).length === 0 &&
+            Object.keys(writes.selfSwitches).length === 0
+        ) {
+            return;
+        }
+
+        const state = await this.getEventState(userId);
+        for (const [id, on] of Object.entries(writes.switches)) {
+            if (on) {
+                state.switches[id] = true;
+            } else {
+                delete state.switches[id];
+            }
+        }
+        for (const [id, value] of Object.entries(writes.variables)) {
+            state.variables[id] = value;
+        }
+        for (const [key, on] of Object.entries(writes.selfSwitches)) {
+            if (on) {
+                state.selfSwitches[key] = true;
+            } else {
+                delete state.selfSwitches[key];
+            }
+        }
+        await this.redis.hSet(this.userKey(userId), {
+            event_switches: JSON.stringify(state.switches),
+            event_variables: JSON.stringify(state.variables),
+            event_self_switches: JSON.stringify(state.selfSwitches)
+        });
+    }
+
+    /**
+     * Clears every self-switch of one event (`<essMapId>:<eventId>:` prefix).
+     * Used to un-brick players stranded on the intro map: replaying the
+     * event's autorun page requires its self-switches to be reset.
+     */
+    public async clearEventSelfSwitchesByPrefix(userId:number, prefix:string) {
+        const state = await this.getEventState(userId);
+        let changed = false;
+        for (const key of Object.keys(state.selfSwitches)) {
+            if (key.startsWith(prefix)) {
+                delete state.selfSwitches[key];
+                changed = true;
+            }
+        }
+        if (changed) {
+            await this.redis.hSet(this.userKey(userId), {
+                event_self_switches: JSON.stringify(state.selfSwitches)
+            });
+        }
+        return changed;
+    }
+
     public async getPublicUserData(userId:number) {
         return this.getUserById(String(userId));
     }

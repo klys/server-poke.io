@@ -1611,8 +1611,9 @@ function createConnectionHandler(
         world.presentPlayersTo(socket.id);
         battleManager.resumeBattleForPlayer(playerRegistration.player);
         if (typeof socket.data.userId === "number") {
-          void eventRuntime.emitEventState(socket.data.userId);
-          void eventRuntime.runAutorunForMap(socket.data.userId);
+          // Emits event state, runs map autoruns with retry, and un-bricks
+          // players stranded mid-intro — see EventRuntime.resumeEventsOnJoin.
+          void eventRuntime.resumeEventsOnJoin(socket.data.userId);
           // A newly-authenticated player changed the online population.
           broadcastAdminPresence(io, world);
         }
