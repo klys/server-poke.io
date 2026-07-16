@@ -137,15 +137,19 @@ function requireDesignerAccess(
   errorEvent: "designer:section:error" | "playableMaps:error",
   message:string
 ) {
-  if (
-    socket.data.authenticated &&
-    socket.data.permissions?.includes("designer.access")
-  ) {
+  if (hasDesignerAccess(socket)) {
     return true;
   }
 
   socket.emit(errorEvent, { message });
   return false;
+}
+
+function hasDesignerAccess(socket:ServerSocket) {
+  return Boolean(
+    socket.data.authenticated &&
+    socket.data.permissions?.includes("designer.access")
+  );
 }
 
 function requirePermission(
@@ -226,6 +230,14 @@ function emitPlayableMapsVersion(
 
 function getDesignerSectionRoom(sectionKey:DesignerSectionKey) {
   return `designer:section:${sectionKey}`;
+}
+
+// Game clients (no designer access) subscribe here instead of the state room:
+// designer saves push them a tiny version stub and they refresh the section
+// over the cacheable /designer-sections/<key>.json HTTP endpoint, so full
+// catalogs never travel the websocket to players.
+function getDesignerSectionVersionsRoom(sectionKey:DesignerSectionKey) {
+  return `designer:section:${sectionKey}:versions`;
 }
 
 function emitDesignerSectionVersion(
@@ -313,22 +325,12 @@ async function emitPlayableMapsSyncIfStale(
     return;
   }
 
-  if (typeof clientVersion === "number" && clientVersion === payload.version) {
-    emitPlayableMapsVersion(socket, payload);
-    return;
-  }
-
-  // Native apps carry a bundled snapshot (clientVersion is set); never stream
-  // the multi-MB state to them over the socket — announce the version and let
-  // them refresh via the cacheable /playable-maps.json HTTP endpoint. A null
-  // clientVersion means the client has nothing usable, so the full state is
-  // still sent as a safety valve.
-  if (isNativeClient(socket) && typeof clientVersion === "number") {
-    emitPlayableMapsVersion(socket, payload);
-    return;
-  }
-
-  socket.emit("playableMaps:state", payload);
+  // The multi-MB maps state never travels over the websocket to game clients
+  // (queued frames starve the Socket.IO heartbeat into ping-timeout storms).
+  // Announce the version and let the client pull the cacheable
+  // /playable-maps.json HTTP endpoint; only the designer maps tooling
+  // (designer:maps:join) still receives full state over the socket.
+  emitPlayableMapsVersion(socket, payload);
 }
 
 async function sanitizeAuthSessionInventory(
@@ -434,7 +436,7 @@ function toInventoryCategory(value: string) {
 }
 
 function createConnectionHandler(
-  _io:TypedSocketServer,
+  io:TypedSocketServer,
   world:World,
   auth:Auth,
   designerSectionStore:DesignerSectionStore,
@@ -765,12 +767,26 @@ function createConnectionHandler(
         return;
       }
 
-      socket.join(getDesignerSectionRoom(sectionKey));
+      // Designers join the state room (live full-state broadcasts keep their
+      // tooling in sync); game clients join the versions room and pull state
+      // over HTTP instead.
+      if (hasDesignerAccess(socket)) {
+        socket.join(getDesignerSectionRoom(sectionKey));
+      } else {
+        socket.join(getDesignerSectionVersionsRoom(sectionKey));
+      }
 
       try {
         const payload = await designerSectionStore.getOrCreate(sectionKey, data?.seedState);
 
         if (typeof data?.version === "number" && data.version === payload.version) {
+          emitDesignerSectionVersion(socket, payload, sectionKey);
+          return;
+        }
+
+        // Game clients never receive the full catalog over the socket — they
+        // refresh via the cacheable /designer-sections/<key>.json endpoint.
+        if (!hasDesignerAccess(socket)) {
           emitDesignerSectionVersion(socket, payload, sectionKey);
           return;
         }
@@ -804,6 +820,7 @@ function createConnectionHandler(
       }
 
       socket.leave(getDesignerSectionRoom(data.sectionKey));
+      socket.leave(getDesignerSectionVersionsRoom(data.sectionKey));
     });
 
     socket.on("designer:section:update", async (data) => {
@@ -832,6 +849,13 @@ function createConnectionHandler(
 
         socket.emit("designer:section:state", payload);
         socket.broadcast.to(room).emit("designer:section:state", payload);
+        // Game clients get a version stub and refetch over HTTP.
+        io.to(getDesignerSectionVersionsRoom(sectionKey)).emit("designer:section:version", {
+          sectionKey,
+          hasState: true,
+          version: payload.version,
+          updatedAt: payload.updatedAt ?? null
+        });
       } catch (error) {
         console.error(`Unable to save designer ${sectionKey} state:`, error);
         socket.emit("designer:section:error", {
@@ -1036,7 +1060,7 @@ function createConnectionHandler(
           message: `Updated ${result.user.username}.`
         });
         await emitRefreshedAuthSessionToUserSockets(
-          _io,
+          io,
           auth,
           designerSectionStore,
           userId
@@ -1109,7 +1133,7 @@ function createConnectionHandler(
           message: `Reset ${result.user.username}'s adventure to the beginning.`
         });
         await emitRefreshedAuthSessionToUserSockets(
-          _io,
+          io,
           auth,
           designerSectionStore,
           userId
@@ -1160,7 +1184,7 @@ function createConnectionHandler(
         // Force any live sessions off. Clearing auth on the socket first stops
         // the disconnect handler from re-persisting a saved location into the
         // hash we just deleted.
-        const targetSockets = Array.from(_io.sockets.sockets.values()).filter(
+        const targetSockets = Array.from(io.sockets.sockets.values()).filter(
           (candidate) => candidate.data.userId === userId
         );
         for (const targetSocket of targetSockets) {
@@ -1172,7 +1196,7 @@ function createConnectionHandler(
           targetSocket.disconnect(true);
         }
 
-        broadcastAdminPresence(_io, world);
+        broadcastAdminPresence(io, world);
 
         socket.emit("admin:user:deleted", { userId });
         socket.emit("auth:info", { message: `Deleted ${result.username} and all their data.` });
@@ -1590,7 +1614,7 @@ function createConnectionHandler(
           void eventRuntime.emitEventState(socket.data.userId);
           void eventRuntime.runAutorunForMap(socket.data.userId);
           // A newly-authenticated player changed the online population.
-          broadcastAdminPresence(_io, world);
+          broadcastAdminPresence(io, world);
         }
       }
     });
@@ -1959,7 +1983,7 @@ function createConnectionHandler(
       world.removePlayer(socket.id);
       // A player leaving may drop them out of the online set — refresh admins.
       if (wasAuthenticated) {
-        broadcastAdminPresence(_io, world);
+        broadcastAdminPresence(io, world);
       }
     });
   };
