@@ -447,8 +447,6 @@ function createConnectionHandler(
   pokecraftApi?:PokecraftApiClient
 ) {
   return (socket:ServerSocket) => {
-    console.log("Client connected!", socket.id);
-
     const handshakePlatform = socket.handshake.auth?.platform;
     socket.data.platform =
       typeof handshakePlatform === "string" ? handshakePlatform.slice(0, 20) : "web";
@@ -1537,8 +1535,6 @@ function createConnectionHandler(
     });
 
     socket.on("addPlayer", async (data) => {
-      console.log("addPlayer");
-
       try {
         const playableMapsPayload = await playableMapsStore.read();
         applyPlayableMapsStateToWorld(world, playableMapsPayload);
@@ -1665,7 +1661,6 @@ function createConnectionHandler(
     });
 
     socket.on("shotProjectil", (data) => {
-      console.log("shotProjectil");
       world.shotProjectil(data.mouse_x,data.mouse_y, socket.id);
     });
 
@@ -1945,8 +1940,6 @@ function createConnectionHandler(
     });
 
     socket.on("disconnect", async (reason) => {
-      console.log(reason);
-
       const player = world.getPlayerBySocket(socket.id);
       const shouldPersistLocation =
         Boolean(player) &&

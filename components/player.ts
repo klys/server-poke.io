@@ -389,11 +389,9 @@ export default class Player {
         this.life -= damage;
         if (this.life <= 0) {
             this.die()
-            console.log("playerDeath being sent.")
         } else {
             World.socketServer.emit("playerHurt", {playerId:this.socketId,life:this.life, id:this.id})
-            console.log("playerHurt being sent.")
-        } 
+        }
     }
 
     /**

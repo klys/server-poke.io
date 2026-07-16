@@ -128,7 +128,6 @@ export default class World {
             if (playerCollided !== undefined) {
                 projectil.trigger();
                 playerCollided.hurt(projectil.damage)
-                console.log("COLLISION!")
                 World.socketServer.emit("explodeProjectil", projectil.data())
             }
             World.socketServer.emit("moveProjectil"+projectil.id, projectil.data())
@@ -163,21 +162,16 @@ export default class World {
      * @returns The collided Player instance if found, undefined otherwise.
      */
     collision_player(element:any):any {
-        console.log("collision_player->element:",element)
-        
         const piterator = this.players.entries();
         let current = piterator.next()
-        
+
         while(current.done === false) {
             let player = current.value[1];
-            console.log(player);
-            console.log("checking IF colliding with "+player.socketId)
             if (player.socketId !== element.ownerId &&
                 player.death === false &&
-                GameMath.collision_square(player, element)) {console.log("COLLIDING!!!!"); return player;};
+                GameMath.collision_square(player, element)) return player;
             current = piterator.next();
         }
-        console.log("NOT colliding.")
         return undefined;
     }
 
@@ -787,7 +781,6 @@ export default class World {
 
         this.players.set(playerId, player);
         this.socketToPlayerId.set(socketId, playerId);
-        console.log("players in map: ", this.players.size);
         World.socketServer.emit("addPlayer", player.data());
         this.presentObjectsTo(socketId);
         return { player, created: true };
@@ -956,7 +949,6 @@ export default class World {
      * Emits a test message to all connected players.
      */
     testSocket() {
-        console.log("test socket executed. ",this.players.size)
         this.players.forEach( (player) => {
             player.socketConnections.forEach((socketId) => {
                 World.socketServer.in(socketId).emit("test", {test:"hello test!"})

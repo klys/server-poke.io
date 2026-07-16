@@ -144,8 +144,6 @@ export default class GameMath {
      * @returns True if they overlap/collide, false otherwise.
      */
     public static collision_square(rect1:any,rect2:any):boolean {
-        console.log("rect1:",rect1)
-        console.log("rect2",rect2)
         return (rect1.x < rect2.x + rect2.width &&
             rect1.x + rect1.width > rect2.x &&
             rect1.y < rect2.y + rect2.height &&

@@ -41,7 +41,6 @@ export default class Projectil {
         this.toY = maxDistance.y;
         this.speed = 2;
         this.damage = 15;
-        console.log("max distance this projectil will reach: ("+this.toX+", "+this.toY+")")
         this.id = Math.round(Math.random()*99999);
     }
 
@@ -87,7 +86,6 @@ export default class Projectil {
             const newPos = GameMath.polar_move(this.x,this.y,this.angle,this.speed);
             this.x = newPos.x;
             this.y = newPos.y;
-            console.log("projectil moving ... ("+this.x+", "+this.y+")")
         } else this.trigger();
     }
 
