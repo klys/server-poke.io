@@ -198,6 +198,8 @@ export type BattlePublicState = {
   log: string[];
   result: string | null;
   summary: BattlePublicSummary | null;
+  /** Essentials battleback name resolved from the map the battle started on. */
+  battleBack: string | null;
 };
 
 type BattleStats = {
@@ -297,6 +299,8 @@ type BattleSession = {
   startedAt: string;
   endedAt: string | null;
   summary: BattlePublicSummary | null;
+  /** Essentials battleback name for the map the battle started on. */
+  battleBack: string | null;
   /** Set while a player must choose which mon replaces their fainted active one. */
   replacementRequest: {
     sideId: BattleSideId;
@@ -1653,9 +1657,13 @@ export default class BattleManager {
       escapeAttempts: 0
     };
 
-    const battle = this.createBattle("wild", playerSide, wildSide, [
-      `A wild ${getPokemonDisplayName(wildPokemon)} appeared.`
-    ]);
+    const battle = this.createBattle(
+      "wild",
+      playerSide,
+      wildSide,
+      [`A wild ${getPokemonDisplayName(wildPokemon)} appeared.`],
+      this.resolveBattleBackForPlayer(player, true)
+    );
 
     this.activateBattle(battle);
   }
@@ -1710,10 +1718,16 @@ export default class BattleManager {
       escapeAttempts: 0
     };
 
-    const battle = this.createBattle("trainer", playerSide, npcSide, [
-      `${trainerDisplayName} wants to battle!`,
-      `${trainerDisplayName} sent out ${getPokemonDisplayName(party[0])}.`
-    ]);
+    const battle = this.createBattle(
+      "trainer",
+      playerSide,
+      npcSide,
+      [
+        `${trainerDisplayName} wants to battle!`,
+        `${trainerDisplayName} sent out ${getPokemonDisplayName(party[0])}.`
+      ],
+      this.resolveBattleBackForPlayer(player)
+    );
 
     this.activateBattle(battle);
     return { ok: true as const, message: `${trainerDisplayName} wants to battle!` };
@@ -1813,10 +1827,16 @@ export default class BattleManager {
       escapeAttempts: 0
     };
 
-    const battle = this.createBattle("trainer", playerSide, npcSide, [
-      `${trainerDisplayName} wants to battle!`,
-      `${trainerDisplayName} sent out ${getPokemonDisplayName(party[0])}.`
-    ]);
+    const battle = this.createBattle(
+      "trainer",
+      playerSide,
+      npcSide,
+      [
+        `${trainerDisplayName} wants to battle!`,
+        `${trainerDisplayName} sent out ${getPokemonDisplayName(party[0])}.`
+      ],
+      this.resolveBattleBackForPlayer(player)
+    );
 
     this.activateBattle(battle);
     return { ok: true, battleId: battle.id, playerSideId: playerSide.id };
@@ -1921,18 +1941,49 @@ export default class BattleManager {
       return;
     }
 
-    const battle = this.createBattle("trainer", firstSide, secondSide, [
-      `${firstSide.trainerName} and ${secondSide.trainerName} started a battle.`
-    ]);
+    const battle = this.createBattle(
+      "trainer",
+      firstSide,
+      secondSide,
+      [`${firstSide.trainerName} and ${secondSide.trainerName} started a battle.`],
+      this.resolveBattleBackForPlayer(firstPlayer)
+    );
 
     this.activateBattle(battle);
+  }
+
+  /**
+   * Resolves the Essentials battleback for the map a player is standing on
+   * (imported from PBS metadata.txt into playableMapConfig.battleBack).
+   * Wild battles that started in tall grass upgrade the plain Field backdrop
+   * to its grass variant, mirroring Essentials' terrain-based bases.
+   */
+  private resolveBattleBackForPlayer(player: Player | null | undefined, fromGrass = false): string | null {
+    if (!player) {
+      return null;
+    }
+
+    const snapshot = this.world.getPlayableMapsState();
+    const map = snapshot?.items.find((item) => item.id === player.currentMapId);
+    const config = map?.playableMapConfig as { battleBack?: unknown } | undefined;
+    let name =
+      typeof config?.battleBack === "string" && config.battleBack.trim().length > 0
+        ? config.battleBack.trim()
+        : null;
+
+    if (fromGrass && (!name || name.toLowerCase() === "field")) {
+      name = "FieldGrass";
+    }
+
+    return name;
   }
 
   private createBattle(
     kind: BattleKind,
     firstSide: BattleSide,
     secondSide: BattleSide,
-    log: string[]
+    log: string[],
+    battleBack: string | null = null
   ): BattleSession {
     const battle: BattleSession = {
       id: crypto.randomUUID(),
@@ -1952,6 +2003,7 @@ export default class BattleManager {
       startedAt: new Date().toISOString(),
       endedAt: null,
       summary: null,
+      battleBack,
       replacementRequest: null
     };
 
@@ -4828,7 +4880,8 @@ export default class BattleManager {
       turnEndsAt: battle.turnEndsAt ? new Date(battle.turnEndsAt).toISOString() : null,
       log: battle.log,
       result: battle.result,
-      summary: battle.summary
+      summary: battle.summary,
+      battleBack: battle.battleBack
     };
   }
 
