@@ -74,7 +74,20 @@ export default class MapAssetStore {
     const mapDir = path.join(this.baseDir, mapId);
 
     if (options?.replace) {
-      await fs.rm(mapDir, { recursive: true, force: true });
+      // Only clear the image files this store manages. The same folder holds
+      // sidecars written by other services (pokecraft-api's tile-data.json
+      // runtime export) that a designer re-save must not destroy.
+      const imageExtensions = new Set([...Object.values(MIME_TO_EXTENSION), "jpeg"]);
+      const entries = await fs.readdir(mapDir, { withFileTypes: true }).catch(() => []);
+
+      await Promise.all(
+        entries
+          .filter((entry) => {
+            const extension = entry.name.split(".").pop() ?? "";
+            return entry.isFile() && imageExtensions.has(extension.toLowerCase());
+          })
+          .map((entry) => fs.rm(path.join(mapDir, entry.name), { force: true }))
+      );
     }
 
     await fs.mkdir(mapDir, { recursive: true });
