@@ -94,7 +94,7 @@ type MapEditorObjectPlacement = {
   y: number;
 };
 
-type MapEditorPortalPlacement = {
+export type MapEditorPortalPlacement = {
   id: string;
   x: number;
   y: number;
@@ -711,6 +711,48 @@ export function resolveInitialSpawnFromPlayableMapsState(snapshot: PlayableMapsS
     mapId: initialMap.id,
     x: position.x,
     y: position.y,
+  };
+}
+
+/**
+ * Server-side mirror of the client's resolvePortalDestination: designer
+ * portals teleport within the source map ("same-map") or to a cell on a
+ * target map ("other-map"), scaled by the DESTINATION map's cellSize.
+ */
+export function resolvePlayableMapPortalDestination(
+  snapshot: PlayableMapsStateSnapshot,
+  sourceMapId: string,
+  portal: MapEditorPortalPlacement
+): { mapId: string; x: number; y: number } | null {
+  const cellSizeOf = (mapId: string) =>
+    snapshot.items.find((item) => item.id === mapId)?.playableMapConfig?.cellSize ??
+    DEFAULT_CELL_SIZE;
+
+  if (portal.destinationType === "same-map") {
+    const cellSize = cellSizeOf(sourceMapId);
+    return {
+      mapId: sourceMapId,
+      x: Math.max(0, Math.round(portal.sameMapX)) * cellSize,
+      y: Math.max(0, Math.round(portal.sameMapY)) * cellSize
+    };
+  }
+
+  if (portal.destinationType !== "other-map") {
+    return null;
+  }
+
+  const targetMap = snapshot.items.find((item) => item.id === portal.targetMapId);
+
+  if (!targetMap) {
+    return null;
+  }
+
+  const cellSize = targetMap.playableMapConfig?.cellSize ?? DEFAULT_CELL_SIZE;
+
+  return {
+    mapId: targetMap.id,
+    x: Math.max(0, Math.round(portal.targetMapX)) * cellSize,
+    y: Math.max(0, Math.round(portal.targetMapY)) * cellSize
   };
 }
 

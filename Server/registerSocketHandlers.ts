@@ -19,6 +19,7 @@ import PlayableMapsStore, {
 } from "../components/PlayableMapsStore";
 import {
   resolveInitialSpawnFromPlayableMapsState,
+  resolvePlayableMapPortalDestination,
 } from "../components/PlayableMapsState";
 import World from "../components/world";
 import PokecraftApiClient, {
@@ -1998,9 +1999,38 @@ export default function registerSocketHandlers(
   const eventRuntime = new EventRuntime(io, world, auth);
   // Event scripts can start real trainer battles (pbTrainerBattle).
   eventRuntime.setBattleManager(battleManager);
+  // pbPokemonMart events open the regular store overlay; buy/sell requests
+  // validate against the mart session the event runtime keeps per user.
+  battleManager.setEventMartResolver((userId, placementId) =>
+    eventRuntime.getActiveMartItems(userId, placementId)
+  );
   // RMXP touch triggers (doors, cave mouths, floor events): the world detects
   // the bump/step, the event runtime plays the event. Cooldown keeps a held
   // arrow key from re-firing the same event every tick.
+  // Designer portals are server-authoritative: the world detects the player
+  // standing on (or bumping into) a portal cell and this handler performs the
+  // transfer. Clients only render portals — a portal in an unreachable spot
+  // or a stale client cache can no longer strand players.
+  world.setPortalHandler((player, portal) => {
+    const snapshot = world.getPlayableMapsState();
+    if (!snapshot) return;
+    const destination = resolvePlayableMapPortalDestination(snapshot, player.currentMapId, portal);
+    if (!destination) return;
+
+    player.stopMovement();
+    player.teleport(destination.mapId, destination.x, destination.y);
+    world.players.set(player.socketId, player);
+    world.presentPlayerToMap(player);
+    player.socketConnections.forEach((socketId) => {
+      world.presentPlayersOnMapTo(socketId, player.currentMapId);
+      // Door/exit chime on the traveling player's clients.
+      io.to(socketId).emit("portal:used", { mapId: player.currentMapId });
+    });
+    if (typeof player.userId === "number") {
+      void eventRuntime.runAutorunForMap(player.userId);
+    }
+  });
+
   const touchCooldowns = new Map<number, { placementId:string; at:number }>();
   // Map transfers persist the new location immediately (fire-and-forget);
   // relying on the disconnect handler alone loses the position on crashes

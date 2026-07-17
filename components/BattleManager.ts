@@ -356,6 +356,8 @@ type ItemDefinition = {
   id: string;
   name: string;
   essentialsId: string;
+  /** Catalog buy price (designer itemProfile.price); 0 = not purchasable. */
+  price: number;
   type: string;
   category: InventoryItem["category"];
   description: string;
@@ -1188,6 +1190,53 @@ export default class BattleManager {
     };
   }
 
+  /**
+   * Items a player may currently trade at this placement: a designer store
+   * NPC's stock, or — for imported Essentials mart events — the live
+   * pbPokemonMart session registered by the event runtime.
+   */
+  private resolveStoreStock(userId: number, placement: { id: string; npcId: string }) {
+    const npc = this.cachedNpcDefinitions.get(placement.npcId);
+
+    if (npc?.npcType === "store") {
+      return npc.storeItems;
+    }
+
+    return this.eventMartResolver?.(userId, placement.id) ?? null;
+  }
+
+  public setEventMartResolver(
+    resolver: (userId: number, placementId: string) => NpcStoreDefinition[] | null
+  ) {
+    this.eventMartResolver = resolver;
+  }
+
+  /** Resolve pbPokemonMart Essentials symbols (:POTION) to store stock rows. */
+  public async resolveMartItems(essentialsSymbols: string[]): Promise<NpcStoreDefinition[]> {
+    await this.loadCatalogs();
+
+    const items: NpcStoreDefinition[] = [];
+    for (const symbol of essentialsSymbols) {
+      const lowered = symbol.trim().toLowerCase();
+      if (!lowered) continue;
+      const definition = this.cachedItemDefinitions.find(
+        (candidate) =>
+          candidate.essentialsId.toLowerCase() === lowered ||
+          candidate.id === `item-${lowered}`
+      );
+      if (!definition || definition.price <= 0) {
+        continue;
+      }
+      items.push({
+        itemId: definition.id,
+        itemName: definition.name,
+        quantity: 1,
+        price: definition.price
+      });
+    }
+    return items;
+  }
+
   public async buyFromNpcStore(
     userId: number,
     npcPlacementId?: string,
@@ -1202,17 +1251,17 @@ export default class BattleManager {
 
     const user = await this.auth.getUserForBattle(userId);
     await this.loadCatalogs();
-    const npc = this.cachedNpcDefinitions.get(interaction.placement.npcId);
+    const storeStock = this.resolveStoreStock(userId, interaction.placement);
     const purchaseCount =
       typeof quantity === "number" && Number.isFinite(quantity)
         ? Math.max(1, Math.round(quantity))
         : 1;
-    const storeItem = npc?.storeItems.find((candidate) => candidate.itemId === itemId);
+    const storeItem = storeStock?.find((candidate) => candidate.itemId === itemId);
     const itemDefinition = storeItem
       ? this.getCachedItemDefinition(storeItem.itemId, storeItem.itemName)
       : null;
 
-    if (!user || !npc || npc.npcType !== "store") {
+    if (!user || !storeStock) {
       return { ok: false, message: "That store is unavailable right now." };
     }
 
@@ -1254,15 +1303,15 @@ export default class BattleManager {
 
     const user = await this.auth.getUserForBattle(userId);
     await this.loadCatalogs();
-    const npc = this.cachedNpcDefinitions.get(interaction.placement.npcId);
+    const storeStock = this.resolveStoreStock(userId, interaction.placement);
     const sellCount =
       typeof quantity === "number" && Number.isFinite(quantity)
         ? Math.max(1, Math.round(quantity))
         : 1;
-    const storeItem = npc?.storeItems.find((candidate) => candidate.itemId === itemId);
+    const storeItem = storeStock?.find((candidate) => candidate.itemId === itemId);
     const inventoryItem = user?.inventory.find((candidate) => candidate.id === itemId);
 
-    if (!user || !npc || npc.npcType !== "store") {
+    if (!user || !storeStock) {
       return { ok: false, message: "That store is unavailable right now." };
     }
 
@@ -3361,6 +3410,9 @@ export default class BattleManager {
   }
 
   private cachedItemDefinitions: ItemDefinition[] = [];
+  private eventMartResolver:
+    | ((userId: number, placementId: string) => NpcStoreDefinition[] | null)
+    | null = null;
   private cachedNpcDefinitions = new Map<string, NpcDefinition>();
 
   private getCachedItemDefinition(itemId: string, itemName: string) {
@@ -4406,6 +4458,7 @@ export default class BattleManager {
   private toItemDefinition(item: DesignerSectionItem): ItemDefinition | null {
     const profile = item.itemProfile as {
       essentialsId?: unknown;
+      price?: unknown;
       type?: unknown;
       pocket?: unknown;
       description?: unknown;
@@ -4458,6 +4511,7 @@ export default class BattleManager {
       id: item.id,
       name: item.name,
       essentialsId,
+      price: Math.max(0, Math.round(parseNumber(profile.price, 0))),
       type: normalizeText(profile.type),
       category: toInventoryCategory(normalizeText(profile.type)),
       description: typeof profile.description === "string" ? profile.description : "",

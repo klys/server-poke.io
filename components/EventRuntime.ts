@@ -79,6 +79,7 @@ const RE_TRAINER_BATTLE = /pbTrainerBattle\(\s*PBTrainers::(\w+)\s*,\s*"([^"]+)"
 const RE_TRAINER_NAME = /pbTrainerName/i;
 const RE_TONE_CHANGE = /pbToneChangeAll\(\s*Tone\.new\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)[^)]*\)\s*,\s*(\d+)/i;
 const RE_SET_POKECENTER = /pbSetPokemonCenter/i;
+const RE_POKEMON_MART = /pbPokemonMart\(\s*\[([^\]]*)\]/i;
 const RE_SE_PLAY = /pbSEPlay\(\s*"([^"]+)"/i;
 const RE_PB_WAIT = /pbWait\(\s*(\d+)\s*\)/i;
 const RE_BUTTON_SCREEN = /pbEventScreen\(\s*ButtonEventScene\s*\)/i;
@@ -103,7 +104,28 @@ type EventStep =
   | { type: "picture"; op: "show" | "move" | "erase"; slot: number; name?: string; origin?: number; x?: number; y?: number; opacity?: number; durationMs?: number }
   | { type: "sound"; kind: "SE" | "ME" | "BGM" | "BGS" | "BGMStop" | "BGSStop"; name?: string; volume?: number }
   | { type: "screen"; effect: "fadeout" | "fadein" | "tone"; durationMs?: number; darken?: number }
+  // pbPokemonMart: opens the store overlay stocked with these items; buying/
+  // selling goes through the regular npc:store-buy/npc:store-sell sockets,
+  // validated against the mart session this runtime keeps per user. x/y are
+  // the clerk's cell coordinates — the client closes the overlay when the
+  // player walks out of interaction range of that spot.
+  | {
+      type: "store";
+      npcName: string;
+      placementId: string;
+      x: number;
+      y: number;
+      interactionDistanceSquares: number;
+      items: EventMartItem[];
+    }
   | { type: "end" };
+
+export type EventMartItem = {
+  itemId: string;
+  itemName: string;
+  quantity: number;
+  price: number;
+};
 
 type Pending =
   | { kind: "advance"; resolve: () => void }
@@ -123,6 +145,7 @@ type Session = {
   npcName: string;
   npcPortraitSrc: string; // the speaking NPC's trimmed sprite, shown in the box
   selfSwitchPrefix: string; // `${essMapId}:${eventId}:`
+  placementId: string; // map placement that hosts this event ("" for resumes)
   isTouch: boolean; // started by walking into/onto the event (doors, mats)
   nodesRun: number; // hang guard against mis-authored label loops
   // Switch/variable/self-switch changes buffer here and only persist at
@@ -148,6 +171,13 @@ export default class EventRuntime {
   private sessions = new Map<number, Session>();
   private pending = new Map<number, Pending>();
   private tokenCounter = 0;
+  // pbPokemonMart sessions: what each user's currently-open mart sells. The
+  // buy/sell socket handlers validate against this (plus the usual placement
+  // proximity check), so prices/stock can't be forged client-side.
+  private activeMartsByUser = new Map<
+    number,
+    { placementId: string; items: EventMartItem[]; expiresAt: number }
+  >();
 
   constructor(io: TypedSocketServer, world: World, auth: Auth) {
     this.io = io;
@@ -161,6 +191,17 @@ export default class EventRuntime {
 
   public isRunning(userId: number) {
     return this.sessions.has(userId);
+  }
+
+  /** Items of the user's active pbPokemonMart at this placement, or null. */
+  public getActiveMartItems(userId: number, placementId: string) {
+    const mart = this.activeMartsByUser.get(userId);
+
+    if (!mart || mart.placementId !== placementId || Date.now() > mart.expiresAt) {
+      return null;
+    }
+
+    return mart.items;
   }
 
   // -- entry point ---------------------------------------------------------
@@ -201,7 +242,8 @@ export default class EventRuntime {
       essentials,
       page,
       false,
-      options?.touch === true
+      options?.touch === true,
+      npcPlacementId
     );
     return { ok: true as const };
   }
@@ -255,7 +297,9 @@ export default class EventRuntime {
             placement.previewImageSrc ?? "",
             essentials,
             page,
-            true
+            true,
+            false,
+            typeof placement.id === "string" ? placement.id : ""
           );
           if (outcome === "aborted") {
             // Disconnected (or superseded) mid-event: stop chaining; the
@@ -383,7 +427,8 @@ export default class EventRuntime {
     essentials: EssentialsEvent,
     page: EventPage,
     isAutorun: boolean,
-    isTouch = false
+    isTouch = false,
+    placementId = ""
   ) {
     const token = ++this.tokenCounter;
     const session: Session = {
@@ -393,6 +438,7 @@ export default class EventRuntime {
       npcName: this.resolveSpeaker(page, placementName),
       npcPortraitSrc: portraitSrc,
       selfSwitchPrefix: `${essentials.essentialsMapId}:${essentials.eventId}:`,
+      placementId,
       isTouch,
       nodesRun: 0,
       pendingWrites: emptyEventStateWrites(),
@@ -806,6 +852,41 @@ export default class EventRuntime {
         await this.waitAdvance(session.userId);
         await this.refreshSession(session);
       }
+      return;
+    }
+
+    const mart = text.match(RE_POKEMON_MART);
+    if (mart) {
+      // pbPokemonMart([:POTION, :POKEBALL, ...]) — resolve the Essentials
+      // symbols against the item catalog (prices live there) and open the
+      // regular store overlay on the client.
+      const symbols = Array.from(mart[1].matchAll(/:(\w+)/g)).map((match) => match[1]);
+      const items = (await this.battleManager?.resolveMartItems(symbols)) ?? [];
+      if (items.length === 0) {
+        return;
+      }
+      this.activeMartsByUser.set(session.userId, {
+        placementId: session.placementId,
+        items,
+        expiresAt: Date.now() + 10 * 60 * 1000
+      });
+      const placement = this.world
+        .getPlayableMapsState()
+        ?.editorDataByMapId[session.player.currentMapId]?.npcs.find(
+          (candidate) => candidate.id === session.placementId
+        ) as { x?: number; y?: number; interactionDistanceSquares?: number } | undefined;
+      this.emitStep(session, {
+        type: "store",
+        npcName: session.npcName,
+        placementId: session.placementId,
+        x: typeof placement?.x === "number" ? placement.x : 0,
+        y: typeof placement?.y === "number" ? placement.y : 0,
+        interactionDistanceSquares:
+          typeof placement?.interactionDistanceSquares === "number"
+            ? placement.interactionDistanceSquares
+            : 2,
+        items
+      });
       return;
     }
 

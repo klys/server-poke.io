@@ -28,6 +28,17 @@ export type EventStepPayload =
   | { type: "text"; npcName: string; text: string; portraitSrc?: string; portraitPokemonId?: string }
   | { type: "choices"; npcName: string; text: string; choices: string[]; portraitSrc?: string; portraitPokemonId?: string }
   | { type: "info"; npcName: string; text: string; portraitSrc?: string; portraitPokemonId?: string }
+  // pbPokemonMart: open the store overlay stocked with these items. Purchases
+  // go through the regular npc:store-buy / npc:store-sell sockets.
+  | {
+      type: "store";
+      npcName: string;
+      placementId: string;
+      x: number;
+      y: number;
+      interactionDistanceSquares: number;
+      items: Array<{ itemId: string; itemName: string; quantity: number; price: number }>;
+    }
   // Asks the player to type a name (e.g. pbTrainerName); answered via
   // event:advance with { text }.
   | { type: "nameInput"; npcName: string; text: string; defaultName: string }
@@ -141,6 +152,9 @@ export default interface ServerToClientEvents {
   addPlayer: (data: PlayerData) => void;
   removePlayer: (data: { playerId: string; id: number }) => void;
   myPlayer: (data: { playerId: string }) => void;
+  // The player just traveled through a designer portal (server-triggered);
+  // clients play the door/exit chime.
+  "portal:used": (data: { mapId: string }) => void;
 
   shotProjectil: (data: ProjectilData) => void;
   explodeProjectil: (data: ProjectilData) => void;

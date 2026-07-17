@@ -2,7 +2,7 @@ import Player from "./player"
 import Projectil from "./projectil"
 import GameMath from "./gameMath";
 import Pathfinding = require("pathfinding")
-import type { PlayableMapsStateSnapshot } from "./PlayableMapsState";
+import type { MapEditorPortalPlacement, PlayableMapsStateSnapshot } from "./PlayableMapsState";
 import { isSolidCollisionCell, type MapCollisionGrid } from "./TileMapGrid";
 import type BattleManager from "./BattleManager";
 import GroundItemStore, { type GroundItem } from "./GroundItemStore";
@@ -53,6 +53,7 @@ export default class World {
     /** Fires trigger-1/2 (touch) events; wired to the event runtime. */
     private eventTouchHandler:((player:Player, placementId:string) => void) | null = null;
     private locationPersistHandler:((player:Player) => void) | null = null;
+    private portalHandler:((player:Player, portal:MapEditorPortalPlacement) => void) | null = null;
     groundItemStore: GroundItemStore | null;
     //finder:Pathfinding.Finder;
     //grid_backup:Pathfinding.Grid;
@@ -396,6 +397,30 @@ export default class World {
         this.locationPersistHandler = handler;
     }
 
+    setPortalHandler(handler:(player:Player, portal:MapEditorPortalPlacement) => void) {
+        this.portalHandler = handler;
+    }
+
+    /**
+     * Designer portals are SERVER-triggered (the client only renders them).
+     * `eventScript` portals stay client-side — their sandboxed script API
+     * (messages, toasts) only exists in the browser.
+     */
+    private firePortalIfPresent(player:Player, cellX:number, cellY:number) {
+        const editorData = this.playableMapsState?.editorDataByMapId[player.currentMapId];
+        const portal = (editorData?.portals ?? []).find(
+            (candidate) => candidate.x === cellX && candidate.y === cellY
+        );
+
+        if (!portal) {
+            return false;
+        }
+        if (portal.destinationType !== "event-script" && this.portalHandler) {
+            this.portalHandler(player, portal);
+        }
+        return true;
+    }
+
     /** Persist map/x/y for authenticated players. Called on map transfers so
      * a crash or disconnect mid-session can't re-strand the player on a map
      * they already left (previously only disconnect saved the location). */
@@ -411,10 +436,33 @@ export default class World {
      * door sprite blocks the tile AND the touch transfer runs on contact).
      */
     notifyBlockedTouch(player:Player, x:number, y:number) {
-        if (!this.eventTouchHandler) {
+        if (Date.now() < player.touchLockUntil) {
             return;
         }
-        if (Date.now() < player.touchLockUntil) {
+
+        // Door-style portals: several migrated buildings (the farmatodo
+        // stores) keep their exit portal ON the solid door tile, which can
+        // never be stood on — walking INTO it must teleport, exactly like an
+        // RMXP player-touch door. The blocked step only reaches ~4px into the
+        // tile, so detect by AABB overlap; the axis ACROSS the movement must
+        // overlap at least half a tile (same alignment rule as event doors).
+        const portals =
+            this.playableMapsState?.editorDataByMapId[player.currentMapId]?.portals ?? [];
+        for (const portal of portals) {
+            const portalX = portal.x * 32;
+            const portalY = portal.y * 32;
+            const overlapX = Math.min(x + player.width, portalX + 32) - Math.max(x, portalX);
+            const overlapY = Math.min(y + player.height, portalY + 32) - Math.max(y, portalY);
+            if (overlapX <= 0 || overlapY <= 0 || Math.max(overlapX, overlapY) < 16) {
+                continue;
+            }
+            if (portal.destinationType !== "event-script" && this.portalHandler) {
+                this.portalHandler(player, portal);
+            }
+            return;
+        }
+
+        if (!this.eventTouchHandler) {
             return;
         }
 
@@ -474,7 +522,9 @@ export default class World {
         if (!editorData) {
             return;
         }
-        if ((editorData.portals ?? []).some((portal) => portal.x === cellX && portal.y === cellY)) {
+        // Standing on a walkable portal cell teleports (server-authoritative);
+        // portal tiles never double as essentials touch events.
+        if (this.firePortalIfPresent(player, cellX, cellY)) {
             return;
         }
 
