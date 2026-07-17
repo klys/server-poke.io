@@ -2002,6 +2002,21 @@ export default function registerSocketHandlers(
   // the bump/step, the event runtime plays the event. Cooldown keeps a held
   // arrow key from re-firing the same event every tick.
   const touchCooldowns = new Map<number, { placementId:string; at:number }>();
+  // Map transfers persist the new location immediately (fire-and-forget);
+  // relying on the disconnect handler alone loses the position on crashes
+  // and re-strands players inside buildings they already exited.
+  world.setLocationPersistHandler((player) => {
+    if (typeof player.userId !== "number") return;
+    void auth
+      .savePlayerLocation(player.userId, {
+        mapId: player.currentMapId,
+        x: player.x,
+        y: player.y
+      })
+      .catch((error) => {
+        console.error("Unable to save player location on transfer:", error);
+      });
+  });
   world.setEventTouchHandler((player, placementId) => {
     const userId = player.userId;
     if (typeof userId !== "number" || player.inBattle || eventRuntime.isRunning(userId)) {

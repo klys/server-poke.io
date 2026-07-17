@@ -52,6 +52,7 @@ export default class World {
     private npcBlockerCache = new WeakMap<object, Map<string, Array<{ id:string; x:number; y:number; essentials:EssentialsEventRecord | null }>>>();
     /** Fires trigger-1/2 (touch) events; wired to the event runtime. */
     private eventTouchHandler:((player:Player, placementId:string) => void) | null = null;
+    private locationPersistHandler:((player:Player) => void) | null = null;
     groundItemStore: GroundItemStore | null;
     //finder:Pathfinding.Finder;
     //grid_backup:Pathfinding.Grid;
@@ -391,6 +392,19 @@ export default class World {
         this.eventTouchHandler = handler;
     }
 
+    setLocationPersistHandler(handler:(player:Player) => void) {
+        this.locationPersistHandler = handler;
+    }
+
+    /** Persist map/x/y for authenticated players. Called on map transfers so
+     * a crash or disconnect mid-session can't re-strand the player on a map
+     * they already left (previously only disconnect saved the location). */
+    persistPlayerLocation(player:Player) {
+        if (this.locationPersistHandler) {
+            this.locationPersistHandler(player);
+        }
+    }
+
     /**
      * RMXP player-touch (bump): walking INTO a blocked event tile fires the
      * event when its active page is trigger 1/2 — this is how doors work (the
@@ -398,6 +412,9 @@ export default class World {
      */
     notifyBlockedTouch(player:Player, x:number, y:number) {
         if (!this.eventTouchHandler) {
+            return;
+        }
+        if (Date.now() < player.touchLockUntil) {
             return;
         }
 
@@ -408,6 +425,15 @@ export default class World {
                 continue;
             }
             if (!this.checkCollision(bounds, { x: blocker.x + inset, y: blocker.y + inset, width: 32 - inset * 2, height: 32 - inset * 2 })) {
+                continue;
+            }
+            // Require the player to actually be walking INTO the door, not
+            // grazing its corner: on the axis across the movement the player
+            // must overlap at least half the tile. Corner clips (a few px on
+            // both axes) used to fire doors the player never aimed at.
+            const overlapX = Math.min(x + player.width, blocker.x + 32) - Math.max(x, blocker.x);
+            const overlapY = Math.min(y + player.height, blocker.y + 32) - Math.max(y, blocker.y);
+            if (Math.max(overlapX, overlapY) < 16) {
                 continue;
             }
             const page = selectConditionMetPage(
@@ -438,6 +464,11 @@ export default class World {
             return;
         }
         player.lastTouchCellKey = key;
+        // Cells crossed during the post-teleport lock never fire: the key is
+        // already updated above, so they won't fire retroactively either.
+        if (Date.now() < player.touchLockUntil) {
+            return;
+        }
 
         const editorData = this.playableMapsState?.editorDataByMapId[player.currentMapId];
         if (!editorData) {

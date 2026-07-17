@@ -2,6 +2,7 @@ import World from "./world"
 import GameMath from "./gameMath";
 
 const PLAYER_MOVE_INTERVAL_MS = 28;
+const POST_TELEPORT_TOUCH_LOCK_MS = 900;
 
 /**
  * Represents a player entity in the game world.
@@ -34,6 +35,10 @@ export default class Player {
     /** Last cell a standing-touch check ran for (touch events fire on cell
      * entry, and teleports seed this so arrivals don't instantly re-fire). */
     lastTouchCellKey:string = "";
+    /** Touch triggers (standing AND bump) are suppressed until this time.
+     * Set on teleport so a held movement key can't immediately bump the
+     * paired door at the destination and warp the player straight back. */
+    touchLockUntil:number = 0;
     angle:number; 
     life:number;
     death:boolean;
@@ -345,6 +350,11 @@ export default class Player {
         // Seed the touch cell so landing on a touch event (door mats, cave
         // mouths) doesn't instantly fire it back — classic transfer behavior.
         this.lastTouchCellKey = `${mapId}:${Math.floor((this.x + this.width / 2) / 32)}:${Math.floor((this.y + this.height / 2) / 32)}`;
+        // Also lock bump-touch for a moment: exiting a building lands the
+        // player next to the (solid) entrance door, and a still-held arrow key
+        // would otherwise bump it on the very next tick and warp them back in.
+        this.touchLockUntil = Date.now() + POST_TELEPORT_TOUCH_LOCK_MS;
+        this.world.persistPlayerLocation(this);
 
         World.socketServer.emit("move"+this.socketId, {
             x:this.x,
