@@ -110,6 +110,19 @@ export default interface ClientToServerEvents {
   "pokemon:reorder": (data: { order: string[] }) => void;
 
   /**
+   * Moves a party Pokemon into PC box storage. Omit `boxId` to use the first
+   * box with free space (a new box is created when every box is full). The
+   * last party Pokemon cannot be deposited. Not allowed during a battle.
+   */
+  "pokemon:box-deposit": (data: { pokemonId: string; boxId?: string }) => void;
+
+  /**
+   * Moves a Pokemon from the given PC storage box back into the party.
+   * Fails when the party already has 6 members. Not allowed during a battle.
+   */
+  "pokemon:box-withdraw": (data: { pokemonId: string; boxId: string }) => void;
+
+  /**
    * Registers a new player account and starts an authenticated socket session.
    * Validation rules:
    * - `name`: letters only, min 2, max 30

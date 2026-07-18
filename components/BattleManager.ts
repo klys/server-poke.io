@@ -1060,6 +1060,24 @@ export default class BattleManager {
     };
   }
 
+  public async depositPokemonToBox(userId: number, pokemonId: string, boxId?: string) {
+    const player = this.world.getPlayerByUserId(userId);
+    if (player && this.isPlayerBattling(player.socketId)) {
+      return { ok: false as const, message: "You can't use the storage system during a battle." };
+    }
+
+    return this.auth.depositPokemonToStorage(userId, pokemonId, boxId);
+  }
+
+  public async withdrawPokemonFromBox(userId: number, pokemonId: string, boxId: string) {
+    const player = this.world.getPlayerByUserId(userId);
+    if (player && this.isPlayerBattling(player.socketId)) {
+      return { ok: false as const, message: "You can't use the storage system during a battle." };
+    }
+
+    return this.auth.withdrawPokemonFromStorage(userId, pokemonId, boxId);
+  }
+
   public async takeHeldItem(userId: number, pokemonId: string) {
     const player = this.world.getPlayerByUserId(userId);
     if (player && this.isPlayerBattling(player.socketId)) {
@@ -3132,13 +3150,9 @@ export default class BattleManager {
         return "That item cannot be used in battle.";
       }
 
-      if (isPokeball) {
-        if (battle.kind !== "wild") {
-          return "You can't catch another trainer's Pokemon!";
-        }
-        if (side.party.length >= MAX_PARTY_SIZE) {
-          return "Your party is full.";
-        }
+      if (isPokeball && battle.kind !== "wild") {
+        // A full party no longer blocks the throw: the catch goes to PC storage.
+        return "You can't catch another trainer's Pokemon!";
       }
     }
 
@@ -3307,11 +3321,6 @@ export default class BattleManager {
       return false;
     }
 
-    if (side.party.length >= MAX_PARTY_SIZE) {
-      this.say(battle, `${side.trainerName} has no room for another Pokemon.`);
-      return false;
-    }
-
     item.quantity -= 1;
     this.pushEvent(
       battle,
@@ -3398,6 +3407,15 @@ export default class BattleManager {
       heldItemId: undefined,
       heldItemName: undefined
     };
+
+    if (side.party.length >= MAX_PARTY_SIZE && typeof side.userId === "number") {
+      // Party full: the catch still succeeds and goes straight to PC storage.
+      const { boxName } = await this.auth.addPokemonToStorage(side.userId, caughtSummary);
+      const storedMessage = `${getPokemonDisplayName(wildPokemon)} was sent to storage (${boxName}).`;
+      this.pushEvent(battle, { kind: "message", text: storedMessage }, storedMessage);
+      await this.finishBattle(battle, `${getPokemonDisplayName(wildPokemon)} was caught!`, side, opponent);
+      return true;
+    }
 
     side.party.push({ ...wildPokemon, id: caughtSummary.id, originalSummary: caughtSummary });
     await this.finishBattle(battle, `${getPokemonDisplayName(wildPokemon)} was caught!`, side, opponent);
@@ -4914,7 +4932,7 @@ export default class BattleManager {
           const definition = this.getCachedItemDefinition(item.id, item.name);
           const canUse = definition
             ? definition.isPokeball
-              ? battle.kind === "wild" && self.party.length < MAX_PARTY_SIZE
+              ? battle.kind === "wild"
               : true
             : false;
 

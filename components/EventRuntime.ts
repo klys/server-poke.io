@@ -80,6 +80,9 @@ const RE_TRAINER_NAME = /pbTrainerName/i;
 const RE_TONE_CHANGE = /pbToneChangeAll\(\s*Tone\.new\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)[^)]*\)\s*,\s*(\d+)/i;
 const RE_SET_POKECENTER = /pbSetPokemonCenter/i;
 const RE_POKEMON_MART = /pbPokemonMart\(\s*\[([^\]]*)\]/i;
+// Pokemon Center / bedroom computers: both Essentials entry points open the
+// same server-authoritative PC box storage overlay on the client.
+const RE_POKEMON_PC = /pbPokeCenterPC|pbTrainerPC/i;
 const RE_SE_PLAY = /pbSEPlay\(\s*"([^"]+)"/i;
 const RE_PB_WAIT = /pbWait\(\s*(\d+)\s*\)/i;
 const RE_BUTTON_SCREEN = /pbEventScreen\(\s*ButtonEventScene\s*\)/i;
@@ -117,6 +120,18 @@ type EventStep =
       y: number;
       interactionDistanceSquares: number;
       items: EventMartItem[];
+    }
+  // pbPokeCenterPC / pbTrainerPC: opens the PC box storage overlay. Deposits/
+  // withdrawals go through the pokemon:box-deposit / pokemon:box-withdraw
+  // sockets, which mutate Redis directly. x/y are the computer's cell — the
+  // client closes the overlay when the player walks out of range.
+  | {
+      type: "pcBox";
+      npcName: string;
+      placementId: string;
+      x: number;
+      y: number;
+      interactionDistanceSquares: number;
     }
   | { type: "end" };
 
@@ -886,6 +901,28 @@ export default class EventRuntime {
             ? placement.interactionDistanceSquares
             : 2,
         items
+      });
+      return;
+    }
+
+    if (RE_POKEMON_PC.test(text)) {
+      // Pokemon Center / bedroom PC: open the box storage overlay anchored to
+      // this computer's cell so walking away closes it (same as marts).
+      const placement = this.world
+        .getPlayableMapsState()
+        ?.editorDataByMapId[session.player.currentMapId]?.npcs.find(
+          (candidate) => candidate.id === session.placementId
+        ) as { x?: number; y?: number; interactionDistanceSquares?: number } | undefined;
+      this.emitStep(session, {
+        type: "pcBox",
+        npcName: session.npcName || "PC",
+        placementId: session.placementId,
+        x: typeof placement?.x === "number" ? placement.x : 0,
+        y: typeof placement?.y === "number" ? placement.y : 0,
+        interactionDistanceSquares:
+          typeof placement?.interactionDistanceSquares === "number"
+            ? placement.interactionDistanceSquares
+            : 2
       });
       return;
     }

@@ -1748,6 +1748,61 @@ function createConnectionHandler(
       socket.emit("auth:info", { message: result.message });
     });
 
+    socket.on("pokemon:box-deposit", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+
+      if (typeof data?.pokemonId !== "string" || data.pokemonId.length === 0) {
+        socket.emit("auth:error", { message: "Select a Pokemon to deposit." });
+        return;
+      }
+
+      const result = await battleManager.depositPokemonToBox(
+        socket.data.userId,
+        data.pokemonId,
+        typeof data.boxId === "string" && data.boxId.length > 0 ? data.boxId : undefined
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("pokemon:box-withdraw", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+
+      if (
+        typeof data?.pokemonId !== "string" || data.pokemonId.length === 0 ||
+        typeof data?.boxId !== "string" || data.boxId.length === 0
+      ) {
+        socket.emit("auth:error", { message: "Select a Pokemon to withdraw." });
+        return;
+      }
+
+      const result = await battleManager.withdrawPokemonFromBox(
+        socket.data.userId,
+        data.pokemonId,
+        data.boxId
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
     socket.on("inventory:take-held-item", async (data) => {
       if (typeof socket.data.userId !== "number") {
         socket.emit("auth:error", { message: "Log in to manage held items." });

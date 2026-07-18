@@ -39,6 +39,16 @@ export type EventStepPayload =
       interactionDistanceSquares: number;
       items: Array<{ itemId: string; itemName: string; quantity: number; price: number }>;
     }
+  // pbPokeCenterPC / pbTrainerPC: open the PC box storage overlay. Deposits
+  // and withdrawals go through pokemon:box-deposit / pokemon:box-withdraw.
+  | {
+      type: "pcBox";
+      npcName: string;
+      placementId: string;
+      x: number;
+      y: number;
+      interactionDistanceSquares: number;
+    }
   // Asks the player to type a name (e.g. pbTrainerName); answered via
   // event:advance with { text }.
   | { type: "nameInput"; npcName: string; text: string; defaultName: string }
@@ -145,6 +155,16 @@ interface AuthUserData {
       specialDefense: number;
       speed: number;
     };
+  }>;
+  /**
+   * PC box storage: endless boxes, each holding up to `capacity` Pokemon.
+   * Always contains at least one box. Entries share the party Pokemon shape.
+   */
+  pokemonStorage: Array<{
+    id: string;
+    name: string;
+    capacity: number;
+    pokemon: AuthUserData["pokemonParty"];
   }>;
 }
 
