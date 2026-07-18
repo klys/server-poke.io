@@ -18,6 +18,7 @@ import PlayableMapsStore, {
   type PlayableMapsSyncPayload,
 } from "../components/PlayableMapsStore";
 import {
+  resolveFlyDestinations,
   resolveInitialSpawnFromPlayableMapsState,
   resolvePlayableMapPortalDestination,
 } from "../components/PlayableMapsState";
@@ -1659,6 +1660,50 @@ function createConnectionHandler(
       if (typeof socket.data.userId === "number") {
         void eventRuntime.runAutorunForMap(socket.data.userId);
       }
+    });
+
+    socket.on("player:fly", async (data) => {
+      const player = world.getPlayerBySocket(socket.id);
+
+      if (!player || player.inBattle) {
+        return;
+      }
+
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("player:fly-error", { message: "Log in to use Volar." });
+        return;
+      }
+
+      const mapsState = world.getPlayableMapsState();
+      const destination = mapsState
+        ? resolveFlyDestinations(mapsState).find(
+            (candidate) => candidate.mapId === data?.mapId
+          )
+        : undefined;
+
+      if (!destination) {
+        socket.emit("player:fly-error", { message: "You cannot fly to that place." });
+        return;
+      }
+
+      const user = await auth.getUserForBattle(socket.data.userId);
+      const knowsFly = (user?.pokemonParty ?? []).some((pokemon) =>
+        (pokemon.moves ?? []).some((move) => move.trim().toLowerCase() === "volar")
+      );
+
+      if (!knowsFly) {
+        socket.emit("player:fly-error", { message: "No venomon in your party knows Volar." });
+        return;
+      }
+
+      player.stopMovement();
+      player.teleport(destination.mapId, destination.x, destination.y);
+      world.players.set(player.socketId, player);
+      world.presentPlayerToMap(player);
+      player.socketConnections.forEach((socketId) => {
+        world.presentPlayersOnMapTo(socketId, player.currentMapId);
+      });
+      void eventRuntime.runAutorunForMap(socket.data.userId);
     });
 
     socket.on("shotProjectil", (data) => {

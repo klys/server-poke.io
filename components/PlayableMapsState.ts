@@ -134,6 +134,13 @@ type MapEditorGrassPlacement = {
   sourceEncounterId?: string;
 };
 
+export type MapEditorNpcStoreItem = {
+  itemId: string;
+  itemName: string;
+  quantity: number;
+  price: number;
+};
+
 type MapEditorNpcPlacement = {
   id: string;
   npcId: string;
@@ -152,6 +159,9 @@ type MapEditorNpcPlacement = {
     parameters: unknown[];
     indent?: number;
   }>;
+  /** Designer stock override for event marts (pbPokemonMart): when set, the
+   * event runtime sells these instead of the imported script's item symbols. */
+  storeItems?: MapEditorNpcStoreItem[];
 };
 
 export type PlayableMapBakedChunk = {
@@ -512,6 +522,41 @@ function sanitizeTileMapProfile(value: unknown): PlayableMapTileMapProfile | und
   };
 }
 
+export function sanitizeNpcStoreItems(value: unknown): MapEditorNpcStoreItem[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+
+  const seenItemIds = new Set<string>();
+  const items = value
+    .filter(
+      (item): item is Partial<MapEditorNpcStoreItem> =>
+        Boolean(item) && typeof item === "object"
+    )
+    .map((item) => ({
+      itemId: typeof item.itemId === "string" ? item.itemId.trim() : "",
+      itemName: typeof item.itemName === "string" ? item.itemName.trim() : "",
+      quantity:
+        typeof item.quantity === "number" && Number.isFinite(item.quantity) && item.quantity > 0
+          ? Math.max(1, Math.round(item.quantity))
+          : 1,
+      price:
+        typeof item.price === "number" && Number.isFinite(item.price) && item.price >= 0
+          ? Math.max(0, Math.round(item.price))
+          : 0,
+    }))
+    .filter((item) => {
+      if (!item.itemId || !item.itemName || seenItemIds.has(item.itemId)) {
+        return false;
+      }
+
+      seenItemIds.add(item.itemId);
+      return true;
+    });
+
+  return items.length > 0 ? items : undefined;
+}
+
 function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
   if (!value || typeof value !== "object") {
     return {
@@ -627,6 +672,7 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
                 : DEFAULT_NPC_INTERACTION_DISTANCE_SQUARES,
             x: Math.max(0, clampInteger(item.x)),
             y: Math.max(0, clampInteger(item.y)),
+            storeItems: sanitizeNpcStoreItems(item.storeItems),
           }))
       : [],
     tileMap: sanitizeTileMapProfile(candidate.tileMap),
@@ -754,6 +800,58 @@ export function resolvePlayableMapPortalDestination(
     x: Math.max(0, Math.round(portal.targetMapX)) * cellSize,
     y: Math.max(0, Math.round(portal.targetMapY)) * cellSize
   };
+}
+
+// Town detection for the world map / Volar (Fly): the imported Essentials data
+// carries no healingSpot or town metadata, so a map counts as a fly-able town
+// when it holds a portal into a Pokémon Center map. The landing spot is one
+// cell south of that portal — right in front of the center's door. The client
+// mirrors this rule in worldMap.ts; keep both in sync.
+const POKECENTER_NAME_PATTERN = /centro\s*pok|pok[eé]\s*center|pokecenter/i;
+
+export type FlyDestination = {
+  mapId: string;
+  name: string;
+  x: number;
+  y: number;
+};
+
+export function resolveFlyDestinations(snapshot: PlayableMapsStateSnapshot): FlyDestination[] {
+  const pokecenterMapIds = new Set(
+    snapshot.items
+      .filter((item) => POKECENTER_NAME_PATTERN.test(item.name))
+      .map((item) => item.id)
+  );
+
+  const destinations: FlyDestination[] = [];
+
+  for (const item of snapshot.items) {
+    if (pokecenterMapIds.has(item.id)) {
+      continue;
+    }
+
+    const portals = snapshot.editorDataByMapId[item.id]?.portals ?? [];
+    const pokecenterPortal = portals.find(
+      (portal) =>
+        portal.destinationType === "other-map" &&
+        pokecenterMapIds.has(portal.targetMapId)
+    );
+
+    if (!pokecenterPortal) {
+      continue;
+    }
+
+    const cellSize = item.playableMapConfig?.cellSize ?? DEFAULT_CELL_SIZE;
+
+    destinations.push({
+      mapId: item.id,
+      name: item.name,
+      x: Math.max(0, Math.round(pokecenterPortal.x)) * cellSize,
+      y: Math.max(0, Math.round(pokecenterPortal.y) + 1) * cellSize,
+    });
+  }
+
+  return destinations.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export function buildPlayableMapDefinitions(snapshot: PlayableMapsStateSnapshot): PlayableMapDefinition[] {

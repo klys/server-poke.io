@@ -175,6 +175,8 @@ export default interface ServerToClientEvents {
   // The player just traveled through a designer portal (server-triggered);
   // clients play the door/exit chime.
   "portal:used": (data: { mapId: string }) => void;
+  // Volar (Fly) request rejected — the world-map window shows the message.
+  "player:fly-error": (data: { message: string }) => void;
 
   shotProjectil: (data: ProjectilData) => void;
   explodeProjectil: (data: ProjectilData) => void;

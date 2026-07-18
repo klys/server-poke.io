@@ -7,7 +7,10 @@ import type ClientToServerEvents from "../Server/ClientToServerEvents";
 import type InterServerEvents from "../Server/InterServerEvents";
 import type ServerToClientEvents from "../Server/ServerToClientEvents";
 import type { SocketData } from "../Server/registerSocketHandlers";
-import { resolveInitialSpawnFromPlayableMapsState } from "./PlayableMapsState";
+import {
+  resolveInitialSpawnFromPlayableMapsState,
+  sanitizeNpcStoreItems,
+} from "./PlayableMapsState";
 
 type TypedSocketServer = Server<
   ClientToServerEvents,
@@ -1010,8 +1013,26 @@ export default class EventRuntime {
       // pbPokemonMart([:POTION, :POKEBALL, ...]) — resolve the Essentials
       // symbols against the item catalog (prices live there) and open the
       // regular store overlay on the client.
+      const placement = this.world
+        .getPlayableMapsState()
+        ?.editorDataByMapId[session.player.currentMapId]?.npcs.find(
+          (candidate) => candidate.id === session.placementId
+        ) as
+        | {
+            x?: number;
+            y?: number;
+            interactionDistanceSquares?: number;
+            storeItems?: Array<{ itemId: string; itemName: string; quantity: number; price: number }>;
+          }
+        | undefined;
+      // A designer stock override on the placement (map editor "Mart Stock")
+      // replaces the imported script's item list entirely.
+      const overrideItems = sanitizeNpcStoreItems(placement?.storeItems) ?? [];
       const symbols = Array.from(mart[1].matchAll(/:(\w+)/g)).map((match) => match[1]);
-      const items = (await this.battleManager?.resolveMartItems(symbols)) ?? [];
+      const items =
+        overrideItems.length > 0
+          ? overrideItems
+          : (await this.battleManager?.resolveMartItems(symbols)) ?? [];
       if (items.length === 0) {
         return;
       }
@@ -1020,11 +1041,6 @@ export default class EventRuntime {
         items,
         expiresAt: Date.now() + 10 * 60 * 1000
       });
-      const placement = this.world
-        .getPlayableMapsState()
-        ?.editorDataByMapId[session.player.currentMapId]?.npcs.find(
-          (candidate) => candidate.id === session.placementId
-        ) as { x?: number; y?: number; interactionDistanceSquares?: number } | undefined;
       this.emitStep(session, {
         type: "store",
         npcName: session.npcName,

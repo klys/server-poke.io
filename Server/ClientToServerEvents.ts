@@ -79,6 +79,7 @@ export default interface ClientToServerEvents {
     token?: string;
   }) => void;
   "player:teleport": (data: { mapId: string; x: number; y: number }) => void;
+  "player:fly": (data: { mapId: string }) => void;
   move: (data: { x: number; y: number }) => void;
   stopMove: () => void;
   shotProjectil: (data: { mouse_x: number; mouse_y: number }) => void;
