@@ -5,6 +5,7 @@ import Auth from "./Auth";
 import type DesignerSectionStore from "./DesignerSectionStore";
 import type { DesignerSectionItem } from "./DesignerSectionStore";
 import type { GroundItem } from "./GroundItemStore";
+import LEGACY_ITEM_INTERNAL_BY_NUMBER from "./legacyItemNumbers";
 import {
   computeBattleExperience,
   createEmptyPokemonStatBonuses,
@@ -1359,6 +1360,44 @@ export default class BattleManager {
       user: nextUser,
       message: `You sold ${inventoryItem.name} x${sellCount} for $${totalPrice}.`
     };
+  }
+
+  /**
+   * Grants an item from a map event script (pbItemBall / pbReceiveItem /
+   * pbStoreItem). The item is referenced either by its Essentials symbol
+   * (:POTION / PBItems::POTION) or by a legacy numeric id read from an event
+   * variable (apricorn trees do `pbItemBall(pbGet(1))`).
+   */
+  public async grantEventItem(
+    userId: number,
+    ref: { symbol?: string; legacyNumber?: number },
+    quantity = 1
+  ): Promise<{ ok: false } | { ok: true; itemName: string }> {
+    await this.loadCatalogs();
+
+    const symbol =
+      ref.symbol ??
+      (typeof ref.legacyNumber === "number"
+        ? LEGACY_ITEM_INTERNAL_BY_NUMBER[ref.legacyNumber]
+        : undefined);
+    const lowered = symbol?.trim().toLowerCase();
+    if (!lowered) {
+      return { ok: false };
+    }
+
+    const definition = this.cachedItemDefinitions.find(
+      (candidate) =>
+        candidate.essentialsId.toLowerCase() === lowered ||
+        candidate.id === `item-${lowered}`
+    );
+    const user = await this.auth.getUserForBattle(userId);
+    if (!definition || !user) {
+      return { ok: false };
+    }
+
+    const inventory = this.addInventoryQuantity(user.inventory, definition, quantity);
+    await this.auth.saveInventory(userId, inventory);
+    return { ok: true, itemName: definition.name };
   }
 
   public async pickUpGroundItem(player: Player, groundItem: GroundItem) {

@@ -43,8 +43,15 @@ type ConditionTest =
   | { kind: "switch"; id: number; on: boolean }
   | { kind: "selfSwitch"; ch: string; on: boolean }
   | { kind: "variable"; id: number; op: number; constant: boolean; value: number }
+  | { kind: "gold"; amount: number; gte: boolean }
   | { kind: "script"; text: string }
   | { kind: "always"; value: boolean };
+
+// Control Variables (122) / Change Gold (125) operands.
+type Operand =
+  | { type: "const"; value: number }
+  | { type: "variable"; id: number }
+  | { type: "random"; min: number; max: number };
 
 type Node =
   | { kind: "text"; text: string }
@@ -52,7 +59,8 @@ type Node =
   | { kind: "condition"; test: ConditionTest; then: Node[]; otherwise: Node[] }
   | { kind: "script"; text: string }
   | { kind: "switch"; start: number; end: number; on: boolean }
-  | { kind: "variable"; id: number; value: number }
+  | { kind: "variable"; start: number; end: number; op: number; operand: Operand }
+  | { kind: "gold"; add: boolean; operand: Operand }
   | { kind: "selfSwitch"; ch: string; on: boolean }
   | { kind: "label"; name: string }
   | { kind: "jump"; name: string }
@@ -71,7 +79,15 @@ class JumpToLabel {
 
 // RMXP script effects the runtime understands (pbAddPokemon etc.).
 const RE_ADD_POKEMON = /pbAddPokemon\(\s*PBSpecies::(\w+)\s*,\s*(\d+)/i;
-const RE_RECEIVE_ITEM = /pb(?:ReceiveItem|Receive)\(\s*(?:Kernel\.)?PBItems::(\w+)/i;
+const RE_RECEIVE_ITEM = /pbReceive(?:Item)?\(\s*(?:PBItems::|:)(\w+)/i;
+// pbItemBall(:POTION) — visible item balls; also used by hidden items.
+const RE_ITEM_BALL = /pbItemBall\(\s*(?:PBItems::|:)(\w+)/i;
+// pbItemBall(pbGet(1)) — the item's legacy numeric id sits in an event
+// variable (apricorn trees roll 21+rand(7) into variable 1 first).
+const RE_ITEM_BALL_VAR = /pbItemBall\(\s*pbGet\(\s*(\d+)\s*\)/i;
+// $PokemonBag.pbStoreItem(PBItems::X) — silent grants (vending machines);
+// the event's own Show Text announces the item, so no info step here.
+const RE_STORE_ITEM = /pbStoreItem\(\s*(?:PBItems::|:)(\w+)/i;
 const RE_POKEDEX = /\$Trainer\.pokedex\s*=\s*true/i;
 const RE_HEAL = /pbHealAll|pbHealParty|Recover All/i;
 const RE_CHANGE_PLAYER = /pbChangePlayer\(\s*(\d)\s*\)/i;
@@ -639,9 +655,31 @@ export default class EventRuntime {
           }
           break;
         }
-        case "variable":
-          session.pendingWrites.variables[String(node.id)] = node.value;
+        case "variable": {
+          const state = await this.getSessionEventState(session);
+          const operand = this.resolveOperand(node.operand, state.variables);
+          for (let id = node.start; id <= node.end; id += 1) {
+            const current = Number(state.variables[String(id)] ?? 0);
+            session.pendingWrites.variables[String(id)] =
+              this.applyVariableOp(current, node.op, operand);
+          }
           break;
+        }
+        case "gold": {
+          // Money changes persist immediately (like battles/purchases);
+          // checkpoint the buffered event state so they stay consistent.
+          await this.flushEventWrites(session);
+          const state = await this.getSessionEventState(session);
+          const amount = this.resolveOperand(node.operand, state.variables);
+          const user = await this.auth.getUserForBattle(session.userId);
+          if (user && amount !== 0) {
+            await this.auth.saveBattleState(session.userId, {
+              money: user.money + (node.add ? amount : -amount)
+            });
+            await this.refreshSession(session);
+          }
+          break;
+        }
         case "selfSwitch":
           session.pendingWrites.selfSwitches[`${session.selfSwitchPrefix}${node.ch}`] = node.on;
           break;
@@ -774,6 +812,90 @@ export default class EventRuntime {
     await this.auth.applyEventStateWrites(session.userId, writes);
   }
 
+  private resolveOperand(operand: Operand, variables: Record<string, number>): number {
+    switch (operand.type) {
+      case "const":
+        return operand.value;
+      case "variable":
+        return Number(variables[String(operand.id)] ?? 0);
+      case "random":
+        return operand.min + Math.floor(Math.random() * (operand.max - operand.min + 1));
+    }
+  }
+
+  /** RMXP Control Variables operations: set/add/sub/mul/div/mod. */
+  private applyVariableOp(current: number, op: number, operand: number): number {
+    switch (op) {
+      case 0: return operand;
+      case 1: return current + operand;
+      case 2: return current - operand;
+      case 3: return current * operand;
+      case 4: return operand !== 0 ? Math.trunc(current / operand) : current;
+      case 5: return operand !== 0 ? current % operand : current;
+      default: return current;
+    }
+  }
+
+  /**
+   * Grants an item named by an event script and (for item balls / gift items,
+   * which announce themselves in Essentials) shows the pickup line. Returns
+   * whether anything was actually granted.
+   */
+  private async grantScriptedItem(
+    session: Session,
+    ref: { symbol?: string; legacyNumber?: number },
+    announce: "found" | "received" | null
+  ): Promise<boolean> {
+    if (!this.battleManager) {
+      return false;
+    }
+    const grant = await this.battleManager.grantEventItem(session.userId, ref);
+    if (!grant.ok) {
+      return false;
+    }
+    if (announce) {
+      this.emitStep(session, {
+        type: "info",
+        npcName: session.npcName,
+        text:
+          announce === "found"
+            ? `¡Has encontrado ${grant.itemName}!`
+            : `¡Has recibido ${grant.itemName}!`
+      });
+      await this.waitAdvance(session.userId);
+    }
+    await this.refreshSession(session);
+    return true;
+  }
+
+  /**
+   * Item grants named inside a script — either a plain Script command or a
+   * script *condition* (item balls live there: the pbItemBall call is the
+   * test and the branch body sets Self Switch A to consume the ball).
+   * Returns null when the script is not an item grant.
+   */
+  private async applyScriptedItemGrant(session: Session, text: string): Promise<boolean | null> {
+    const ballVar = text.match(RE_ITEM_BALL_VAR);
+    if (ballVar) {
+      const state = await this.getSessionEventState(session);
+      const legacyNumber = Number(state.variables[String(Number(ballVar[1]))] ?? 0);
+      return this.grantScriptedItem(session, { legacyNumber }, "found");
+    }
+    const ball = text.match(RE_ITEM_BALL);
+    if (ball) {
+      return this.grantScriptedItem(session, { symbol: ball[1] }, "found");
+    }
+    const receive = text.match(RE_RECEIVE_ITEM);
+    if (receive) {
+      return this.grantScriptedItem(session, { symbol: receive[1] }, "received");
+    }
+    const store = text.match(RE_STORE_ITEM);
+    if (store) {
+      return this.grantScriptedItem(session, { symbol: store[1] }, null);
+    }
+    return null;
+  }
+
   private async evaluate(session: Session, test: ConditionTest): Promise<boolean> {
     const state = await this.getSessionEventState(session);
     switch (test.kind) {
@@ -794,12 +916,25 @@ export default class EventRuntime {
           default: return false;
         }
       }
+      case "gold": {
+        const user = await this.auth.getUserForBattle(session.userId);
+        const money = user?.money ?? 0;
+        return test.gte ? money >= test.amount : money <= test.amount;
+      }
       case "script": {
         const trainerBattle = test.text.match(RE_TRAINER_BATTLE);
         if (trainerBattle) {
           // The battle IS the condition: its outcome selects the branch
           // (win -> self switch A = trainer defeated, like Essentials).
           return this.runScriptedTrainerBattle(session, trainerBattle[1], trainerBattle[2]);
+        }
+        // Item balls are usually authored as script conditions whose branch
+        // body sets Self Switch A. Granting here (and failing the test when
+        // nothing could be granted) means the ball is only consumed when the
+        // player really got the item.
+        const itemGrant = await this.applyScriptedItemGrant(session, test.text);
+        if (itemGrant !== null) {
+          return itemGrant;
         }
         // Unknown script tests keep the old permissive behavior.
         return true;
@@ -927,9 +1062,8 @@ export default class EventRuntime {
       return;
     }
 
-    const receiveItem = text.match(RE_RECEIVE_ITEM);
-    if (receiveItem) {
-      // Item grants are best-effort; unknown items are ignored gracefully.
+    const itemGrant = await this.applyScriptedItemGrant(session, text);
+    if (itemGrant !== null) {
       return;
     }
 
@@ -1317,10 +1451,42 @@ function parseBlock(commands: RawCommand[], start: number, indent: number): { no
         break;
       }
       case 122: {
-        const id = Number(command.parameters[0] ?? 0);
-        // parameters: [start, end, operation, operand_type, value...]. Support constant set.
-        const value = Number(command.parameters[4] ?? 0);
-        nodes.push({ kind: "variable", id, value });
+        // [start, end, operation, operandType, ...operand]. Operand types
+        // beyond const/variable/random (item counts, actor stats) are rare
+        // and read as 0. Apricorn trees rely on random: 21 + rand(0..6).
+        const startId = Number(command.parameters[0] ?? 0);
+        const endId = Number(command.parameters[1] ?? startId);
+        const operandType = Number(command.parameters[3] ?? 0);
+        const operand: Operand =
+          operandType === 1
+            ? { type: "variable", id: Number(command.parameters[4] ?? 0) }
+            : operandType === 2
+              ? {
+                  type: "random",
+                  min: Number(command.parameters[4] ?? 0),
+                  max: Number(command.parameters[5] ?? 0)
+                }
+              : { type: "const", value: operandType === 0 ? Number(command.parameters[4] ?? 0) : 0 };
+        nodes.push({
+          kind: "variable",
+          start: startId,
+          end: endId,
+          op: Number(command.parameters[2] ?? 0),
+          operand
+        });
+        i += 1;
+        break;
+      }
+      case 125: {
+        // Change Gold: [operation(0 add/1 subtract), operandType(0 const/1 var), value].
+        nodes.push({
+          kind: "gold",
+          add: command.parameters[0] === 0,
+          operand:
+            command.parameters[1] === 1
+              ? { type: "variable", id: Number(command.parameters[2] ?? 0) }
+              : { type: "const", value: Number(command.parameters[2] ?? 0) }
+        });
         i += 1;
         break;
       }
@@ -1469,6 +1635,9 @@ function parseCondition(parameters: unknown[]): ConditionTest {
         ch: typeof parameters[1] === "string" ? parameters[1] : "A",
         on: parameters[2] === 0
       };
+    case 7:
+      // Gold check (vending machines): [7, amount, operator(0 >=, 1 <=)].
+      return { kind: "gold", amount: Number(parameters[1] ?? 0), gte: parameters[2] === 0 };
     case 12: {
       // Script condition — trainer battles live here in Essentials events:
       // `pbTrainerBattle(PBTrainers::TYPE, "Name", ...)` is the test itself.
