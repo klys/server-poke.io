@@ -2072,6 +2072,78 @@ export default class BattleManager {
     return { ok: true, battleId: battle.id, playerSideId: playerSide.id };
   }
 
+  /**
+   * Starts a wild battle from an RPG Maker event script:
+   * `pbWildBattle(PBSpecies::MUK, 25, ...)` — the hidden/static overworld
+   * encounters (a venomon you talk to). The player can catch it like any
+   * wild battle; the event runtime decides from the outcome whether the
+   * overworld venomon is consumed.
+   */
+  public async startScriptedWildBattle(
+    userId: number,
+    speciesEssentialsId: string,
+    level: number
+  ): Promise<
+    | { ok: true; battleId: string; playerSideId: string }
+    | { ok: false; message: string }
+  > {
+    const player = this.world.getPlayerByUserId(userId);
+    if (!player) {
+      return { ok: false, message: "Enter the world before battling." };
+    }
+    if (this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "You are already in a battle." };
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    const catalogs = await this.loadCatalogs();
+    if (!user) {
+      return { ok: false, message: "Account not found." };
+    }
+
+    // Imported species use `pokemon-<INTERNALNAME>` ids (same convention as
+    // Auth.givePokemonBySpecies).
+    const pokemonDefinition = catalogs.pokemonById.get(
+      `pokemon-${String(speciesEssentialsId).toUpperCase()}`
+    );
+    if (!pokemonDefinition) {
+      return { ok: false, message: "That Pokemon is not available." };
+    }
+
+    const playerSide = this.buildPlayerSide("a", player, user, catalogs);
+    if (!this.hasAvailablePokemon(playerSide)) {
+      return { ok: false, message: "Your team has no Pokemon able to battle." };
+    }
+
+    const wildPokemon = this.buildWildPokemon(
+      pokemonDefinition,
+      clamp(Math.round(level) || 1, 1, 100),
+      catalogs.skillsById
+    );
+    const wildSide: BattleSide = {
+      id: "b",
+      isAi: true,
+      trainerName: "Wild Pokemon",
+      money: 0,
+      inventory: [],
+      party: [wildPokemon],
+      activeIndex: 0,
+      action: null,
+      escapeAttempts: 0
+    };
+
+    const battle = this.createBattle(
+      "wild",
+      playerSide,
+      wildSide,
+      [`A wild ${getPokemonDisplayName(wildPokemon)} appeared.`],
+      this.resolveBattleBackForPlayer(player, true)
+    );
+
+    this.activateBattle(battle);
+    return { ok: true, battleId: battle.id, playerSideId: playerSide.id };
+  }
+
   /** One-shot notification when a battle finishes (used by the event runtime). */
   public onBattleEnd(battleId: string, listener: (winnerSideId: string | null) => void) {
     const listeners = this.battleEndListeners.get(battleId) ?? [];

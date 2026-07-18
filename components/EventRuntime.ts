@@ -95,6 +95,10 @@ const RE_POKEDEX = /\$Trainer\.pokedex\s*=\s*true/i;
 const RE_HEAL = /pbHealAll|pbHealParty|Recover All/i;
 const RE_CHANGE_PLAYER = /pbChangePlayer\(\s*(\d)\s*\)/i;
 const RE_TRAINER_BATTLE = /pbTrainerBattle\(\s*PBTrainers::(\w+)\s*,\s*"([^"]+)"/i;
+// pbWildBattle(:CYNDAQUIL,30) / pbWildBattle(PBSpecies::MUK,25,1,false,true) —
+// hidden/static overworld venomons the player battles (and can catch) by
+// talking to them.
+const RE_WILD_BATTLE = /pbWildBattle\(\s*(?:PBSpecies::|:)(\w+)\s*,\s*(\d+)/i;
 const RE_TRAINER_NAME = /pbTrainerName/i;
 const RE_TONE_CHANGE = /pbToneChangeAll\(\s*Tone\.new\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)[^)]*\)\s*,\s*(\d+)/i;
 const RE_SET_POKECENTER = /pbSetPokemonCenter/i;
@@ -686,13 +690,16 @@ export default class EventRuntime {
         case "selfSwitch":
           session.pendingWrites.selfSwitches[`${session.selfSwitchPrefix}${node.ch}`] = node.on;
           break;
-        case "script":
+        case "script": {
           // Scripts can persist things on their own (pokemon grants, skin,
           // name, battles); checkpoint the buffered state first so those
           // side effects never outlive a later rollback.
           await this.flushEventWrites(session);
-          await this.applyScript(session, node.text);
+          if ((await this.applyScript(session, node.text)) === "exit") {
+            return "exit";
+          }
           break;
+        }
         case "label":
           break;
         case "jump":
@@ -931,6 +938,12 @@ export default class EventRuntime {
           // (win -> self switch A = trainer defeated, like Essentials).
           return this.runScriptedTrainerBattle(session, trainerBattle[1], trainerBattle[2]);
         }
+        const wildBattle = test.text.match(RE_WILD_BATTLE);
+        if (wildBattle) {
+          // Same idea for static wild encounters: catching/defeating the
+          // venomon selects the branch that consumes the overworld event.
+          return this.runScriptedWildBattle(session, wildBattle[1], Number(wildBattle[2]));
+        }
         // Item balls are usually authored as script conditions whose branch
         // body sets Self Switch A. Granting here (and failing the test when
         // nothing could be granted) means the ball is only consumed when the
@@ -986,7 +999,54 @@ export default class EventRuntime {
     });
   }
 
-  private async applyScript(session: Session, text: string) {
+  /**
+   * Runs a real wild battle for a pbWildBattle script. Returns true when the
+   * player resolved the encounter (caught or defeated the wild venomon);
+   * false when they fled, lost, or the battle could not start.
+   */
+  private async runScriptedWildBattle(
+    session: Session,
+    speciesEssentialsId: string,
+    level: number
+  ): Promise<boolean> {
+    if (!this.battleManager) {
+      return true;
+    }
+
+    // Battle results persist immediately (party HP, exp, the caught venomon);
+    // checkpoint the buffered event state so a later abort can't roll back
+    // behind them.
+    await this.flushEventWrites(session);
+
+    // Close the dialog: the battle scene takes over; the event resumes after.
+    this.emitStep(session, { type: "end" });
+
+    const start = await this.battleManager.startScriptedWildBattle(
+      session.userId,
+      speciesEssentialsId,
+      level
+    );
+
+    if (!start.ok) {
+      this.emitStep(session, { type: "info", npcName: session.npcName, text: start.message });
+      await this.waitAdvance(session.userId);
+      return false; // no battle happened: the encounter stays available
+    }
+
+    return new Promise<boolean>((resolve) => {
+      // Safety valve so an abandoned battle can't hold the session forever.
+      const timer = setTimeout(() => resolve(false), 15 * 60 * 1000);
+      this.battleManager!.onBattleEnd(start.battleId, (winnerSideId) => {
+        clearTimeout(timer);
+        // Winning covers both catching and knocking out the wild venomon.
+        resolve(winnerSideId === start.playerSideId);
+      });
+    });
+  }
+
+  /** Returns "exit" when the rest of the event must not run (e.g. an
+   *  unresolved wild encounter whose later commands would consume it). */
+  private async applyScript(session: Session, text: string): Promise<"exit" | undefined> {
     const addPokemon = text.match(RE_ADD_POKEMON);
     if (addPokemon) {
       const result = await this.auth.givePokemonBySpecies(
@@ -1098,6 +1158,19 @@ export default class EventRuntime {
       // Some events call pbTrainerBattle as a plain script (no branch).
       await this.runScriptedTrainerBattle(session, trainerBattle[1], trainerBattle[2]);
       return;
+    }
+
+    const wildBattle = text.match(RE_WILD_BATTLE);
+    if (wildBattle) {
+      const resolvedEncounter = await this.runScriptedWildBattle(
+        session,
+        wildBattle[1],
+        Number(wildBattle[2])
+      );
+      // The commands after the script consume the overworld venomon (Self
+      // Switch A). Only let them run when the player actually caught or
+      // defeated it — fleeing or losing keeps the encounter available.
+      return resolvedEncounter ? undefined : "exit";
     }
 
     const changePlayer = text.match(RE_CHANGE_PLAYER);
