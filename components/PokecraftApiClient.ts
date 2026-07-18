@@ -34,12 +34,59 @@ export interface CreateApiKeyInput {
     expiresInDays?: number;
 }
 
+/**
+ * Species summary/detail payloads proxied for the client's CanaimaDex tab.
+ * Shapes mirror pokecraft-api's SpeciesResource records; fields the game
+ * doesn't render are passed through untyped.
+ */
+export interface SpeciesSummary {
+    id: number;
+    projectId: number;
+    pokemonId: string;
+    dexNumber: number;
+    name: string;
+    internalName: string | null;
+    [key: string]: unknown;
+}
+
+export interface SpeciesDetail extends SpeciesSummary {
+    category: string;
+    growthRate: string;
+    // Pokedex entry text; absent when prod runs a pokecraft-api build that
+    // predates the description field.
+    description?: string | null;
+    types: string[];
+    stats: Record<string, unknown> | null;
+    abilities: unknown[];
+    learnset: unknown[];
+    evolutions: unknown[];
+    sprites: Record<string, string | null>;
+    foundOn: Array<{
+        mapId: number;
+        mapName: string | null;
+        method: string;
+        levelMin: number;
+        levelMax: number;
+    }>;
+}
+
+interface PagedResult<T> {
+    items: T[];
+    page: number;
+    pageSize: number;
+    total: number;
+    totalPages: number;
+}
+
 export class PokecraftApiError extends Error {
     constructor(message: string, readonly status: number) {
         super(message);
         this.name = "PokecraftApiError";
     }
 }
+
+const SPECIES_CACHE_TTL_MS = 10 * 60 * 1000;
+const SPECIES_LIST_PAGE_SIZE = 30; // pokecraft-api caps `n` at 30
 
 export default class PokecraftApiClient {
     private readonly baseUrl: string;
@@ -73,6 +120,86 @@ export default class PokecraftApiClient {
 
     public async revokeApiKey(id: number): Promise<void> {
         await this.request<void>("DELETE", `/api/admin/api-keys/${id}`);
+    }
+
+    // internalName (upper-cased) -> pokemonId. Depending on the migrated dump,
+    // species pokemonId is either the legacy InternalName itself (v21 PBS) or
+    // the numeric dex string with InternalName tucked in raw_properties (the
+    // Venova BW dump), so lookups by the client's essentialsId need this index.
+    private speciesIndex: { builtAt: number; byInternalName: Map<string, string> } | null = null;
+    private speciesDetailCache = new Map<string, { fetchedAt: number; detail: SpeciesDetail }>();
+
+    /**
+     * Species detail for the client CanaimaDex tab, looked up by the designer
+     * catalog's essentialsId (the legacy Essentials InternalName). Returns
+     * null when the species is unknown; throws PokecraftApiError on transport
+     * or auth problems.
+     */
+    public async getSpeciesDetailByEssentialsId(essentialsId: string): Promise<SpeciesDetail | null> {
+        const key = essentialsId.trim().toUpperCase();
+        if (!key) {
+            return null;
+        }
+
+        const cached = this.speciesDetailCache.get(key);
+        if (cached && Date.now() - cached.fetchedAt < SPECIES_CACHE_TTL_MS) {
+            return cached.detail;
+        }
+
+        // Fast path: pokemonId IS the InternalName in v21-style dumps.
+        let detail = await this.fetchSpeciesDetail(key);
+
+        if (!detail) {
+            const index = await this.getSpeciesIndex();
+            const pokemonId = index.get(key);
+            detail = pokemonId ? await this.fetchSpeciesDetail(pokemonId) : null;
+        }
+
+        if (detail) {
+            this.speciesDetailCache.set(key, { fetchedAt: Date.now(), detail });
+        }
+        return detail;
+    }
+
+    private async fetchSpeciesDetail(pokemonId: string): Promise<SpeciesDetail | null> {
+        try {
+            return await this.request<SpeciesDetail>(
+                "GET",
+                `/api/species/${encodeURIComponent(pokemonId)}`
+            );
+        } catch (error) {
+            if (error instanceof PokecraftApiError && error.status === 404) {
+                return null;
+            }
+            throw error;
+        }
+    }
+
+    private async getSpeciesIndex(): Promise<Map<string, string>> {
+        if (this.speciesIndex && Date.now() - this.speciesIndex.builtAt < SPECIES_CACHE_TTL_MS) {
+            return this.speciesIndex.byInternalName;
+        }
+
+        const byInternalName = new Map<string, string>();
+        let page = 1;
+        let totalPages = 1;
+
+        do {
+            const result = await this.request<PagedResult<SpeciesSummary>>(
+                "GET",
+                `/api/species?page=${page}&n=${SPECIES_LIST_PAGE_SIZE}`
+            );
+            for (const summary of result.items) {
+                if (summary.internalName) {
+                    byInternalName.set(summary.internalName.toUpperCase(), summary.pokemonId);
+                }
+            }
+            totalPages = Math.max(1, result.totalPages ?? 1);
+            page += 1;
+        } while (page <= totalPages);
+
+        this.speciesIndex = { builtAt: Date.now(), byInternalName };
+        return byInternalName;
     }
 
     private async request<T>(method: string, path: string, body?: unknown): Promise<T> {

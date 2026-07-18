@@ -140,6 +140,44 @@ async function bootstrap() {
     }
   };
 
+  // CanaimaDex species data for the client's venomon stats window. Proxied
+  // here (not fetched by the browser) because pokecraft-api requires an API
+  // key on every /api/* request and that key must stay server-side.
+  const serveDexSpecies = async (
+    essentialsId:string,
+    request:import("http").IncomingMessage,
+    response:import("http").ServerResponse
+  ) => {
+    const headers:Record<string, string> = buildCorsHeaders(request.headers.origin);
+
+    if (!pokecraftApi.isConfigured()) {
+      response.writeHead(503, headers);
+      response.end();
+      return;
+    }
+
+    try {
+      const detail = await pokecraftApi.getSpeciesDetailByEssentialsId(essentialsId);
+
+      if (!detail) {
+        response.writeHead(404, headers);
+        response.end();
+        return;
+      }
+
+      headers["Content-Type"] = "application/json";
+      // Species data only changes on designer/PBS reloads; let clients keep
+      // it for a while so reopening stats windows doesn't refetch.
+      headers["Cache-Control"] = "public, max-age=600";
+      response.writeHead(200, headers);
+      response.end(JSON.stringify(detail));
+    } catch (error) {
+      console.error(`Unable to serve dex species ${essentialsId}:`, error);
+      response.writeHead(502, headers);
+      response.end();
+    }
+  };
+
   // Static assets (including /map-assets/...) are served by the standalone
   // asset-storage nginx server; this process only handles Socket.IO traffic
   // plus the endpoints below.
@@ -164,6 +202,12 @@ async function bootstrap() {
     const sectionMatch = request.url?.match(/^\/designer-sections\/([a-zA-Z]+)\.json$/);
     if (sectionMatch && PUBLIC_SECTION_KEYS.has(sectionMatch[1])) {
       void serveDesignerSection(sectionMatch[1], request, response);
+      return;
+    }
+
+    const dexMatch = request.url?.match(/^\/dex\/species\/([A-Za-z0-9_-]{1,64})\.json$/);
+    if (dexMatch) {
+      void serveDexSpecies(dexMatch[1], request, response);
       return;
     }
 

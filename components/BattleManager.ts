@@ -948,6 +948,130 @@ export default class BattleManager {
     };
   }
 
+  /**
+   * Stats-window move management: teaches a move the venomon is entitled to
+   * at its current level — anything in its learnset up to `level`, plus any
+   * pending learn left behind when a battle closed before the player
+   * answered the prompt. Outside battles only.
+   */
+  public async learnAvailableMove(
+    userId: number,
+    pokemonId: string,
+    moveName: string,
+    replaceMoveName?: string
+  ) {
+    const player = this.world.getPlayerByUserId(userId);
+    if (player && this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "You can't manage moves during a battle." };
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    const catalogs = await this.loadCatalogs();
+    const targetPokemon = user?.pokemonParty.find((pokemon) => pokemon.id === pokemonId);
+
+    if (!user || !targetPokemon) {
+      return { ok: false, message: "That Pokemon is not in your party." };
+    }
+
+    const skillDefinition = catalogs.skillsByName.get(String(moveName ?? "").toLowerCase());
+    if (!skillDefinition) {
+      return { ok: false, message: `${moveName} is not a valid move.` };
+    }
+
+    const canonicalName = skillDefinition.name;
+    const sameMove = (name: string) => name.toLowerCase() === canonicalName.toLowerCase();
+
+    if (targetPokemon.moves.some(sameMove)) {
+      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} already knows ${canonicalName}.` };
+    }
+
+    const pending = targetPokemon.pendingMoveLearns ?? [];
+    const definition =
+      (targetPokemon.sourcePokemonId
+        ? catalogs.pokemonById.get(targetPokemon.sourcePokemonId)
+        : undefined) ??
+      this.resolvePokemonDefinition(targetPokemon.name, catalogs);
+    const inLearnset = (definition?.skills ?? []).some(
+      (entry) => entry.level <= targetPokemon.level && sameMove(entry.skillName)
+    );
+
+    if (!inLearnset && !pending.some(sameMove)) {
+      return {
+        ok: false,
+        message: `${getPokemonDisplayName(targetPokemon)} can't learn ${canonicalName} at level ${targetPokemon.level}.`
+      };
+    }
+
+    const movePp = { ...(targetPokemon.movePp ?? {}) };
+    if (targetPokemon.moves.length >= 4) {
+      if (!replaceMoveName) {
+        return {
+          ok: false,
+          message: `${getPokemonDisplayName(targetPokemon)} already knows four moves. Choose one to replace.`
+        };
+      }
+      const replaceIndex = targetPokemon.moves.indexOf(replaceMoveName);
+      if (replaceIndex < 0) {
+        return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} does not know ${replaceMoveName}.` };
+      }
+      targetPokemon.moves = targetPokemon.moves.map((name, index) =>
+        index === replaceIndex ? canonicalName : name
+      );
+      delete movePp[replaceMoveName];
+    } else {
+      targetPokemon.moves = [...targetPokemon.moves, canonicalName];
+    }
+    movePp[canonicalName] = skillDefinition.powerPoint;
+    targetPokemon.movePp = movePp;
+    targetPokemon.pendingMoveLearns = pending.filter((name) => !sameMove(name));
+
+    const nextUser = await this.auth.saveBattleState(userId, { pokemonParty: user.pokemonParty });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: replaceMoveName
+        ? `${getPokemonDisplayName(targetPokemon)} forgot ${replaceMoveName} and learned ${canonicalName}!`
+        : `${getPokemonDisplayName(targetPokemon)} learned ${canonicalName}!`
+    };
+  }
+
+  /** Stats-window move management: forgets a known move (never the last one). */
+  public async forgetMove(userId: number, pokemonId: string, moveName: string) {
+    const player = this.world.getPlayerByUserId(userId);
+    if (player && this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "You can't manage moves during a battle." };
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    const targetPokemon = user?.pokemonParty.find((pokemon) => pokemon.id === pokemonId);
+
+    if (!user || !targetPokemon) {
+      return { ok: false, message: "That Pokemon is not in your party." };
+    }
+
+    if (!targetPokemon.moves.includes(moveName)) {
+      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} does not know ${moveName}.` };
+    }
+
+    if (targetPokemon.moves.length <= 1) {
+      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} must keep at least one move.` };
+    }
+
+    targetPokemon.moves = targetPokemon.moves.filter((name) => name !== moveName);
+    const movePp = { ...(targetPokemon.movePp ?? {}) };
+    delete movePp[moveName];
+    targetPokemon.movePp = movePp;
+
+    const nextUser = await this.auth.saveBattleState(userId, { pokemonParty: user.pokemonParty });
+
+    return {
+      ok: true,
+      user: nextUser,
+      message: `${getPokemonDisplayName(targetPokemon)} forgot ${moveName}.`
+    };
+  }
+
   private updateActiveBattleMoves(
     userId: number,
     summary: PokemonSummary,

@@ -110,6 +110,14 @@ export default interface ClientToServerEvents {
   "pokemon:reorder": (data: { order: string[] }) => void;
 
   /**
+   * Stats-window move management (outside battles): learn a move available at
+   * the venomon's current level (learnset or a missed battle prompt),
+   * optionally replacing a known move, or forget a known move.
+   */
+  "pokemon:learn-move": (data: { pokemonId: string; moveName: string; replaceMoveName?: string }) => void;
+  "pokemon:forget-move": (data: { pokemonId: string; moveName: string }) => void;
+
+  /**
    * Moves a party Pokemon into PC box storage. Omit `boxId` to use the first
    * box with free space (a new box is created when every box is full). The
    * last party Pokemon cannot be deposited. Not allowed during a battle.

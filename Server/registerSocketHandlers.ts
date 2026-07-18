@@ -1728,6 +1728,49 @@ function createConnectionHandler(
       socket.emit("auth:info", { message: result.message });
     });
 
+    socket.on("pokemon:learn-move", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to manage moves." });
+        return;
+      }
+
+      const result = await battleManager.learnAvailableMove(
+        socket.data.userId,
+        data.pokemonId,
+        data.moveName,
+        data.replaceMoveName
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("pokemon:forget-move", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to manage moves." });
+        return;
+      }
+
+      const result = await battleManager.forgetMove(
+        socket.data.userId,
+        data.pokemonId,
+        data.moveName
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      socket.emit("auth:info", { message: result.message });
+    });
+
     socket.on("pokemon:reorder", async (data) => {
       if (typeof socket.data.userId !== "number") {
         socket.emit("auth:error", { message: "Log in to reorder your party." });
