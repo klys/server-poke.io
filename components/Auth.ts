@@ -288,6 +288,10 @@ interface ChangePasswordPayload {
     newPassword:string;
 }
 
+interface ConfirmAccountDeletionPayload {
+    code:string;
+}
+
 interface UpdateProfilePayload {
     profileImage?:string;
     description?:string;
@@ -402,6 +406,7 @@ export default class Auth {
     private readonly passwordPepper:string;
     private readonly emailValidationTtlSeconds:number;
     private readonly passwordResetTtlSeconds:number;
+    private readonly accountDeletionTtlSeconds:number;
     private roleDefinitionsCache:{ roles:RoleDefinition[]; expiresAt:number } | null = null;
 
     constructor(redis:RedisClientType, mailService:MailService) {
@@ -412,6 +417,7 @@ export default class Auth {
         this.passwordPepper = process.env.AUTH_PEPPER || "";
         this.emailValidationTtlSeconds = Number(process.env.AUTH_EMAIL_VALIDATION_TTL_SECONDS || 60 * 60 * 24);
         this.passwordResetTtlSeconds = Number(process.env.AUTH_PASSWORD_RESET_TTL_SECONDS || 60 * 60);
+        this.accountDeletionTtlSeconds = Number(process.env.AUTH_ACCOUNT_DELETION_TTL_SECONDS || 60 * 15);
     }
 
     public async initialize() {
@@ -777,6 +783,65 @@ export default class Auth {
         });
 
         return { message: "Password updated successfully." };
+    }
+
+    /**
+     * Starts the self-service account deletion flow: generates a short numeric
+     * confirmation code, stores it (keyed by user id, so a new request replaces
+     * any pending one) with a short TTL, and emails it to the account address.
+     * The code — not a link — is what the user types back to confirm.
+     */
+    public async requestAccountDeletion(token:string | undefined):Promise<AuthInfoResult | AuthErrorResult> {
+        const authenticatedUser = await this.getAuthenticatedUserFromToken(token);
+        if (!authenticatedUser) {
+            return { error: "You must be authenticated to delete your account." };
+        }
+
+        const code = this.generateNumericCode(6);
+        await this.redis.set(this.accountDeletionCodeKey(authenticatedUser.id), code, {
+            EX: this.accountDeletionTtlSeconds
+        });
+
+        await this.mailService.sendAccountDeletionCodeEmail(authenticatedUser, code);
+
+        return {
+            message: "A confirmation code has been sent to your email address."
+        };
+    }
+
+    /**
+     * Confirms self-service deletion: verifies the emailed code, then wipes the
+     * account and every trace of its data via {@link deleteUser}. The code is
+     * single-use — it is cleared whether or not it matched a valid attempt only
+     * on success (a mismatch keeps it so the user can retry until it expires).
+     */
+    public async confirmAccountDeletion(
+        token:string | undefined,
+        payload:ConfirmAccountDeletionPayload
+    ):Promise<{ username:string } | AuthErrorResult> {
+        const authenticatedUser = await this.getAuthenticatedUserFromToken(token);
+        if (!authenticatedUser) {
+            return { error: "You must be authenticated to delete your account." };
+        }
+
+        const submittedCode = typeof payload.code === "string" ? payload.code.trim() : "";
+        if (!submittedCode) {
+            return { error: "Enter the confirmation code sent to your email." };
+        }
+
+        const codeKey = this.accountDeletionCodeKey(authenticatedUser.id);
+        const storedCode = await this.redis.get(codeKey);
+        if (!storedCode) {
+            return { error: "The confirmation code is invalid or has expired. Request a new one." };
+        }
+
+        if (!this.constantTimeEquals(storedCode, submittedCode)) {
+            return { error: "The confirmation code is incorrect." };
+        }
+
+        await this.redis.del(codeKey);
+
+        return this.deleteUser(authenticatedUser.id);
     }
 
     public async updateProfile(token:string | undefined, payload:UpdateProfilePayload):Promise<AuthSuccessResult | AuthErrorResult> {
@@ -2795,6 +2860,25 @@ export default class Auth {
         return userId;
     }
 
+    /** Cryptographically random fixed-length numeric string (leading zeros kept). */
+    private generateNumericCode(length:number) {
+        let code = "";
+        while (code.length < length) {
+            code += crypto.randomInt(0, 10).toString();
+        }
+        return code;
+    }
+
+    /** Length-safe, timing-safe string comparison for confirmation codes. */
+    private constantTimeEquals(expected:string, actual:string) {
+        const expectedBuffer = Buffer.from(expected);
+        const actualBuffer = Buffer.from(actual);
+        if (expectedBuffer.length !== actualBuffer.length) {
+            return false;
+        }
+        return crypto.timingSafeEqual(expectedBuffer, actualBuffer);
+    }
+
     private sessionKey(sessionId:string) {
         return `auth:session:${sessionId}`;
     }
@@ -2833,6 +2917,10 @@ export default class Auth {
 
     private passwordResetTokenKey(token:string) {
         return `${this.passwordResetTokenPrefix()}${token}`;
+    }
+
+    private accountDeletionCodeKey(userId:number | string) {
+        return `auth:token:account-deletion:${userId}`;
     }
 
     private async createPasswordResetToken(userId:number) {

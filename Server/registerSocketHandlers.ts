@@ -616,6 +616,85 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("auth:request-account-deletion", async () => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        const result = await auth.requestAccountDeletion(readSocketToken(socket));
+        if ("error" in result) {
+          socket.emit("auth:error", { message: result.error });
+          return;
+        }
+
+        socket.emit("auth:info", { message: result.message });
+      } catch (error) {
+        console.error("Auth request account deletion event failed:", error);
+        socket.emit("auth:error", {
+          message: "Unable to start account deletion right now."
+        });
+      }
+    });
+
+    socket.on("auth:confirm-account-deletion", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        const userId = socket.data.userId;
+        if (typeof userId === "number") {
+          const player = world.getPlayerByUserId(userId);
+          if (player && battleManager.isPlayerBattling(player.socketId)) {
+            socket.emit("auth:error", {
+              message: "You are in a battle right now. Finish it before deleting your account."
+            });
+            return;
+          }
+        }
+
+        const result = await auth.confirmAccountDeletion(readSocketToken(socket), {
+          code: typeof data?.code === "string" ? data.code : ""
+        });
+        if ("error" in result) {
+          socket.emit("auth:error", { message: result.error });
+          return;
+        }
+
+        // Force every live session of this account off. Clearing auth on each
+        // socket first stops the disconnect handler from re-persisting a saved
+        // location into the hash we just deleted.
+        if (typeof userId === "number") {
+          const targetSockets = Array.from(io.sockets.sockets.values()).filter(
+            (candidate) => candidate.data.userId === userId
+          );
+          for (const targetSocket of targetSockets) {
+            world.removePlayer(targetSocket.id);
+            applySocketAuth(targetSocket.data, null);
+            targetSocket.emit("auth:account-deleted", {
+              message: "Your account and all of its data have been permanently deleted."
+            });
+            targetSocket.disconnect(true);
+          }
+
+          broadcastAdminPresence(io, world);
+        } else {
+          world.removePlayer(socket.id);
+          applySocketAuth(socket.data, null);
+          socket.emit("auth:account-deleted", {
+            message: "Your account and all of its data have been permanently deleted."
+          });
+          socket.disconnect(true);
+        }
+      } catch (error) {
+        console.error("Auth confirm account deletion event failed:", error);
+        socket.emit("auth:error", {
+          message: "Unable to delete your account right now."
+        });
+      }
+    });
+
     socket.on("auth:update-profile", async (data) => {
       try {
         if (!socket.data.authenticated && readSocketToken(socket)) {

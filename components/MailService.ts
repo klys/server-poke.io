@@ -113,6 +113,20 @@ export default class MailService {
         });
     }
 
+    public async sendAccountDeletionCodeEmail(user:AuthenticatedUser, code:string) {
+        const template = await this.renderTemplate("account-deletion-code.html", {
+            NAME: user.name,
+            CODE: code
+        });
+
+        await this.sendMail({
+            to: user.email,
+            subject: "Confirm your Poke.io account deletion",
+            text: this.convertHtmlToText(template),
+            html: template
+        });
+    }
+
     private async sendMail(options:{ to:string; subject:string; text:string; html:string }) {
         if (!this.transporter) {
             console.warn(`Skipping email to ${options.to} because SMTP is not configured.`);

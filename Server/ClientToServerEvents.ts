@@ -54,6 +54,10 @@ interface AuthChangePasswordPayload {
   newPassword: string;
 }
 
+interface AuthConfirmAccountDeletionPayload {
+  code: string;
+}
+
 interface AuthUpdateProfilePayload {
   profileImage?: string;
   description?: string;
@@ -199,6 +203,19 @@ export default interface ClientToServerEvents {
    * Updates the authenticated user's password from the Account window.
    */
   "auth:change-password": (data: AuthChangePasswordPayload) => void;
+
+  /**
+   * Starts self-service account deletion by emailing a confirmation code to the
+   * authenticated user. No payload; the socket must have a valid auth token.
+   */
+  "auth:request-account-deletion": () => void;
+
+  /**
+   * Confirms self-service account deletion with the emailed code. On success the
+   * account and all of its data are permanently removed and the socket is
+   * signed out.
+   */
+  "auth:confirm-account-deletion": (data: AuthConfirmAccountDeletionPayload) => void;
 
   /**
    * Updates lightweight trainer profile data used by account windows and trainer card.

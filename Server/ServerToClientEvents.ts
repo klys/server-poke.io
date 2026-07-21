@@ -255,6 +255,13 @@ export default interface ServerToClientEvents {
   "auth:error": (data: { message: string }) => void;
 
   /**
+   * Emitted right before the socket is signed out because the authenticated user
+   * deleted their own account. The frontend should clear any persisted auth
+   * token and return to the logged-out state.
+   */
+  "auth:account-deleted": (data: { message: string }) => void;
+
+  /**
    * Full authoritative designer section snapshot loaded from Redis.
    * The same event is used for the initial hydration and for live rebroadcasts after edits.
    */
