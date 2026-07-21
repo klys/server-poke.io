@@ -1914,18 +1914,23 @@ function createConnectionHandler(
         return;
       }
 
-      const result = await battleManager.useInventoryItem(
-        socket.data.userId,
-        data.itemId,
-        data.targetPokemonId
-      );
+      const result = await battleManager.useInventoryItem(socket.data.userId, data.itemId, {
+        targetPokemonId: data.targetPokemonId,
+        targetMoveName: data.targetMoveName,
+        player: world.getPlayerBySocket(socket.id) ?? undefined
+      });
 
       if (!result.ok) {
         socket.emit("auth:error", { message: result.message });
         return;
       }
 
-      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
+      if (result.user) {
+        socket.emit("auth:session", { authenticated: true, user: result.user });
+      }
+      if (result.clientAction) {
+        socket.emit("inventory:action", result.clientAction);
+      }
       socket.emit("auth:info", { message: result.message });
     });
 

@@ -174,6 +174,8 @@ export interface PokemonSummary {
     maxHp:number;
     moves:string[];
     movePp?:Record<string, number>;
+    /** PP-Up stages per move (0-3, +20% max PP each); set by PP Up / PP Max. */
+    movePpUps?:Record<string, number>;
     experience:number;
     experienceCurve:"fast" | "medium" | "slow";
     nextLevelExperience:number;

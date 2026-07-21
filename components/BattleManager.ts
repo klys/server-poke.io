@@ -24,6 +24,18 @@ import type {
   BattleStatusId
 } from "./battle/events";
 import { resolveFunctionCode } from "./battle/functionCodeMap";
+import {
+  classifyFieldItem,
+  fieldItemTargetKind,
+  maxPpForMove,
+  MAX_STANDARD_EV_PER_STAT,
+  MAX_TOTAL_EV,
+  STATUS_CURE_ITEMS,
+  VITAMIN_EV_CAP,
+  type FieldItemEffect,
+  type FieldItemKeyAction,
+  type FieldItemTargetKind
+} from "./battle/fieldItemEffects";
 import { resolveHeldItemEffect, type HeldItemEffect } from "./battle/heldItems";
 import {
   parseMoveEffect,
@@ -641,34 +653,6 @@ function parseNumber(value: unknown, fallback: number) {
     : fallback;
 }
 
-const STATUS_CURE_ITEMS: Record<string, { statuses: BattleStatusId[] | "any"; confusion: boolean }> = {
-  ANTIDOTE: { statuses: ["poison", "toxic"], confusion: false },
-  PARLYZHEAL: { statuses: ["paralysis"], confusion: false },
-  PARALYZEHEAL: { statuses: ["paralysis"], confusion: false },
-  AWAKENING: { statuses: ["sleep"], confusion: false },
-  BURNHEAL: { statuses: ["burn"], confusion: false },
-  ICEHEAL: { statuses: ["freeze"], confusion: false },
-  FULLHEAL: { statuses: "any", confusion: true },
-  FULLRESTORE: { statuses: "any", confusion: true },
-  LAVACOOKIE: { statuses: "any", confusion: true },
-  OLDGATEAU: { statuses: "any", confusion: true },
-  HEALPOWDER: { statuses: "any", confusion: true },
-  LUMBERRY: { statuses: "any", confusion: true },
-  CHERIBERRY: { statuses: ["paralysis"], confusion: false },
-  CHESTOBERRY: { statuses: ["sleep"], confusion: false },
-  PECHABERRY: { statuses: ["poison", "toxic"], confusion: false },
-  RAWSTBERRY: { statuses: ["burn"], confusion: false },
-  ASPEARBERRY: { statuses: ["freeze"], confusion: false },
-  PERSIMBERRY: { statuses: [], confusion: true },
-  MIRACLEBERRY: { statuses: "any", confusion: true },
-  BITTERBERRY: { statuses: [], confusion: true },
-  PRZCUREBERRY: { statuses: ["paralysis"], confusion: false },
-  MINTBERRY: { statuses: ["sleep"], confusion: false },
-  PSNCUREBERRY: { statuses: ["poison", "toxic"], confusion: false },
-  ICEBERRY: { statuses: ["burn"], confusion: false },
-  BURNTBERRY: { statuses: ["freeze"], confusion: false }
-};
-
 function normalizeStatKey(raw: string): BattleStatKey | null {
   const normalized = raw.trim().toLowerCase().replace(/[\s_-]/g, "");
   switch (normalized) {
@@ -697,6 +681,26 @@ function normalizeStatKey(raw: string): BattleStatKey | null {
   }
 }
 
+export interface UseInventoryItemOptions {
+  targetPokemonId?: string;
+  /** For PP-restore-one / PP-up items: which move to affect. */
+  targetMoveName?: string;
+  /** The live world player, required for field items (Repel/Escape Rope). */
+  player?: Player;
+}
+
+/** Client-side follow-up a bag item triggers (open a window, toggle a mode). */
+export interface UseInventoryItemClientAction {
+  type: FieldItemKeyAction;
+}
+
+export interface UseInventoryItemResult {
+  ok: boolean;
+  user?: AuthenticatedUser | null;
+  message: string;
+  clientAction?: UseInventoryItemClientAction;
+}
+
 export default class BattleManager {
   private readonly io: TypedSocketServer;
   private readonly world: World;
@@ -706,6 +710,8 @@ export default class BattleManager {
   private readonly playerBattleIds = new Map<string, string>();
   private readonly lastGrassCellByPlayerId = new Map<string, string>();
   private readonly pendingStepChecks = new Set<string>();
+  /** Remaining Repel steps per player (in-grass encounters skipped while >0). */
+  private readonly repelStepsByPlayerId = new Map<string, number>();
   private readonly challenges = new Map<string, ChallengeRequest>();
   private readonly tradeRequests = new Map<string, TradeRequest>();
   private typeChart: TypeChart = buildTypeChart([]);
@@ -795,13 +801,26 @@ export default class BattleManager {
     );
   }
 
+  /**
+   * Uses a field-usable item from the bag (out of battle). Dispatches across
+   * every effect the item catalog can express — HP/PP restore, status cures,
+   * revives, vitamins (EVs), Rare Candy, evolution stones, and field items
+   * like Repel / Escape Rope / Town Map. In-battle item use goes through
+   * {@link applyItemAction}; this path is blocked while battling.
+   */
   public async useInventoryItem(
     userId: number,
     itemId: string,
-    targetPokemonId?: string
-  ) {
+    options: UseInventoryItemOptions = {}
+  ): Promise<UseInventoryItemResult> {
+    const { targetPokemonId, targetMoveName, player } = options;
+
+    if (player && this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "You can't use bag items during a battle." };
+    }
+
     const user = await this.auth.getUserForBattle(userId);
-    await this.loadCatalogs();
+    const catalogs = await this.loadCatalogs();
     const item = user?.inventory.find((candidate) => candidate.id === itemId);
     const itemDefinition = this.getCachedItemDefinition(itemId, item?.name ?? "");
 
@@ -809,39 +828,582 @@ export default class BattleManager {
       return { ok: false, message: "That item is no longer available." };
     }
 
-    if (!["usable", "berries"].includes(item.category)) {
+    if (!["usable", "berries", "quest"].includes(item.category)) {
       return { ok: false, message: "That item cannot be used from the bag." };
     }
 
-    const targetPokemon = user.pokemonParty.find((pokemon) => pokemon.id === targetPokemonId);
-
-    if (!targetPokemon) {
-      return { ok: false, message: "Choose a Pokemon for this item." };
-    }
-
-    if (itemDefinition.statModifiers.hp > 0 && targetPokemon.hp >= targetPokemon.maxHp) {
-      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} already has full HP.` };
-    }
-
-    const beforeHp = targetPokemon.hp;
-    targetPokemon.hp = Math.min(
-      targetPokemon.maxHp,
-      Math.max(0, targetPokemon.hp + itemDefinition.statModifiers.hp)
-    );
-    const nextInventory = this.removeInventoryQuantity(user.inventory, item.id, 1);
-    const nextUser = await this.auth.saveBattleState(userId, {
-      pokemonParty: user.pokemonParty,
-      inventory: nextInventory
+    const effect = classifyFieldItem({
+      essentialsId: itemDefinition.essentialsId,
+      healHp: itemDefinition.statModifiers.hp,
+      category: item.category
     });
 
-    return {
-      ok: true,
-      user: nextUser,
-      message:
-        itemDefinition.statModifiers.hp > 0
-          ? `${getPokemonDisplayName(targetPokemon)} recovered ${targetPokemon.hp - beforeHp} HP.`
-          : `${item.name} was used on ${getPokemonDisplayName(targetPokemon)}.`
+    if (!effect) {
+      return { ok: false, message: `${item.name} can't be used right now.` };
+    }
+
+    // ----- Field / party-wide effects (no single Venomon target) -----------
+    if (effect.kind === "repel") {
+      if (!player) {
+        return { ok: false, message: "Enter the world before using Repel." };
+      }
+      this.repelStepsByPlayerId.set(player.socketId, effect.steps);
+      return {
+        ok: true,
+        user: await this.consumeItem(userId, user, item),
+        message: `${item.name} will keep weak Venomon away for ${effect.steps} steps.`
+      };
+    }
+
+    if (effect.kind === "escape-rope") {
+      if (!player) {
+        return { ok: false, message: "Enter the world before using an Escape Rope." };
+      }
+      const destination = this.resolveEscapeDestination(player);
+      if (!destination) {
+        return { ok: false, message: "You can't use that here." };
+      }
+      const nextUser = await this.consumeItem(userId, user, item);
+      this.teleportPlayerTo(player, destination);
+      return { ok: true, user: nextUser, message: `${user.name} used the Escape Rope.` };
+    }
+
+    if (effect.kind === "key-item") {
+      const nextUser = user; // key items are not consumed
+      return {
+        ok: true,
+        user: nextUser,
+        message: `${user.name} used the ${item.name}.`,
+        clientAction: { type: effect.action }
+      };
+    }
+
+    if (effect.kind === "revive-all") {
+      const revived = user.pokemonParty.filter((pokemon) => pokemon.hp <= 0);
+      if (revived.length === 0) {
+        return { ok: false, message: "None of your Venomon have fainted." };
+      }
+      revived.forEach((pokemon) => {
+        const definition = this.resolveSummaryDefinition(pokemon, catalogs);
+        this.reviveSummary(pokemon, definition, effect.hpFraction, catalogs);
+      });
+      return {
+        ok: true,
+        user: await this.consumeItem(userId, user, item, {
+          pokemonParty: user.pokemonParty
+        }),
+        message: `${item.name} revived your fainted Venomon.`
+      };
+    }
+
+    if (effect.kind === "wake-flute") {
+      const asleep = user.pokemonParty.filter((pokemon) => pokemon.status?.id === "sleep");
+      if (asleep.length === 0) {
+        return { ok: false, message: "None of your Venomon are asleep." };
+      }
+      asleep.forEach((pokemon) => {
+        pokemon.status = null;
+      });
+      return {
+        ok: true,
+        user: await this.consumeItem(userId, user, item, {
+          pokemonParty: user.pokemonParty
+        }),
+        message: `${item.name} woke your Venomon.`
+      };
+    }
+
+    // ----- Single-target effects (require a party Venomon) -----------------
+    const targetPokemon = user.pokemonParty.find((pokemon) => pokemon.id === targetPokemonId);
+    if (!targetPokemon) {
+      return { ok: false, message: "Choose a Venomon for this item." };
+    }
+
+    const definition = this.resolveSummaryDefinition(targetPokemon, catalogs);
+    const displayName = getPokemonDisplayName(targetPokemon);
+    const fainted = targetPokemon.hp <= 0;
+
+    switch (effect.kind) {
+      case "revive": {
+        if (!fainted) {
+          return { ok: false, message: `${displayName} isn't fainted.` };
+        }
+        this.reviveSummary(targetPokemon, definition, effect.hpFraction, catalogs);
+        return {
+          ok: true,
+          user: await this.consumeItem(userId, user, item, { pokemonParty: user.pokemonParty }),
+          message: `${displayName} was revived.`
+        };
+      }
+
+      case "heal-hp":
+      case "full-restore": {
+        if (fainted) {
+          return { ok: false, message: `${displayName} has fainted — use a Revive first.` };
+        }
+        const healed = targetPokemon.hp < targetPokemon.maxHp;
+        const cured = effect.kind === "full-restore" && Boolean(targetPokemon.status);
+        if (!healed && !cured) {
+          return { ok: false, message: `${displayName} already has full HP.` };
+        }
+        const beforeHp = targetPokemon.hp;
+        targetPokemon.hp = clamp(targetPokemon.hp + effect.amount, 0, targetPokemon.maxHp);
+        let message = `${displayName} recovered ${targetPokemon.hp - beforeHp} HP.`;
+        if (effect.kind === "full-restore" && targetPokemon.status) {
+          targetPokemon.status = null;
+          message = `${displayName} was fully restored.`;
+        }
+        return {
+          ok: true,
+          user: await this.consumeItem(userId, user, item, { pokemonParty: user.pokemonParty }),
+          message
+        };
+      }
+
+      case "cure-status": {
+        if (fainted) {
+          return { ok: false, message: `${displayName} has fainted — use a Revive first.` };
+        }
+        const status = targetPokemon.status;
+        const canCure =
+          status &&
+          (effect.statuses === "any" ||
+            effect.statuses.includes(status.id as BattleStatusId));
+        if (!canCure) {
+          return { ok: false, message: `${displayName} has no status ${item.name} can cure.` };
+        }
+        targetPokemon.status = null;
+        return {
+          ok: true,
+          user: await this.consumeItem(userId, user, item, { pokemonParty: user.pokemonParty }),
+          message: `${displayName} was cured.`
+        };
+      }
+
+      case "pp-restore": {
+        const result = this.applyPpRestore(targetPokemon, effect, targetMoveName, catalogs);
+        if (!result.ok) {
+          return { ok: false, message: result.message };
+        }
+        return {
+          ok: true,
+          user: await this.consumeItem(userId, user, item, { pokemonParty: user.pokemonParty }),
+          message: result.message
+        };
+      }
+
+      case "pp-up": {
+        const result = this.applyPpUp(targetPokemon, effect, targetMoveName, catalogs);
+        if (!result.ok) {
+          return { ok: false, message: result.message };
+        }
+        return {
+          ok: true,
+          user: await this.consumeItem(userId, user, item, { pokemonParty: user.pokemonParty }),
+          message: result.message
+        };
+      }
+
+      case "vitamin": {
+        const result = this.applyVitamin(targetPokemon, definition, effect);
+        if (!result.ok) {
+          return { ok: false, message: result.message };
+        }
+        return {
+          ok: true,
+          user: await this.consumeItem(userId, user, item, { pokemonParty: user.pokemonParty }),
+          message: result.message
+        };
+      }
+
+      case "level-up": {
+        if (targetPokemon.level >= 100) {
+          return { ok: false, message: `${displayName} is already at the level cap.` };
+        }
+        const result = this.applyRareCandy(targetPokemon, definition, catalogs);
+        return {
+          ok: true,
+          user: await this.consumeItem(userId, user, item, { pokemonParty: user.pokemonParty }),
+          message: result.message
+        };
+      }
+
+      case "evolution-stone": {
+        const target = this.findItemEvolutionTarget(
+          targetPokemon,
+          itemDefinition.essentialsId,
+          catalogs
+        );
+        if (!target) {
+          return { ok: false, message: `It had no effect on ${displayName}.` };
+        }
+        const fromName = displayName;
+        this.evolveSummary(targetPokemon, target, catalogs);
+        return {
+          ok: true,
+          user: await this.consumeItem(userId, user, item, { pokemonParty: user.pokemonParty }),
+          message: `${fromName} evolved into ${target.name}!`
+        };
+      }
+
+      default:
+        return { ok: false, message: `${item.name} can't be used right now.` };
+    }
+  }
+
+  /** Removes one of `item` from inventory and persists optional party changes. */
+  private async consumeItem(
+    userId: number,
+    user: AuthenticatedUser,
+    item: InventoryItem,
+    extra: { pokemonParty?: PokemonSummary[] } = {}
+  ) {
+    const nextInventory = this.removeInventoryQuantity(user.inventory, item.id, 1);
+    return this.auth.saveBattleState(userId, {
+      inventory: nextInventory,
+      ...(extra.pokemonParty ? { pokemonParty: extra.pokemonParty } : {})
+    });
+  }
+
+  private resolveSummaryDefinition(
+    summary: PokemonSummary,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): PokemonDefinition | null {
+    return (
+      (summary.sourcePokemonId ? catalogs.pokemonById.get(summary.sourcePokemonId) : undefined) ??
+      this.resolvePokemonDefinition(summary.name, catalogs)
+    );
+  }
+
+  /** Recomputes maxHp from the current level/EVs/IVs, preserving HP damage. */
+  private recomputeSummaryMaxHp(summary: PokemonSummary, definition: PokemonDefinition | null) {
+    const level = clamp(summary.level, 1, 100);
+    const statBonuses = sanitizePokemonStatBonuses(summary.statBonuses);
+    const ivs = sanitizeBattleStats(summary.ivs, 31);
+    const evs = sanitizeBattleStats(summary.evs, MAX_EV_PER_STAT);
+    const baseStats = definition?.baseStats ?? {
+      hp: summary.maxHp,
+      attack: Math.max(1, summary.maxHp),
+      defense: Math.max(1, summary.maxHp),
+      specialAttack: Math.max(1, summary.maxHp),
+      specialDefense: Math.max(1, summary.maxHp),
+      speed: Math.max(1, summary.maxHp)
     };
+    const stats = calculateStats(baseStats, level, statBonuses, ivs, evs);
+    const wasFainted = summary.hp <= 0;
+    const missingHp = Math.max(0, summary.maxHp - summary.hp);
+    summary.maxHp = stats.hp;
+    summary.hp = wasFainted ? 0 : clamp(stats.hp - missingHp, 1, stats.hp);
+    return stats;
+  }
+
+  private reviveSummary(
+    summary: PokemonSummary,
+    definition: PokemonDefinition | null,
+    hpFraction: number,
+    _catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ) {
+    this.recomputeSummaryMaxHp(summary, definition);
+    summary.status = null;
+    summary.hp = clamp(Math.round(summary.maxHp * hpFraction), 1, summary.maxHp);
+  }
+
+  private applyPpRestore(
+    summary: PokemonSummary,
+    effect: Extract<FieldItemEffect, { kind: "pp-restore" }>,
+    targetMoveName: string | undefined,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): { ok: true; message: string } | { ok: false; message: string } {
+    const moves = Array.isArray(summary.moves) ? summary.moves : [];
+    if (moves.length === 0) {
+      return { ok: false, message: `${getPokemonDisplayName(summary)} knows no moves.` };
+    }
+    const movePp = { ...(summary.movePp ?? {}) };
+    const ppUps = summary.movePpUps ?? {};
+    const restoreOne = (moveName: string) => {
+      const skill = catalogs.skillsByName.get(moveName.toLowerCase());
+      const baseMax = Math.max(1, skill?.powerPoint ?? movePp[moveName] ?? 1);
+      const max = maxPpForMove(baseMax, ppUps[moveName] ?? 0);
+      const current = typeof movePp[moveName] === "number" ? movePp[moveName] : max;
+      const next = effect.amount >= 9999 ? max : Math.min(max, current + effect.amount);
+      movePp[moveName] = next;
+      return next - current;
+    };
+
+    if (effect.scope === "all") {
+      let restored = 0;
+      moves.forEach((moveName) => {
+        restored += restoreOne(moveName);
+      });
+      if (restored <= 0) {
+        return { ok: false, message: `${getPokemonDisplayName(summary)}'s PP are already full.` };
+      }
+      summary.movePp = movePp;
+      return { ok: true, message: `${getPokemonDisplayName(summary)}'s PP was restored.` };
+    }
+
+    const moveName = targetMoveName && moves.includes(targetMoveName) ? targetMoveName : undefined;
+    if (!moveName) {
+      return { ok: false, message: "Choose a move to restore." };
+    }
+    const gained = restoreOne(moveName);
+    if (gained <= 0) {
+      return { ok: false, message: `${moveName} already has full PP.` };
+    }
+    summary.movePp = movePp;
+    return { ok: true, message: `${moveName}'s PP was restored.` };
+  }
+
+  private applyPpUp(
+    summary: PokemonSummary,
+    effect: Extract<FieldItemEffect, { kind: "pp-up" }>,
+    targetMoveName: string | undefined,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): { ok: true; message: string } | { ok: false; message: string } {
+    const moves = Array.isArray(summary.moves) ? summary.moves : [];
+    const moveName = targetMoveName && moves.includes(targetMoveName) ? targetMoveName : undefined;
+    if (!moveName) {
+      return { ok: false, message: "Choose a move to boost." };
+    }
+    const ppUps = { ...(summary.movePpUps ?? {}) };
+    const current = ppUps[moveName] ?? 0;
+    if (current >= 3) {
+      return { ok: false, message: `${moveName}'s PP can't go any higher.` };
+    }
+    const next = effect.mode === "max" ? 3 : current + 1;
+    ppUps[moveName] = next;
+    summary.movePpUps = ppUps;
+
+    // Top the current PP up to the new maximum so the boost is immediately felt.
+    const skill = catalogs.skillsByName.get(moveName.toLowerCase());
+    const baseMax = Math.max(1, skill?.powerPoint ?? 1);
+    const movePp = { ...(summary.movePp ?? {}) };
+    movePp[moveName] = maxPpForMove(baseMax, next);
+    summary.movePp = movePp;
+
+    return { ok: true, message: `${moveName}'s max PP increased.` };
+  }
+
+  private applyVitamin(
+    summary: PokemonSummary,
+    definition: PokemonDefinition | null,
+    effect: Extract<FieldItemEffect, { kind: "vitamin" }>
+  ): { ok: true; message: string } | { ok: false; message: string } {
+    const evs = { ...(summary.evs ?? {}) } as Record<string, number>;
+    const statKeys: BattleStatKey[] = [
+      "hp",
+      "attack",
+      "defense",
+      "specialAttack",
+      "specialDefense",
+      "speed"
+    ];
+    const current = Math.max(0, Math.round(evs[effect.stat] ?? 0));
+    const total = statKeys.reduce((sum, key) => sum + Math.max(0, Math.round(evs[key] ?? 0)), 0);
+
+    if (effect.capped && current >= VITAMIN_EV_CAP) {
+      return {
+        ok: false,
+        message: `${getPokemonDisplayName(summary)} won't benefit from any more of that.`
+      };
+    }
+    if (current >= MAX_STANDARD_EV_PER_STAT || total >= MAX_TOTAL_EV) {
+      return {
+        ok: false,
+        message: `${getPokemonDisplayName(summary)} won't benefit from any more of that.`
+      };
+    }
+
+    const perStatCap = effect.capped
+      ? Math.min(VITAMIN_EV_CAP, MAX_STANDARD_EV_PER_STAT)
+      : MAX_STANDARD_EV_PER_STAT;
+    const roomForStat = perStatCap - current;
+    const roomForTotal = MAX_TOTAL_EV - total;
+    const applied = Math.max(0, Math.min(effect.amount, roomForStat, roomForTotal));
+    if (applied <= 0) {
+      return {
+        ok: false,
+        message: `${getPokemonDisplayName(summary)} won't benefit from any more of that.`
+      };
+    }
+    evs[effect.stat] = current + applied;
+    summary.evs = evs;
+
+    if (effect.stat === "hp") {
+      this.recomputeSummaryMaxHp(summary, definition);
+    }
+    return { ok: true, message: `${getPokemonDisplayName(summary)}'s base stats rose.` };
+  }
+
+  /**
+   * Rare Candy: one level, recomputed stats, any moves learnable at the new
+   * level (appended or queued as a pending prompt), then a level-up evolution
+   * check.
+   */
+  private applyRareCandy(
+    summary: PokemonSummary,
+    definition: PokemonDefinition | null,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): { message: string } {
+    const nextLevel = Math.min(100, summary.level + 1);
+    summary.level = nextLevel;
+    summary.experience = 0;
+    summary.nextLevelExperience = this.getExperienceRequirement(
+      { growthRate: definition?.growthRate ?? null },
+      nextLevel,
+      catalogs.levelingCurveConfig
+    );
+    if (nextLevel >= 100) {
+      summary.experience = 0;
+      summary.nextLevelExperience = 0;
+    }
+    this.recomputeSummaryMaxHp(summary, definition);
+
+    const messages = [`${getPokemonDisplayName(summary)} grew to level ${nextLevel}!`];
+    this.learnLevelMovesForSummary(summary, definition, nextLevel, catalogs, messages);
+
+    const evolveTarget = this.findLevelEvolutionTargetForSummary(summary, catalogs);
+    if (evolveTarget) {
+      const fromName = getPokemonDisplayName(summary);
+      this.evolveSummary(summary, evolveTarget, catalogs);
+      messages.push(`${fromName} evolved into ${evolveTarget.name}!`);
+    }
+
+    return { message: messages.join(" ") };
+  }
+
+  /** Appends moves learnable exactly at `level`, queuing extras as pending. */
+  private learnLevelMovesForSummary(
+    summary: PokemonSummary,
+    definition: PokemonDefinition | null,
+    level: number,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>,
+    messages: string[]
+  ) {
+    const learnset = definition?.skills ?? [];
+    const learnable = learnset.filter((entry) => entry.level === level);
+    for (const entry of learnable) {
+      if (summary.moves.some((move) => move.toLowerCase() === entry.skillName.toLowerCase())) {
+        continue;
+      }
+      const skill =
+        catalogs.skillsById.get(entry.skillId) ??
+        catalogs.skillsByName.get(entry.skillName.toLowerCase());
+      if (!skill) {
+        continue;
+      }
+      if (summary.moves.length < 4) {
+        summary.moves = [...summary.moves, skill.name];
+        summary.movePp = { ...(summary.movePp ?? {}), [skill.name]: skill.powerPoint };
+        messages.push(`It learned ${skill.name}!`);
+      } else {
+        const pending = summary.pendingMoveLearns ?? [];
+        if (!pending.some((name) => name.toLowerCase() === skill.name.toLowerCase())) {
+          summary.pendingMoveLearns = [...pending, skill.name];
+        }
+      }
+    }
+  }
+
+  private findItemEvolutionTarget(
+    summary: PokemonSummary,
+    itemEssentialsId: string,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): PokemonDefinition | null {
+    const definition = this.resolveSummaryDefinition(summary, catalogs);
+    const wantedItem = itemEssentialsId.trim().toUpperCase();
+    for (const evolution of definition?.evolutions ?? []) {
+      const method = evolution.method.trim().toLowerCase().replace(/[\s_-]/g, "");
+      if (method !== "item" && method !== "itemmale" && method !== "itemfemale") {
+        continue;
+      }
+      const parameter = String(evolution.parameter ?? "").trim().toUpperCase();
+      if (parameter && parameter !== wantedItem) {
+        continue;
+      }
+      const target = this.resolvePokemonDefinition(evolution.targetId, catalogs);
+      if (target && target.id !== summary.sourcePokemonId) {
+        return target;
+      }
+    }
+    return null;
+  }
+
+  private findLevelEvolutionTargetForSummary(
+    summary: PokemonSummary,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): PokemonDefinition | null {
+    const definition = this.resolveSummaryDefinition(summary, catalogs);
+    for (const evolution of definition?.evolutions ?? []) {
+      const method = evolution.method.trim().toLowerCase().replace(/[\s_-]/g, "");
+      if (method !== "level" && method !== "levelup") {
+        continue;
+      }
+      const requiredLevel =
+        typeof evolution.parameter === "number"
+          ? evolution.parameter
+          : Number.parseInt(String(evolution.parameter ?? ""), 10);
+      if (!Number.isFinite(requiredLevel) || requiredLevel <= 0 || summary.level < requiredLevel) {
+        continue;
+      }
+      const target = this.resolvePokemonDefinition(evolution.targetId, catalogs);
+      if (target && target.id !== summary.sourcePokemonId) {
+        return target;
+      }
+    }
+    return null;
+  }
+
+  /** Applies an evolution to a stored summary (stone or level triggered). */
+  private evolveSummary(
+    summary: PokemonSummary,
+    target: PokemonDefinition,
+    _catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ) {
+    summary.sourcePokemonId = target.id;
+    summary.name = target.name;
+    summary.types = target.types;
+    this.recomputeSummaryMaxHp(summary, target);
+  }
+
+  /**
+   * Escape Rope destination: the current map's configured healing spot
+   * (Essentials `HealSpot`, stored in tile cells → converted to pixels via the
+   * destination map's cell size), falling back to the world's initial spawn.
+   */
+  private resolveEscapeDestination(
+    player: Player
+  ): { mapId: string; x: number; y: number } | null {
+    const mapsState = this.world.getPlayableMapsState();
+    if (!mapsState) {
+      return null;
+    }
+    const currentMap = mapsState.items.find((item) => item.id === player.currentMapId);
+    const healingSpot = currentMap?.playableMapConfig?.healingSpot;
+    if (healingSpot) {
+      const targetMap =
+        mapsState.items.find((item) => item.id === healingSpot.mapId) ?? currentMap;
+      const cellSize = targetMap?.playableMapConfig?.cellSize ?? 32;
+      return {
+        mapId: healingSpot.mapId,
+        x: Math.max(0, Math.round(healingSpot.x)) * cellSize,
+        y: Math.max(0, Math.round(healingSpot.y)) * cellSize
+      };
+    }
+    return resolveInitialSpawnFromPlayableMapsState(mapsState);
+  }
+
+  private teleportPlayerTo(
+    player: Player,
+    destination: { mapId: string; x: number; y: number }
+  ) {
+    player.stopMovement();
+    player.teleport(destination.mapId, destination.x, destination.y);
+    this.world.players.set(player.socketId, player);
+    this.world.presentPlayerToMap(player);
+    player.socketConnections.forEach((socketId) => {
+      this.world.presentPlayersOnMapTo(socketId, player.currentMapId);
+    });
   }
 
   public async teachInventoryMove(
@@ -1569,6 +2131,20 @@ export default class BattleManager {
     }
 
     this.lastGrassCellByPlayerId.set(player.socketId, grassKey);
+
+    // Repel: each new grass tile spends one step; encounters are suppressed
+    // until the charge runs out.
+    const repelSteps = this.repelStepsByPlayerId.get(player.socketId) ?? 0;
+    if (repelSteps > 0) {
+      const remaining = repelSteps - 1;
+      if (remaining > 0) {
+        this.repelStepsByPlayerId.set(player.socketId, remaining);
+      } else {
+        this.repelStepsByPlayerId.delete(player.socketId);
+        this.emitToPlayer(player, "auth:info", { message: "The repellent wore off." });
+      }
+      return;
+    }
 
     if (Math.random() * 100 >= grass.encounterRate) {
       return;

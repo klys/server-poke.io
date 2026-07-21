@@ -177,6 +177,11 @@ export default interface ServerToClientEvents {
   "portal:used": (data: { mapId: string }) => void;
   // Volar (Fly) request rejected — the world-map window shows the message.
   "player:fly-error": (data: { message: string }) => void;
+  // A used bag key item asks the client to open a window / toggle a mode
+  // (e.g. Town Map -> open the world map). No party state changed.
+  "inventory:action": (data: {
+    type: "town-map" | "bicycle" | "dowsing" | "fishing" | "generic";
+  }) => void;
 
   shotProjectil: (data: ProjectilData) => void;
   explodeProjectil: (data: ProjectilData) => void;

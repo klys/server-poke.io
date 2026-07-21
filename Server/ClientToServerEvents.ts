@@ -89,7 +89,7 @@ export default interface ClientToServerEvents {
   "battle:trade-response": (data: BattleTradeResponsePayload) => void;
   "battle:action": (data: BattleActionRequest) => void;
   "battle:learn-move": (data: { pokemonId: string; moveName: string; replaceMoveName?: string }) => void;
-  "inventory:use-item": (data: { itemId: string; targetPokemonId: string }) => void;
+  "inventory:use-item": (data: { itemId: string; targetPokemonId?: string; targetMoveName?: string }) => void;
   "inventory:teach-move": (data: { itemId: string; targetPokemonId: string }) => void;
   "inventory:hold-item": (data: { pokemonId: string; itemId: string }) => void;
   "inventory:take-held-item": (data: { pokemonId: string }) => void;
