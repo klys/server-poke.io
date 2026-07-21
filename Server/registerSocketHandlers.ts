@@ -1726,6 +1726,113 @@ function createConnectionHandler(
       battleManager.respondToTrade(socket.id, data);
     });
 
+    // Paid skin change ($300). The free `auth:update-profile` path only sets a
+    // skin on the very first (onboarding) pick; every later change is bought
+    // here so the money is actually deducted and validated server-side.
+    socket.on("player:set-skin", async (data) => {
+      const SKIN_PRICE = 300;
+      try {
+        if (typeof socket.data.userId !== "number") {
+          socket.emit("auth:error", { message: "Log in to change your skin." });
+          return;
+        }
+        const userId = socket.data.userId;
+        const characterSkinId =
+          typeof data?.characterSkinId === "string" ? data.characterSkinId.trim().slice(0, 120) : "";
+        if (!characterSkinId) {
+          socket.emit("auth:error", { message: "Select a skin to wear." });
+          return;
+        }
+
+        const playersPayload = await designerSectionStore.read("players");
+        const skinExists = (playersPayload?.state.items ?? []).some(
+          (item) => item.id === characterSkinId && Boolean(item.characterSkinProfile)
+        );
+        if (!skinExists) {
+          socket.emit("auth:error", { message: "That skin is not available." });
+          return;
+        }
+
+        const user = await auth.getPublicUserData(userId);
+        if (!user) {
+          socket.emit("auth:error", { message: "Unable to load your account right now." });
+          return;
+        }
+        if (user.characterSkinId === characterSkinId) {
+          socket.emit("auth:info", { message: "You are already wearing that skin." });
+          return;
+        }
+        if (user.money < SKIN_PRICE) {
+          socket.emit("auth:error", { message: `You need $${SKIN_PRICE} to change your skin.` });
+          return;
+        }
+
+        await auth.setCharacterSkin(userId, characterSkinId);
+        const updated = await auth.saveBattleState(userId, { money: user.money - SKIN_PRICE });
+
+        // Reflect the new skin on the live world player so everyone (including
+        // the buyer) sees the sprite swap without a reload.
+        const player = world.getPlayerByUserId(userId);
+        if (player) {
+          player.characterSkinId = characterSkinId;
+          world.presentPlayerToMap(player);
+          player.socketConnections.forEach((connectionId) => {
+            socket.nsp.to(connectionId).emit("addPlayer", player.data());
+          });
+        }
+
+        socket.emit("auth:session", { authenticated: true, user: updated ?? null });
+        socket.emit("auth:info", { message: `You changed your skin for $${SKIN_PRICE}.` });
+      } catch (error) {
+        console.error("player:set-skin failed:", error);
+        socket.emit("auth:error", { message: "Unable to change your skin right now." });
+      }
+    });
+
+    // Public trainer card for another player (clicking them on the map). Only
+    // the presentable fields are sent — never money/email/credentials.
+    socket.on("trainer:card", async (data) => {
+      try {
+        const targetPlayerId = typeof data?.targetPlayerId === "string" ? data.targetPlayerId : "";
+        const player = targetPlayerId ? world.players.get(targetPlayerId) : undefined;
+        if (!player) {
+          socket.emit("auth:error", { message: "That trainer is no longer nearby." });
+          return;
+        }
+
+        let badges: number[] = [];
+        let trainerCardColor = "";
+        let party: Array<{ name: string; sourcePokemonId?: string; nickname?: string }> = [];
+
+        if (typeof player.userId === "number") {
+          const user = await auth.getPublicUserData(player.userId);
+          if (user) {
+            badges = user.badges;
+            trainerCardColor = user.trainerCardColor;
+            party = user.pokemonParty.slice(0, 6).map((pokemon) => ({
+              name: pokemon.name,
+              sourcePokemonId: pokemon.sourcePokemonId,
+              nickname: pokemon.nickname
+            }));
+          }
+        }
+
+        socket.emit("trainer:card-data", {
+          playerId: targetPlayerId,
+          name: player.name,
+          username: player.username,
+          description: player.description,
+          characterSkinId: player.characterSkinId,
+          trainerCardColor,
+          badges,
+          party
+        });
+      } catch (error) {
+        console.error("trainer:card failed:", error);
+        socket.emit("auth:error", { message: "Unable to load that trainer card." });
+      }
+    });
+
     socket.on("battle:action", (data) => {
       battleManager.submitAction(socket.id, data);
     });

@@ -124,6 +124,10 @@ interface AuthUserData {
   trainerGender: string;
   characterSkinId: string;
   money: number;
+  /** 0-based gym badge indices earned. */
+  badges: number[];
+  /** Palette key for the Trainer Card background. */
+  trainerCardColor: string;
   role: "admin" | "designer" | "moderator" | "user";
   permissions: Array<"game.access" | "designer.access" | "moderator.access" | "admin.access">;
   inventory: Array<{
@@ -168,8 +172,21 @@ interface AuthUserData {
   }>;
 }
 
+/** Public trainer card for another player (never carries money/email). */
+interface TrainerCardData {
+  playerId: string;
+  name: string;
+  username: string;
+  description: string;
+  characterSkinId: string;
+  trainerCardColor: string;
+  badges: number[];
+  party: Array<{ name: string; sourcePokemonId?: string; nickname?: string }>;
+}
+
 export default interface ServerToClientEvents {
   addPlayer: (data: PlayerData) => void;
+  "trainer:card-data": (data: TrainerCardData) => void;
   removePlayer: (data: { playerId: string; id: number }) => void;
   myPlayer: (data: { playerId: string }) => void;
   // The player just traveled through a designer portal (server-triggered);

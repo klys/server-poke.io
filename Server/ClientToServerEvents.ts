@@ -58,6 +58,7 @@ interface AuthUpdateProfilePayload {
   profileImage?: string;
   description?: string;
   characterSkinId?: string;
+  trainerCardColor?: string;
 }
 
 interface AuthChooseStarterPayload {
@@ -87,6 +88,8 @@ export default interface ClientToServerEvents {
   "battle:challenge-response": (data: BattleChallengeResponsePayload) => void;
   "battle:trade-request": (data: BattleTradeRequestPayload) => void;
   "battle:trade-response": (data: BattleTradeResponsePayload) => void;
+  "player:set-skin": (data: { characterSkinId: string }) => void;
+  "trainer:card": (data: { targetPlayerId: string }) => void;
   "battle:action": (data: BattleActionRequest) => void;
   "battle:learn-move": (data: { pokemonId: string; moveName: string; replaceMoveName?: string }) => void;
   "inventory:use-item": (data: { itemId: string; targetPokemonId?: string; targetMoveName?: string }) => void;

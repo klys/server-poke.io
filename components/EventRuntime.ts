@@ -95,6 +95,14 @@ const RE_ITEM_BALL_VAR = /pbItemBall\(\s*pbGet\(\s*(\d+)\s*\)/i;
 // the event's own Show Text announces the item, so no info step here.
 const RE_STORE_ITEM = /pbStoreItem\(\s*(?:PBItems::|:)(\w+)/i;
 const RE_POKEDEX = /\$Trainer\.pokedex\s*=\s*true/i;
+// Gym badges. Award forms (RPG-Maker Script cmd 355): `$Trainer.badges[N]=true`
+// or `pbReceiveBadge(N)`. Condition forms (Script conditional branch): the
+// badge count `$Trainer.numbadges >=|>|... N`, or a plain `$Trainer.badges[N]`
+// truthy test. Awarding is honoured in applyScript; conditions in evaluate().
+const RE_AWARD_BADGE = /\$Trainer\.badges\[\s*(\d+)\s*\]\s*=\s*true/i;
+const RE_RECEIVE_BADGE = /pbReceiveBadge\(\s*(\d+)\s*\)/i;
+const RE_NUMBADGES = /\$Trainer\.numbadges\s*(>=|<=|==|!=|>|<)\s*(\d+)/i;
+const RE_HAS_BADGE = /\$Trainer\.badges\[\s*(\d+)\s*\]/i;
 const RE_HEAL = /pbHealAll|pbHealParty|Recover All/i;
 const RE_CHANGE_PLAYER = /pbChangePlayer\(\s*(\d)\s*\)/i;
 const RE_TRAINER_BATTLE = /pbTrainerBattle\(\s*PBTrainers::(\w+)\s*,\s*"([^"]+)"/i;
@@ -993,6 +1001,28 @@ export default class EventRuntime {
         if (itemGrant !== null) {
           return itemGrant;
         }
+        // Gym progression gates. Badges are now real (see applyScript), so
+        // `$Trainer.numbadges>=N` / `$Trainer.badges[N]` checkpoints actually
+        // enforce instead of always passing.
+        const numBadges = test.text.match(RE_NUMBADGES);
+        if (numBadges) {
+          const count = (await this.auth.getBadges(session.userId)).length;
+          const target = Number(numBadges[2]);
+          switch (numBadges[1]) {
+            case ">=": return count >= target;
+            case "<=": return count <= target;
+            case ">": return count > target;
+            case "<": return count < target;
+            case "==": return count === target;
+            case "!=": return count !== target;
+            default: return true;
+          }
+        }
+        const hasBadge = test.text.match(RE_HAS_BADGE);
+        if (hasBadge) {
+          const badges = await this.auth.getBadges(session.userId);
+          return badges.includes(Number(hasBadge[1]));
+        }
         // Unknown script tests keep the old permissive behavior.
         return true;
       }
@@ -1186,6 +1216,31 @@ export default class EventRuntime {
 
     if (RE_POKEDEX.test(text)) {
       await this.auth.setEventSwitches(session.userId, 999, 999, true); // pokedex-owned marker
+      return;
+    }
+
+    // Gym leaders award a badge via `$Trainer.badges[N]=true` (or
+    // pbReceiveBadge(N)). These are no longer silent no-ops — the badge is
+    // persisted so it shows on the Trainer Card and unlocks numbadges gates.
+    const awardBadge = text.match(RE_AWARD_BADGE) ?? text.match(RE_RECEIVE_BADGE);
+    if (awardBadge) {
+      const index = Number(awardBadge[1]);
+      const before = await this.auth.getBadges(session.userId);
+      const after = await this.auth.awardBadge(session.userId, index);
+      if (after.length > before.length) {
+        this.emitStep(session, {
+          type: "sound",
+          kind: "ME",
+          name: "001-Victory01"
+        });
+        this.emitStep(session, {
+          type: "info",
+          npcName: session.npcName,
+          text: `¡Has conseguido la medalla de gimnasio #${index + 1}!`
+        });
+        await this.waitAdvance(session.userId);
+        await this.refreshSession(session);
+      }
       return;
     }
 

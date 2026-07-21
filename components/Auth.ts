@@ -49,6 +49,10 @@ export interface AuthenticatedUser {
     trainerGender:string;
     characterSkinId:string;
     money:number;
+    /** 0-based gym badge indices earned (see $Trainer.badges[N]). */
+    badges:number[];
+    /** Palette key chosen for the Trainer Card background (client owns the palette). */
+    trainerCardColor:string;
     battleHistory:BattleHistoryEntry[];
     role:UserRoleKey;
     permissions:RolePermission[];
@@ -288,6 +292,7 @@ interface UpdateProfilePayload {
     profileImage?:string;
     description?:string;
     characterSkinId?:string;
+    trainerCardColor?:string;
 }
 
 interface ChooseStarterPayload {
@@ -782,10 +787,18 @@ export default class Auth {
 
         const profileImage = typeof payload.profileImage === "string" ? payload.profileImage.trim() : authenticatedUser.profileImage;
         const description = typeof payload.description === "string" ? payload.description.trim() : authenticatedUser.description;
+        // The free profile update only sets the skin on the FIRST pick (empty
+        // current skin — the startup/onboarding selection). Later skin changes
+        // must go through the paid `player:set-skin` handler ($300), so a
+        // characterSkinId here is ignored once a skin is already assigned.
         const characterSkinId =
-            typeof payload.characterSkinId === "string"
+            typeof payload.characterSkinId === "string" && !authenticatedUser.characterSkinId.trim()
                 ? payload.characterSkinId.trim().slice(0, 120)
                 : authenticatedUser.characterSkinId;
+        const trainerCardColor =
+            typeof payload.trainerCardColor === "string"
+                ? payload.trainerCardColor.trim().slice(0, 40)
+                : authenticatedUser.trainerCardColor;
 
         if (description.length > 50) {
             return { error: "Description must be 50 characters or less." };
@@ -798,7 +811,8 @@ export default class Auth {
         await this.redis.hSet(this.userKey(authenticatedUser.id), {
             profile_image: profileImage,
             description,
-            character_skin_id: characterSkinId
+            character_skin_id: characterSkinId,
+            trainer_card_color: trainerCardColor
         });
 
         const user = await this.getUserById(String(authenticatedUser.id));
@@ -1421,6 +1435,29 @@ export default class Auth {
         return true;
     }
 
+    // ---- Gym badges (Essentials $Trainer.badges[N]) ----
+    // Persisted per user as a JSON array of 0-based badge indices. Gym-leader
+    // events award them (EventRuntime honours `$Trainer.badges[N]=true`) and
+    // progression gates read them (`$Trainer.numbadges>=N`).
+    public async getBadges(userId:number):Promise<number[]> {
+        const raw = await this.redis.hGet(this.userKey(userId), "badges");
+        return this.parseBadges(raw);
+    }
+
+    /** Awards a badge (idempotent). Returns the updated badge list. */
+    public async awardBadge(userId:number, index:number):Promise<number[]> {
+        if (!Number.isInteger(index) || index < 0 || index > 63) {
+            return this.getBadges(userId);
+        }
+        const badges = await this.getBadges(userId);
+        if (!badges.includes(index)) {
+            badges.push(index);
+            badges.sort((a, b) => a - b);
+            await this.redis.hSet(this.userKey(userId), { badges: JSON.stringify(badges) });
+        }
+        return badges;
+    }
+
     // ---- Pokemon Center respawn point (Kernel.pbSetPokemonCenter) ----
     // Where a blacked-out player is returned to; falls back to the initial
     // spawn when no center has been visited yet.
@@ -1757,6 +1794,8 @@ export default class Auth {
                     pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
                     trainer_gender: "",
                     character_skin_id: "",
+                    badges: "[]",
+                    trainer_card_color: "",
                     money: String(DEFAULT_MONEY),
                     battle_history: JSON.stringify(DEFAULT_BATTLE_HISTORY),
                     role,
@@ -1780,6 +1819,8 @@ export default class Auth {
                     pokemonStorage: this.parsePokemonStorage(undefined),
                     trainerGender: "",
                     characterSkinId: "",
+                    badges: [],
+                    trainerCardColor: "",
                     money: DEFAULT_MONEY,
                     battleHistory: DEFAULT_BATTLE_HISTORY,
                     role,
@@ -1961,6 +2002,12 @@ export default class Auth {
         if (typeof user.character_skin_id !== "string") {
             defaultFields.character_skin_id = "";
         }
+        if (typeof user.badges !== "string") {
+            defaultFields.badges = "[]";
+        }
+        if (typeof user.trainer_card_color !== "string") {
+            defaultFields.trainer_card_color = "";
+        }
         if (typeof user.money !== "string") {
             defaultFields.money = String(DEFAULT_MONEY);
         }
@@ -1994,6 +2041,8 @@ export default class Auth {
             trainerGender: user.trainer_gender ?? "",
             characterSkinId: user.character_skin_id ?? "",
             money: this.parseMoney(user.money),
+            badges: this.parseBadges(user.badges),
+            trainerCardColor: user.trainer_card_color ?? "",
             battleHistory: this.parseBattleHistory(user.battle_history),
             role: resolvedRole.role,
             permissions: resolvedRole.permissions,
@@ -2016,6 +2065,8 @@ export default class Auth {
             trainerGender: user.trainerGender,
             characterSkinId: user.characterSkinId,
             money: user.money,
+            badges: user.badges,
+            trainerCardColor: user.trainerCardColor,
             battleHistory: user.battleHistory,
             role: user.role,
             permissions: user.permissions
@@ -2650,6 +2701,28 @@ export default class Auth {
 
         const parsed = Number.parseInt(value, 10);
         return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : DEFAULT_MONEY;
+    }
+
+    private parseBadges(value:string | undefined | null):number[] {
+        if (typeof value !== "string") {
+            return [];
+        }
+        try {
+            const parsed = JSON.parse(value);
+            if (!Array.isArray(parsed)) {
+                return [];
+            }
+            const seen = new Set<number>();
+            for (const entry of parsed) {
+                const index = Number(entry);
+                if (Number.isInteger(index) && index >= 0 && index <= 63) {
+                    seen.add(index);
+                }
+            }
+            return Array.from(seen).sort((a, b) => a - b);
+        } catch {
+            return [];
+        }
     }
 
     private isLegacyDemoPokemonParty(value:unknown[]) {
