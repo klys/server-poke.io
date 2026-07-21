@@ -14,6 +14,11 @@ export interface GroundItem {
   width: number;
   height: number;
   droppedAt: string;
+  /**
+   * Hidden items are invisible on the ground (never emitted to clients) and
+   * can't be walked into until the Dowsing Machine/Itemfinder reveals them.
+   */
+  hidden?: boolean;
 }
 
 const REDIS_KEY = "world:ground-items";
@@ -55,7 +60,8 @@ function sanitizeGroundItem(value: unknown): GroundItem | null {
     y: Math.max(0, normalizeNumber(candidate.y)),
     width: Math.max(16, normalizeNumber(candidate.width, 32)),
     height: Math.max(16, normalizeNumber(candidate.height, 32)),
-    droppedAt: normalizeText(candidate.droppedAt) || new Date().toISOString()
+    droppedAt: normalizeText(candidate.droppedAt) || new Date().toISOString(),
+    ...(candidate.hidden ? { hidden: true } : {})
   };
 }
 

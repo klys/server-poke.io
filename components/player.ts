@@ -13,7 +13,11 @@ export default class Player {
     currentMapId:string;
     width:number;
     height:number;
-    speed:number; 
+    speed:number;
+    /** Path nodes consumed per movement tick. 1 = walking, >1 = cycling. */
+    speedMultiplier:number = 1;
+    /** True while the Bicycle is out (drives speedMultiplier and the sprite). */
+    cycling:boolean = false;
     socketId:string;
     socketConnections:Set<string>;
     userId:number | null;
@@ -118,17 +122,63 @@ export default class Player {
         return this.socketConnections.size > 0;
     }
 
+    /** Bicycle speed while cycling (path nodes consumed per movement tick). */
+    static readonly CYCLE_SPEED_MULTIPLIER = 2;
+
+    /** Toggles/sets the Bicycle. Cycling doubles movement speed. */
+    setCycling(on: boolean) {
+        this.cycling = on;
+        this.speedMultiplier = on ? Player.CYCLE_SPEED_MULTIPLIER : 1;
+    }
+
+    /** The cell the player currently occupies (its collision-box centre). */
+    getCurrentCell(cellSize: number) {
+        return {
+            x: Math.floor((this.x + this.width / 2) / cellSize),
+            y: Math.floor((this.y + this.height / 2) / cellSize)
+        };
+    }
+
+    /** The cell directly in front of the player, based on facing angle. */
+    getFacingCell(cellSize: number) {
+        const current = this.getCurrentCell(cellSize);
+        // angle: 90=up, 270=down, 0/360=left, 180=right (see gameMath / client).
+        const normalized = ((Math.round(this.angle) % 360) + 360) % 360;
+        let dx = 0;
+        let dy = 0;
+        if (normalized === 90) dy = -1;
+        else if (normalized === 270) dy = 1;
+        else if (normalized === 180) dx = 1;
+        else dx = -1; // 0 / 360 = left (default)
+        return { x: current.x + dx, y: current.y + dy };
+    }
+
     /**
      * Evaluates the current path segment and moves the player towards it.
+     * While cycling, up to `speedMultiplier` path nodes are consumed per tick
+     * (each still runs the full block/slide/touch logic), so the Bicycle just
+     * advances the walk faster without a separate faster interval.
      */
     public move() {
         if (this.inBattle) return;
         if (this.relocateInsideMapIfNeeded()) return;
-        if (this.path.length === 0) return;
-        if (this.path.length === this.path_pos) return;
 
-        //console.log("player "+player.socketId+" moving to "+player.path[player.path_pos][0]+"/"+player.path[player.path_pos][1])
+        const steps = Math.max(1, Math.round(this.speedMultiplier));
+        for (let i = 0; i < steps; i++) {
+            if (this.path.length === 0 || this.path.length === this.path_pos) {
+                return;
+            }
+            if (!this.stepAlongPath()) {
+                return; // blocked or sliding — don't over-advance this tick
+            }
+        }
+    }
 
+    /**
+     * Advances one path node. Returns true when the walk may continue this
+     * tick (a clean node advance), false when it stalled (blocked or a slide).
+     */
+    private stepAlongPath(): boolean {
         const toX = this.path[this.path_pos][0]*World.moveScale;
         const toY = this.path[this.path_pos][1]*World.moveScale;
 
@@ -171,7 +221,7 @@ export default class Player {
                 // RMXP bump-touch: walking into a blocked trigger-1/2 event
                 // (a door) fires it even though the step itself is denied.
                 this.world.notifyBlockedTouch(this, toX, toY);
-                return;
+                return false;
             }
         }
 
@@ -190,7 +240,7 @@ export default class Player {
                 currentMapId:this.currentMapId
             })
             this.world.handlePlayerStep(this);
-            return;
+            return false;
         }
 
         this.path_pos = this.path_pos + 1;
@@ -203,7 +253,7 @@ export default class Player {
             currentMapId:this.currentMapId
         })
         this.world.handlePlayerStep(this);
-
+        return true;
     }
 
     private relocateInsideMapIfNeeded() {

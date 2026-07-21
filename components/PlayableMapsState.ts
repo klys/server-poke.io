@@ -196,11 +196,33 @@ export type PlayableMapTileMapProfile = {
   };
 };
 
+/**
+ * A water tile a player can fish from. Same encounter shape as grass, plus an
+ * optional minimum rod tier ("old" < "good" < "super") gating who can fish it.
+ */
+export type MapEditorFishingSpot = {
+  id: string;
+  x: number;
+  y: number;
+  pokemonIds: string[];
+  minLevel: number;
+  maxLevel: number;
+  /** Minimum rod tier required; omitted = any rod. */
+  rod?: "old" | "good" | "super";
+  encounterRows?: Array<{
+    weight: number;
+    pokemonId: string;
+    minLevel: number;
+    maxLevel: number;
+  }>;
+};
+
 export type PlayableMapEditorData = {
   version: 1;
   objects: MapEditorObjectPlacement[];
   portals: MapEditorPortalPlacement[];
   grass: MapEditorGrassPlacement[];
+  fishingSpots?: MapEditorFishingSpot[];
   npcs: MapEditorNpcPlacement[];
   tileMap?: PlayableMapTileMapProfile;
   essentials?: {
@@ -564,6 +586,7 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
       objects: [],
       portals: [],
       grass: [],
+      fishingSpots: [],
       npcs: [],
       essentials: undefined,
     };
@@ -646,6 +669,40 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
               Math.max(1, clampInteger(item.maxLevel, 1))
             ),
             encounterRate: Math.max(0, Math.min(100, clampInteger(item.encounterRate))),
+          }))
+      : [],
+    fishingSpots: Array.isArray(candidate.fishingSpots)
+      ? candidate.fishingSpots
+          .filter(
+            (item): item is MapEditorFishingSpot =>
+              typeof item?.id === "string" &&
+              typeof item?.x === "number" &&
+              typeof item?.y === "number"
+          )
+          .map((item) => ({
+            id: item.id,
+            x: Math.max(0, clampInteger(item.x)),
+            y: Math.max(0, clampInteger(item.y)),
+            pokemonIds: Array.isArray(item.pokemonIds)
+              ? item.pokemonIds.filter((id): id is string => typeof id === "string")
+              : [],
+            minLevel: Math.max(1, clampInteger(item.minLevel, 1)),
+            maxLevel: Math.max(
+              Math.max(1, clampInteger(item.minLevel, 1)),
+              Math.max(1, clampInteger(item.maxLevel, 1))
+            ),
+            rod:
+              item.rod === "old" || item.rod === "good" || item.rod === "super"
+                ? item.rod
+                : undefined,
+            encounterRows: Array.isArray(item.encounterRows)
+              ? item.encounterRows.filter(
+                  (row) =>
+                    row &&
+                    typeof row.pokemonId === "string" &&
+                    typeof row.weight === "number"
+                )
+              : undefined,
           }))
       : [],
     npcs: Array.isArray(candidate.npcs)

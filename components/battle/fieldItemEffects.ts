@@ -121,12 +121,27 @@ const REPEL_ITEMS: Record<string, number> = {
 /** Flutes that wake the whole party from sleep. */
 const WAKE_FLUTE_ITEMS = new Set(["POKEFLUTE", "BLUEFLUTE"]);
 
-export type FieldItemKeyAction = "town-map" | "bicycle" | "dowsing" | "fishing" | "generic";
+export type FieldItemKeyAction =
+  | "town-map"
+  | "bicycle"
+  | "dowsing"
+  | "fishing"
+  | "poke-radar"
+  | "generic";
+
+/** Fishing rod tier — gates the encounter level range on a cast. */
+export type FishingRodTier = "old" | "good" | "super";
+
+export const FISHING_ROD_TIERS: Record<string, FishingRodTier> = {
+  OLDROD: "old",
+  GOODROD: "good",
+  SUPERROD: "super"
+};
 
 /** Key items that open a client UI or toggle a mode instead of a party effect. */
 const KEY_ITEM_ACTIONS: Record<string, FieldItemKeyAction> = {
   TOWNMAP: "town-map",
-  POKERADAR: "generic",
+  POKERADAR: "poke-radar",
   BICYCLE: "bicycle",
   ITEMFINDER: "dowsing",
   DOWSINGMACHINE: "dowsing",

@@ -935,10 +935,54 @@ export default class World {
             World.socketServer.in(socketId).emit("addObject", object)
         })
         this.groundItems.forEach((item) => {
-            if (item.mapId === mapId) {
+            if (item.mapId === mapId && !item.hidden) {
                 World.socketServer.in(socketId).emit("world:item-dropped", item);
             }
         });
+    }
+
+    /**
+     * Nearest still-hidden ground item on the player's map, with a compass
+     * direction and tile distance. Powers the Dowsing Machine / Itemfinder.
+     */
+    findNearestHiddenGroundItem(player:Player, cellSize:number) {
+        const here = player.getCurrentCell(cellSize);
+        let best: { item: GroundItem; distanceTiles: number; direction: string } | null = null;
+
+        for (const item of this.groundItems.values()) {
+            if (item.mapId !== player.currentMapId || !item.hidden) {
+                continue;
+            }
+            const itemCellX = Math.floor((item.x + item.width / 2) / cellSize);
+            const itemCellY = Math.floor((item.y + item.height / 2) / cellSize);
+            const dx = itemCellX - here.x;
+            const dy = itemCellY - here.y;
+            const distanceTiles = Math.abs(dx) + Math.abs(dy);
+            let direction = "here";
+            if (distanceTiles > 0) {
+                direction = Math.abs(dx) >= Math.abs(dy)
+                    ? (dx > 0 ? "east" : "west")
+                    : (dy > 0 ? "south" : "north");
+            }
+            if (!best || distanceTiles < best.distanceTiles) {
+                best = { item, distanceTiles, direction };
+            }
+        }
+
+        return best;
+    }
+
+    /** Reveals a hidden ground item so it renders and can be picked up. */
+    revealGroundItem(groundItemId:string) {
+        const item = this.groundItems.get(groundItemId);
+        if (!item || !item.hidden) {
+            return null;
+        }
+        const revealed: GroundItem = { ...item, hidden: false };
+        this.groundItems.set(groundItemId, revealed);
+        this.persistGroundItems();
+        World.socketServer.emit("world:item-dropped", revealed);
+        return revealed;
     }
 
     dropGroundItem(item: Omit<GroundItem, "id" | "droppedAt" | "width" | "height"> & Partial<Pick<GroundItem, "width" | "height">>) {
@@ -971,6 +1015,7 @@ export default class World {
 
         const groundItem = Array.from(this.groundItems.values()).find((item) =>
             item.mapId === player.currentMapId &&
+            !item.hidden &&
             this.checkCollision(playerBounds, item)
         );
 

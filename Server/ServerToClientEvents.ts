@@ -180,7 +180,7 @@ export default interface ServerToClientEvents {
   // A used bag key item asks the client to open a window / toggle a mode
   // (e.g. Town Map -> open the world map). No party state changed.
   "inventory:action": (data: {
-    type: "town-map" | "bicycle" | "dowsing" | "fishing" | "generic";
+    type: "town-map" | "bicycle" | "dowsing" | "fishing" | "poke-radar" | "generic";
   }) => void;
 
   shotProjectil: (data: ProjectilData) => void;

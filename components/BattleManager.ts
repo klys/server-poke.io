@@ -28,13 +28,15 @@ import {
   classifyFieldItem,
   fieldItemTargetKind,
   maxPpForMove,
+  FISHING_ROD_TIERS,
   MAX_STANDARD_EV_PER_STAT,
   MAX_TOTAL_EV,
   STATUS_CURE_ITEMS,
   VITAMIN_EV_CAP,
   type FieldItemEffect,
   type FieldItemKeyAction,
-  type FieldItemTargetKind
+  type FieldItemTargetKind,
+  type FishingRodTier
 } from "./battle/fieldItemEffects";
 import { resolveHeldItemEffect, type HeldItemEffect } from "./battle/heldItems";
 import {
@@ -869,13 +871,7 @@ export default class BattleManager {
     }
 
     if (effect.kind === "key-item") {
-      const nextUser = user; // key items are not consumed
-      return {
-        ok: true,
-        user: nextUser,
-        message: `${user.name} used the ${item.name}.`,
-        clientAction: { type: effect.action }
-      };
+      return this.applyKeyItem(effect.action, item, user, itemDefinition.essentialsId, player);
     }
 
     if (effect.kind === "revive-all") {
@@ -1404,6 +1400,210 @@ export default class BattleManager {
     player.socketConnections.forEach((socketId) => {
       this.world.presentPlayersOnMapTo(socketId, player.currentMapId);
     });
+  }
+
+  /** Dispatches a used key item (Bicycle, Poke Radar, rods, Dowsing, Town Map). */
+  private async applyKeyItem(
+    action: FieldItemKeyAction,
+    item: InventoryItem,
+    user: AuthenticatedUser,
+    essentialsId: string,
+    player?: Player
+  ): Promise<UseInventoryItemResult> {
+    switch (action) {
+      case "town-map":
+        // Handled client-side (opens the world map); this is a safety fallback.
+        return {
+          ok: true,
+          message: `${user.name} checked the ${item.name}.`,
+          clientAction: { type: "town-map" }
+        };
+
+      case "bicycle": {
+        if (!player) {
+          return { ok: false, message: "Enter the world before using the Bicycle." };
+        }
+        const nowCycling = !player.cycling;
+        player.setCycling(nowCycling);
+        return {
+          ok: true,
+          message: nowCycling ? "You got on the Bicycle." : "You got off the Bicycle.",
+          clientAction: { type: "bicycle" }
+        };
+      }
+
+      case "poke-radar": {
+        if (!player) {
+          return { ok: false, message: "Enter the world before using the Poke Radar." };
+        }
+        return this.usePokeRadar(player, user, item);
+      }
+
+      case "fishing": {
+        if (!player) {
+          return { ok: false, message: "Enter the world before fishing." };
+        }
+        const tier: FishingRodTier = FISHING_ROD_TIERS[essentialsId.toUpperCase()] ?? "old";
+        return this.useFishingRod(player, user, tier, item);
+      }
+
+      case "dowsing": {
+        if (!player) {
+          return { ok: false, message: "Enter the world before using that." };
+        }
+        return this.useDowsing(player, item);
+      }
+
+      default:
+        return { ok: true, message: `${user.name} used the ${item.name}.` };
+    }
+  }
+
+  private partyCanBattle(user: AuthenticatedUser) {
+    return user.pokemonParty.some((pokemon) => pokemon.hp > 0);
+  }
+
+  /** Poke Radar: forces a wild encounter from the tall grass you're standing in. */
+  private async usePokeRadar(
+    player: Player,
+    user: AuthenticatedUser,
+    item: InventoryItem
+  ): Promise<UseInventoryItemResult> {
+    if (!this.partyCanBattle(user)) {
+      return { ok: false, message: "Your Venomon are in no condition to battle." };
+    }
+    const grass = this.getGrassCellForPlayer(player);
+    if (!grass || (grass.pokemonIds.length === 0 && !grass.encounterRows?.length)) {
+      return { ok: false, message: "There's no tall grass to search here." };
+    }
+    await this.startWildBattle(player, grass);
+    return { ok: true, message: `The ${item.name} found a rustling patch of grass!` };
+  }
+
+  /** The map's shared grass encounter table (fishing fallback pool). */
+  private getMapEncounterTable(
+    editorData:
+      | { grass: Array<{ pokemonIds: string[]; minLevel: number; maxLevel: number; encounterRows?: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }> }> }
+      | undefined
+  ) {
+    const carrier = (editorData?.grass ?? []).find(
+      (cell) => (cell.encounterRows?.length ?? 0) > 0 || cell.pokemonIds.length > 0
+    );
+    if (!carrier) {
+      return null;
+    }
+    return {
+      pokemonIds: carrier.pokemonIds,
+      minLevel: carrier.minLevel,
+      maxLevel: carrier.maxLevel,
+      encounterRows: carrier.encounterRows
+    };
+  }
+
+  private isCellBlockedForPlayer(player: Player, cell: { x: number; y: number }, cellSize: number) {
+    return this.world.isRectBlockedForPlayer(
+      player,
+      cell.x * cellSize,
+      cell.y * cellSize,
+      player.width,
+      player.height
+    );
+  }
+
+  /**
+   * Fishing: casts at the water tile the player faces. Uses a fishing-spot
+   * placement when one is in front (rod-tier gated), otherwise falls back to
+   * the map's grass encounter table when facing a blocked/water tile.
+   */
+  private async useFishingRod(
+    player: Player,
+    user: AuthenticatedUser,
+    tier: FishingRodTier,
+    item: InventoryItem
+  ): Promise<UseInventoryItemResult> {
+    if (!this.partyCanBattle(user)) {
+      return { ok: false, message: "Your Venomon are in no condition to battle." };
+    }
+
+    const snapshot = this.world.getPlayableMapsState();
+    const map = snapshot?.items.find((candidate) => candidate.id === player.currentMapId);
+    const editorData = snapshot?.editorDataByMapId[player.currentMapId];
+    const cellSize = map?.playableMapConfig?.cellSize ?? 32;
+    const facing = player.getFacingCell(cellSize);
+    const rodOrder: Record<FishingRodTier, number> = { old: 0, good: 1, super: 2 };
+
+    const spot = (editorData?.fishingSpots ?? []).find(
+      (candidate) => candidate.x === facing.x && candidate.y === facing.y
+    );
+    if (spot) {
+      if (spot.rod && rodOrder[tier] < rodOrder[spot.rod]) {
+        return { ok: false, message: `The ${item.name} isn't strong enough to fish here.` };
+      }
+      return this.castFishing(
+        player,
+        { pokemonIds: spot.pokemonIds, minLevel: spot.minLevel, maxLevel: spot.maxLevel, encounterRows: spot.encounterRows },
+        tier,
+        item
+      );
+    }
+
+    // No fishing spot: allow casting only when facing a blocked tile (water /
+    // map edge), drawing from the map's grass table as a fallback pool.
+    if (!this.isCellBlockedForPlayer(player, facing, cellSize)) {
+      return { ok: false, message: "You can't fish here. Face the water first." };
+    }
+    const table = this.getMapEncounterTable(editorData);
+    if (!table) {
+      return { ok: true, message: "Not even a nibble..." };
+    }
+    return this.castFishing(player, table, tier, item);
+  }
+
+  private async castFishing(
+    player: Player,
+    table: { pokemonIds: string[]; minLevel: number; maxLevel: number; encounterRows?: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }> },
+    tier: FishingRodTier,
+    item: InventoryItem
+  ): Promise<UseInventoryItemResult> {
+    const biteChance = tier === "super" ? 0.9 : tier === "good" ? 0.7 : 0.5;
+    if (Math.random() > biteChance) {
+      return { ok: true, message: "Not even a nibble..." };
+    }
+    const levelCap: Record<FishingRodTier, number> = { old: 15, good: 30, super: 60 };
+    const gated = {
+      pokemonIds: table.pokemonIds,
+      minLevel: table.minLevel,
+      maxLevel: Math.max(table.minLevel, Math.min(table.maxLevel, levelCap[tier])),
+      encounterRows: table.encounterRows
+    };
+    await this.startWildBattle(player, gated);
+    return { ok: true, message: `Oh! A bite! Something's on the ${item.name}!` };
+  }
+
+  /**
+   * Dowsing Machine / Itemfinder: pings the nearest hidden ground item on the
+   * map, revealing it once you're on top of it.
+   */
+  private useDowsing(player: Player, item: InventoryItem): UseInventoryItemResult {
+    const snapshot = this.world.getPlayableMapsState();
+    const map = snapshot?.items.find((candidate) => candidate.id === player.currentMapId);
+    const cellSize = map?.playableMapConfig?.cellSize ?? 32;
+    const nearest = this.world.findNearestHiddenGroundItem(player, cellSize);
+
+    if (!nearest) {
+      return { ok: true, message: `The ${item.name} stays silent... no response.` };
+    }
+    if (nearest.distanceTiles <= 1) {
+      const revealed = this.world.revealGroundItem(nearest.item.id);
+      return {
+        ok: true,
+        message: `The ${item.name} reacts! You found ${revealed?.itemName ?? "a hidden item"}!`
+      };
+    }
+    return {
+      ok: true,
+      message: `The ${item.name} points ${nearest.direction} — about ${nearest.distanceTiles} tiles away.`
+    };
   }
 
   public async teachInventoryMove(
