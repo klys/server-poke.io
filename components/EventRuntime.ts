@@ -81,7 +81,10 @@ class JumpToLabel {
 }
 
 // RMXP script effects the runtime understands (pbAddPokemon etc.).
-const RE_ADD_POKEMON = /pbAddPokemon\(\s*PBSpecies::(\w+)\s*,\s*(\d+)/i;
+// Accepts both the legacy `PBSpecies::NAME` and the modern `:NAME` symbol
+// forms, with an optional `Kernel.` prefix (gift events are often authored as
+// `Kernel.pbAddPokemon(:ARIADOS,35)`) — mirrors RE_WILD_BATTLE below.
+const RE_ADD_POKEMON = /(?:Kernel\.)?pbAddPokemon\(\s*(?:PBSpecies::|:)(\w+)\s*,\s*(\d+)/i;
 const RE_RECEIVE_ITEM = /pbReceive(?:Item)?\(\s*(?:PBItems::|:)(\w+)/i;
 // pbItemBall(:POTION) — visible item balls; also used by hidden items.
 const RE_ITEM_BALL = /pbItemBall\(\s*(?:PBItems::|:)(\w+)/i;
@@ -943,6 +946,44 @@ export default class EventRuntime {
           // Same idea for static wild encounters: catching/defeating the
           // venomon selects the branch that consumes the overworld event.
           return this.runScriptedWildBattle(session, wildBattle[1], Number(wildBattle[2]));
+        }
+        const giftPokemon = test.text.match(RE_ADD_POKEMON);
+        if (giftPokemon) {
+          // Hidden/gift venomons are authored as `Conditional Branch:
+          // pbAddPokemon(:SPECIES, level)` — the grant IS the condition, and
+          // the then-branch sets the Self Switch that consumes the event.
+          // Only hand it over when there is an empty team slot; when the party
+          // is full we refuse (return false, so the event is NOT consumed) and
+          // ask the player to make room and come back.
+          const result = await this.auth.givePokemonBySpecies(
+            session.userId,
+            giftPokemon[1],
+            Number(giftPokemon[2]),
+            { boxWhenFull: false }
+          );
+          if (result.ok) {
+            this.emitStep(session, {
+              type: "info",
+              npcName: session.npcName,
+              text: `¡Has recibido a ${result.pokemonName}!`
+            });
+            await this.waitAdvance(session.userId);
+            await this.refreshSession(session);
+            return true;
+          }
+          if (result.partyFull) {
+            this.emitStep(session, {
+              type: "info",
+              npcName: session.npcName,
+              text: "No tienes espacio en tu equipo. Haz sitio en tu equipo y vuelve más tarde."
+            });
+            await this.waitAdvance(session.userId);
+            return false;
+          }
+          // Misconfigured gift (unknown species / missing account): grant
+          // nothing and leave the event unconsumed so it can be fixed and
+          // retried, rather than silently burning it.
+          return false;
         }
         // Item balls are usually authored as script conditions whose branch
         // body sets Self Switch A. Granting here (and failing the test when

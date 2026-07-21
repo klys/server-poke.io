@@ -1480,8 +1480,9 @@ export default class Auth {
     public async givePokemonBySpecies(
         userId:number,
         internalName:string,
-        level:number
-    ):Promise<{ ok:true; pokemonName:string; boxed:boolean } | { ok:false; message:string }> {
+        level:number,
+        options:{ boxWhenFull?:boolean } = {}
+    ):Promise<{ ok:true; pokemonName:string; boxed:boolean } | { ok:false; message:string; partyFull?:boolean }> {
         const pokemonId = `pokemon-${String(internalName).toUpperCase()}`;
         const resolved = await this.readPokemonProfileById(pokemonId);
         if (!resolved) {
@@ -1546,7 +1547,14 @@ export default class Auth {
             return { ok: true, pokemonName: resolved.name, boxed: false };
         }
 
-        // Party full: send to PC storage so nothing is lost.
+        // Party full. Gift events (pbAddPokemon authored as a conditional
+        // branch) want the player to make room and come back, so the caller
+        // can opt out of the box fallback and be told the party is full.
+        if (options.boxWhenFull === false) {
+            return { ok: false, message: "Party is full.", partyFull: true };
+        }
+
+        // Otherwise send to PC storage so nothing is lost.
         await this.addPokemonToStorage(userId, summary);
         return { ok: true, pokemonName: resolved.name, boxed: true };
     }
