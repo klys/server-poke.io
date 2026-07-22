@@ -190,6 +190,15 @@ export interface PokemonSummary {
     heldItemId?:string;
     heldItemName?:string;
     pendingMoveLearns?:string[];
+    /**
+     * Egg state. An egg is a real (already-rolled) level-1 Pokemon that the
+     * player cannot use in battle and that is hidden as a "Huevo" in the UI
+     * until it hatches. `eggStepsToHatch` counts down as the player walks; when
+     * it reaches 0 the egg hatches in place (isEgg cleared) into the species it
+     * was created for. Absent/false = an ordinary Pokemon.
+     */
+    isEgg?:boolean;
+    eggStepsToHatch?:number;
     // Read-only enrichment for admin/UX surfaces (see InventoryItem.iconSrc).
     iconImageSrc?:string;
     frontImageSrc?:string;
@@ -345,6 +354,15 @@ const DEFAULT_INVENTORY:InventoryItem[] = [
 const DEFAULT_POKEMON_PARTY:PokemonSummary[] = [];
 export const MAX_POKEMON_PARTY_SIZE = 6;
 export const POKEMON_BOX_CAPACITY = 30;
+/**
+ * How many walked tiles a freshly received egg takes to hatch when the species
+ * carries no `hatchSteps` metadata. Tuned for our engine (a few minutes of
+ * walking) rather than the very high vanilla-Essentials counts. A species'
+ * own `hatchSteps` (when present) overrides this, clamped to a sane range.
+ */
+export const DEFAULT_EGG_HATCH_STEPS = 500;
+const MIN_EGG_HATCH_STEPS = 50;
+const MAX_EGG_HATCH_STEPS = 10000;
 const DEFAULT_BATTLE_HISTORY:BattleHistoryEntry[] = [];
 const DEFAULT_MONEY = 1000;
 const MAX_BATTLE_HISTORY_ITEMS = 50;
@@ -408,6 +426,15 @@ export default class Auth {
     private readonly passwordResetTtlSeconds:number;
     private readonly accountDeletionTtlSeconds:number;
     private roleDefinitionsCache:{ roles:RoleDefinition[]; expiresAt:number } | null = null;
+    /**
+     * Per-user "does the party currently hold at least one egg" hint, so the
+     * per-tile hatch ticker can skip a Redis read for the overwhelming majority
+     * of players who carry no egg. `false` = confirmed no egg (fast-skip);
+     * `true` = has an egg (tick it); absent = unknown (resolve once from Redis).
+     * Any write that could change egg membership calls markPartyChanged() to
+     * invalidate the entry.
+     */
+    private readonly eggPresenceByUserId = new Map<number, boolean>();
 
     constructor(redis:RedisClientType, mailService:MailService) {
         this.redis = redis;
@@ -546,6 +573,7 @@ export default class Auth {
 
         if (state.pokemonParty) {
             fields.pokemon_party = JSON.stringify(this.sanitizePokemonPartyForStorage(state.pokemonParty));
+            this.markPartyChanged(userId);
         }
 
         if (state.inventory) {
@@ -1581,21 +1609,26 @@ export default class Auth {
      * "BULBASAUR") at a level, mirroring chooseStarter's stat rules. Used by the
      * event runtime for `pbAddPokemon`. Species ids follow `pokemon-<NAME>`.
      */
-    public async givePokemonBySpecies(
-        userId:number,
+    /**
+     * Rolls a fresh {@link PokemonSummary} for a species at a given level
+     * (IVs, HP, level-appropriate moves). Shared by the plain gift path and the
+     * egg generator so a hatched egg is identical to a normally received mon.
+     * Returns the species' `hatchSteps` metadata alongside for egg creation.
+     */
+    private async buildSpeciesSummary(
         internalName:string,
-        level:number,
-        options:{ boxWhenFull?:boolean } = {}
-    ):Promise<{ ok:true; pokemonName:string; boxed:boolean } | { ok:false; message:string; partyFull?:boolean }> {
+        level:number
+    ):Promise<{ summary:PokemonSummary; hatchSteps:number } | null> {
         const pokemonId = `pokemon-${String(internalName).toUpperCase()}`;
         const resolved = await this.readPokemonProfileById(pokemonId);
         if (!resolved) {
-            return { ok: false, message: `Unknown species ${internalName}.` };
+            return null;
         }
 
         const profile = resolved.profile as {
             hp?:unknown;
             elements?:unknown;
+            hatchSteps?:unknown;
             skills?:Array<{ skillName?:unknown; level?:unknown }>;
         };
         const lvl = Math.max(1, Math.min(100, Math.round(level)));
@@ -1637,6 +1670,27 @@ export default class Auth {
             statBonuses: createEmptyPokemonStatBonuses()
         };
 
+        const rawHatchSteps = Number(profile.hatchSteps);
+        const hatchSteps = Number.isFinite(rawHatchSteps) && rawHatchSteps > 0
+            ? Math.min(MAX_EGG_HATCH_STEPS, Math.max(MIN_EGG_HATCH_STEPS, Math.round(rawHatchSteps)))
+            : DEFAULT_EGG_HATCH_STEPS;
+
+        return { summary, hatchSteps };
+    }
+
+    public async givePokemonBySpecies(
+        userId:number,
+        internalName:string,
+        level:number,
+        options:{ boxWhenFull?:boolean } = {}
+    ):Promise<{ ok:true; pokemonName:string; boxed:boolean } | { ok:false; message:string; partyFull?:boolean }> {
+        const built = await this.buildSpeciesSummary(internalName, level);
+        if (!built) {
+            return { ok: false, message: `Unknown species ${internalName}.` };
+        }
+        const summary = built.summary;
+        const resolved = { id: summary.sourcePokemonId!, name: summary.name };
+
         const user = await this.getUserById(String(userId));
         if (!user) {
             return { ok: false, message: "Account not found." };
@@ -1648,6 +1702,7 @@ export default class Auth {
             await this.redis.hSet(this.userKey(userId), {
                 pokemon_party: JSON.stringify(party)
             });
+            this.markPartyChanged(userId);
             return { ok: true, pokemonName: resolved.name, boxed: false };
         }
 
@@ -1661,6 +1716,108 @@ export default class Auth {
         // Otherwise send to PC storage so nothing is lost.
         await this.addPokemonToStorage(userId, summary);
         return { ok: true, pokemonName: resolved.name, boxed: true };
+    }
+
+    /**
+     * Gives the player an egg for a species. Egg-giving events (the "REGALA
+     * HUEVO" NPC's `pbGenerateEgg`, and any future egg item) require a free
+     * PARTY slot — an egg can only be carried in the team, never boxed by the
+     * giver — so when the party is full we refuse with `partyFull` so the
+     * event is not consumed and the player is told to make room and return.
+     */
+    public async giveEggBySpecies(
+        userId:number,
+        internalName:string
+    ):Promise<{ ok:true; speciesName:string } | { ok:false; message:string; partyFull?:boolean }> {
+        const built = await this.buildSpeciesSummary(internalName, 1);
+        if (!built) {
+            return { ok: false, message: `Unknown species ${internalName}.` };
+        }
+
+        const user = await this.getUserById(String(userId));
+        if (!user) {
+            return { ok: false, message: "Account not found." };
+        }
+
+        const party = Array.isArray(user.pokemonParty) ? [...user.pokemonParty] : [];
+        if (party.length >= MAX_POKEMON_PARTY_SIZE) {
+            return { ok: false, message: "Party is full.", partyFull: true };
+        }
+
+        const egg:PokemonSummary = {
+            ...built.summary,
+            level: 1,
+            isEgg: true,
+            eggStepsToHatch: built.hatchSteps
+        };
+        party.push(egg);
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
+        });
+        this.eggPresenceByUserId.set(userId, true);
+        return { ok: true, speciesName: built.summary.name };
+    }
+
+    /**
+     * Advances every egg in the player's party by one walked tile. Returns any
+     * eggs that hatched this step so the caller can notify the player and push
+     * the refreshed party. Uses an in-memory presence hint to skip a Redis read
+     * for players who carry no egg (the common case). Called once per new tile
+     * from the movement step handler.
+     */
+    public async tickEggSteps(
+        userId:number
+    ):Promise<{ user:AuthenticatedUser | null; hatched:Array<{ name:string }> }> {
+        if (this.eggPresenceByUserId.get(userId) === false) {
+            return { user: null, hatched: [] };
+        }
+
+        const user = await this.getUserById(String(userId));
+        const party = Array.isArray(user?.pokemonParty) ? [...(user!.pokemonParty)] : [];
+        const eggIndexes = party
+            .map((pokemon, index) => (pokemon.isEgg ? index : -1))
+            .filter((index) => index >= 0);
+
+        if (eggIndexes.length === 0) {
+            this.eggPresenceByUserId.set(userId, false);
+            return { user: null, hatched: [] };
+        }
+
+        const hatched:Array<{ name:string }> = [];
+        let stillHasEgg = false;
+        for (const index of eggIndexes) {
+            const egg = party[index];
+            const remaining = Math.max(0, (Number(egg.eggStepsToHatch) || 0) - 1);
+            if (remaining <= 0) {
+                // Hatch in place: the egg was a fully-rolled level-1 Pokemon all
+                // along, so we just reveal it.
+                party[index] = { ...egg, isEgg: undefined, eggStepsToHatch: undefined };
+                hatched.push({ name: egg.name });
+            } else {
+                party[index] = { ...egg, eggStepsToHatch: remaining };
+                stillHasEgg = true;
+            }
+        }
+
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
+        });
+        this.eggPresenceByUserId.set(userId, stillHasEgg);
+
+        // Only re-read the authoritative user (for the client push) when
+        // something actually hatched; a plain decrement needs no UI refresh.
+        return {
+            user: hatched.length > 0 ? await this.getUserById(String(userId)) : null,
+            hatched
+        };
+    }
+
+    /**
+     * Invalidates the cached egg-presence hint for a user after any write that
+     * could change which Pokemon (if any) is an egg in their party.
+     */
+    private markPartyChanged(userId:number) {
+        this.eggPresenceByUserId.delete(userId);
     }
 
     private async sendPostRegistrationEmails(user:AuthenticatedUser) {
@@ -2525,7 +2682,16 @@ export default class Auth {
                         Number.isFinite(pokemon.nextLevelExperience)
                             ? Math.max(0, Math.round(pokemon.nextLevelExperience))
                             : 100,
-                    statBonuses: sanitizePokemonStatBonuses(pokemon.statBonuses)
+                    statBonuses: sanitizePokemonStatBonuses(pokemon.statBonuses),
+                    // Preserve egg state. A non-egg drops both fields so stale
+                    // egg data can never linger on a hatched Pokemon.
+                    isEgg: pokemon.isEgg === true ? true : undefined,
+                    eggStepsToHatch:
+                        pokemon.isEgg === true &&
+                        typeof pokemon.eggStepsToHatch === "number" &&
+                        Number.isFinite(pokemon.eggStepsToHatch)
+                            ? Math.max(0, Math.round(pokemon.eggStepsToHatch))
+                            : undefined
                 };
             });
     }
@@ -2692,6 +2858,7 @@ export default class Auth {
             pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party)),
             pokemon_box: this.serializePokemonStorage(boxes)
         });
+        this.markPartyChanged(userId);
 
         const displayName = deposited.nickname || deposited.name;
         return {
@@ -2734,6 +2901,7 @@ export default class Auth {
             pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party)),
             pokemon_box: this.serializePokemonStorage(boxes)
         });
+        this.markPartyChanged(userId);
 
         const displayName = withdrawn.nickname || withdrawn.name;
         return {

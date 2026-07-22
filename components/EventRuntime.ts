@@ -85,6 +85,12 @@ class JumpToLabel {
 // forms, with an optional `Kernel.` prefix (gift events are often authored as
 // `Kernel.pbAddPokemon(:ARIADOS,35)`) — mirrors RE_WILD_BATTLE below.
 const RE_ADD_POKEMON = /(?:Kernel\.)?pbAddPokemon\(\s*(?:PBSpecies::|:)(\w+)\s*,\s*(\d+)/i;
+// pbGenerateEgg(:EEVEE, _I("Encargada")) — the "REGALA HUEVO" day-care NPC and
+// any egg-giving item. Like pbAddPokemon it is authored as a conditional-branch
+// script whose then-branch sets the Self Switch, but it hands over an EGG that
+// hatches after walking. Only the species matters here; the obtain text arg is
+// flavour and ignored.
+const RE_GENERATE_EGG = /(?:Kernel\.)?pbGenerateEgg\(\s*(?:PBSpecies::|:)(\w+)/i;
 const RE_RECEIVE_ITEM = /pbReceive(?:Item)?\(\s*(?:PBItems::|:)(\w+)/i;
 // pbItemBall(:POTION) — visible item balls; also used by hidden items.
 const RE_ITEM_BALL = /pbItemBall\(\s*(?:PBItems::|:)(\w+)/i;
@@ -993,6 +999,34 @@ export default class EventRuntime {
           // retried, rather than silently burning it.
           return false;
         }
+        const eggGift = test.text.match(RE_GENERATE_EGG);
+        if (eggGift) {
+          // pbGenerateEgg mirrors the gift flow, but hands over an egg and
+          // strictly requires a free PARTY slot (an egg is never boxed). When
+          // full we refuse (return false, event not consumed) so the player can
+          // make room and come back — exactly what the NPC's dialogue promises.
+          const result = await this.auth.giveEggBySpecies(session.userId, eggGift[1]);
+          if (result.ok) {
+            this.emitStep(session, {
+              type: "info",
+              npcName: session.npcName,
+              text: "¡Has recibido un Huevo!"
+            });
+            await this.waitAdvance(session.userId);
+            await this.refreshSession(session);
+            return true;
+          }
+          if (result.partyFull) {
+            this.emitStep(session, {
+              type: "info",
+              npcName: session.npcName,
+              text: "No tienes espacio en tu equipo. Haz sitio para el Huevo y vuelve más tarde."
+            });
+            await this.waitAdvance(session.userId);
+            return false;
+          }
+          return false;
+        }
         // Item balls are usually authored as script conditions whose branch
         // body sets Self Switch A. Granting here (and failing the test when
         // nothing could be granted) means the ball is only consumed when the
@@ -1134,6 +1168,25 @@ export default class EventRuntime {
             : `You received ${result.pokemonName}!`
         });
         await this.waitAdvance(session.userId);
+        await this.refreshSession(session);
+      }
+      return;
+    }
+
+    const generateEgg = text.match(RE_GENERATE_EGG);
+    if (generateEgg) {
+      // Egg authored as a plain Script command. Same rule as the gift path: an
+      // egg needs a free party slot, otherwise the player is told to make room.
+      const result = await this.auth.giveEggBySpecies(session.userId, generateEgg[1]);
+      this.emitStep(session, {
+        type: "info",
+        npcName: session.npcName,
+        text: result.ok
+          ? "¡Has recibido un Huevo!"
+          : "No tienes espacio en tu equipo para el Huevo."
+      });
+      await this.waitAdvance(session.userId);
+      if (result.ok) {
         await this.refreshSession(session);
       }
       return;

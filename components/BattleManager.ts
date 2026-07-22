@@ -281,6 +281,8 @@ type BattleSide = {
   money: number;
   inventory: InventoryItem[];
   party: BattlePokemon[];
+  /** Eggs held out of battle (can't fight); re-merged into the saved party. */
+  heldEggs?: Array<{ index: number; summary: PokemonSummary }>;
   activeIndex: number;
   action: BattleQueuedAction | null;
   escapeAttempts: number;
@@ -711,6 +713,10 @@ export default class BattleManager {
   private readonly battles = new Map<string, BattleSession>();
   private readonly playerBattleIds = new Map<string, string>();
   private readonly lastGrassCellByPlayerId = new Map<string, string>();
+  /** Per-cell dedupe for egg hatch steps (every tile, not just grass). */
+  private readonly lastEggStepCellByPlayerId = new Map<string, string>();
+  /** In-flight guard so a fast walker can't race two egg ticks at once. */
+  private readonly pendingEggTicks = new Set<string>();
   private readonly pendingStepChecks = new Set<string>();
   /** Remaining Repel steps per player (in-grass encounters skipped while >0). */
   private readonly repelStepsByPlayerId = new Map<string, number>();
@@ -1460,7 +1466,8 @@ export default class BattleManager {
   }
 
   private partyCanBattle(user: AuthenticatedUser) {
-    return user.pokemonParty.some((pokemon) => pokemon.hp > 0);
+    // Eggs can't fight even though they have hp, so they don't count here.
+    return user.pokemonParty.some((pokemon) => !pokemon.isEgg && pokemon.hp > 0);
   }
 
   /** Poke Radar: forces a wild encounter from the tall grass you're standing in. */
@@ -2362,6 +2369,59 @@ export default class BattleManager {
       })
       .finally(() => {
         this.pendingStepChecks.delete(player.socketId);
+      });
+  }
+
+  /**
+   * Advances any egg in the player's party by one walked tile. Unlike wild
+   * encounters this fires on EVERY tile (not just grass), so it lives in its
+   * own handler with its own per-cell dedupe. Auth.tickEggSteps fast-skips
+   * players with no egg, so the common case costs a single Map lookup.
+   */
+  public handleEggStep(player: Player) {
+    if (player.userId === null || this.isPlayerBattling(player.socketId)) {
+      return;
+    }
+
+    const cellSize = 32;
+    const cellX = Math.floor((player.x + player.width / 2) / cellSize);
+    const cellY = Math.floor((player.y + player.height / 2) / cellSize);
+    const cellKey = `${player.currentMapId}:${cellX}:${cellY}`;
+    if (this.lastEggStepCellByPlayerId.get(player.socketId) === cellKey) {
+      return;
+    }
+    this.lastEggStepCellByPlayerId.set(player.socketId, cellKey);
+
+    if (this.pendingEggTicks.has(player.socketId)) {
+      return;
+    }
+    this.pendingEggTicks.add(player.socketId);
+
+    const userId = player.userId;
+    void this.auth
+      .tickEggSteps(userId)
+      .then((result) => {
+        if (result.hatched.length === 0) {
+          return;
+        }
+        if (result.user) {
+          this.emitToPlayer(player, "auth:session", {
+            authenticated: true,
+            user: result.user,
+            token: undefined
+          });
+        }
+        for (const egg of result.hatched) {
+          this.emitToPlayer(player, "auth:info", {
+            message: `¡Tu Huevo ha eclosionado en ${egg.name}!`
+          });
+        }
+      })
+      .catch((error) => {
+        console.error("Unable to advance egg steps:", error);
+      })
+      .finally(() => {
+        this.pendingEggTicks.delete(player.socketId);
       });
   }
 
@@ -3895,6 +3955,8 @@ export default class BattleManager {
             }));
             whiteoutSides.push(side);
           }
+          // Eggs sat out the battle (and any whiteout heal); restore them.
+          partySummaries = this.reinsertHeldEggs(side, partySummaries);
           await this.auth.saveBattleState(side.userId!, {
             pokemonParty: partySummaries,
             inventory: side.inventory,
@@ -5668,7 +5730,20 @@ export default class BattleManager {
     user: AuthenticatedUser,
     catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
   ): BattleSide {
-    const party = user.pokemonParty.map((pokemon) => {
+    // Eggs can never battle. Hold them aside (with their party position) so the
+    // battle logic never sees them, and re-merge them untouched when the party
+    // is written back after the fight (see reinsertHeldEggs).
+    const heldEggs: Array<{ index: number; summary: PokemonSummary }> = [];
+    const battleReadyParty: PokemonSummary[] = [];
+    user.pokemonParty.forEach((pokemon, index) => {
+      if (pokemon.isEgg) {
+        heldEggs.push({ index, summary: pokemon });
+      } else {
+        battleReadyParty.push(pokemon);
+      }
+    });
+
+    const party = battleReadyParty.map((pokemon) => {
       const sourceDefinition =
         (pokemon.sourcePokemonId ? catalogs.pokemonById.get(pokemon.sourcePokemonId) : undefined) ??
         [...catalogs.pokemonById.values()].find((definition) => definition.name.toLowerCase() === pokemon.name.toLowerCase()) ??
@@ -5686,11 +5761,31 @@ export default class BattleManager {
       money: user.money,
       inventory: user.inventory.map((item) => ({ ...item })),
       party,
+      heldEggs,
       // Start with the first mon able to battle (a fainted lead can't open).
       activeIndex: Math.max(0, party.findIndex((pokemon) => !isFainted(pokemon))),
       action: null,
       escapeAttempts: 0
     };
+  }
+
+  /**
+   * Re-inserts the eggs that were held out of battle back into a rebuilt party
+   * summary list at (approximately) their original party positions, so writing
+   * the post-battle party never drops the player's eggs.
+   */
+  private reinsertHeldEggs(side: BattleSide, partySummaries: PokemonSummary[]): PokemonSummary[] {
+    if (!side.heldEggs?.length) {
+      return partySummaries;
+    }
+    const merged = [...partySummaries];
+    // Ascending index order keeps earlier eggs from shifting later ones.
+    [...side.heldEggs]
+      .sort((left, right) => left.index - right.index)
+      .forEach(({ index, summary }) => {
+        merged.splice(Math.min(index, merged.length), 0, summary);
+      });
+    return merged;
   }
 
   private buildBattlePokemonFromSummary(

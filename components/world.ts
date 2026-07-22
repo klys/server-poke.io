@@ -599,6 +599,7 @@ export default class World {
 
     handlePlayerStep(player: Player) {
         this.battleManager?.handlePlayerStep(player);
+        this.battleManager?.handleEggStep(player);
         void this.handleGroundItemPickup(player);
         this.handleTouchEventStep(player);
     }
