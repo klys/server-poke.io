@@ -1785,6 +1785,86 @@ function createConnectionHandler(
       void eventRuntime.runAutorunForMap(socket.data.userId);
     });
 
+    socket.on("player:surf", async () => {
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player || player.inBattle || typeof socket.data.userId !== "number") {
+        return;
+      }
+      const result = await world.beginSurf(player, socket.data.userId);
+      if (!result.ok) {
+        socket.emit("player:field-skill-error", { skill: "surf", message: result.message ?? "" });
+      }
+    });
+
+    socket.on("player:dive", async () => {
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player || player.inBattle || typeof socket.data.userId !== "number") {
+        return;
+      }
+      const result = await world.tryDive(player, socket.data.userId);
+      if (!result.ok) {
+        socket.emit("player:field-skill-error", { skill: "dive", message: result.message ?? "" });
+        return;
+      }
+      if (result.mapChanged) {
+        world.players.set(player.socketId, player);
+        world.presentPlayerToMap(player);
+        player.socketConnections.forEach((socketId) => {
+          world.presentPlayersOnMapTo(socketId, player.currentMapId);
+        });
+        void eventRuntime.runAutorunForMap(socket.data.userId);
+      }
+    });
+
+    socket.on("player:waterfall", async () => {
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player || player.inBattle || typeof socket.data.userId !== "number") {
+        return;
+      }
+      const result = await world.tryWaterfall(player, socket.data.userId);
+      if (!result.ok) {
+        socket.emit("player:field-skill-error", { skill: "waterfall", message: result.message ?? "" });
+      }
+    });
+
+    socket.on("player:strength-push", async () => {
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player || player.inBattle || typeof socket.data.userId !== "number") {
+        return;
+      }
+      const result = await world.tryStrengthPush(player, socket.data.userId);
+      if (!result.ok) {
+        socket.emit("player:field-skill-error", { skill: "strength", message: result.message ?? "" });
+      }
+    });
+
+    socket.on("player:field-interact", async () => {
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player || player.inBattle || typeof socket.data.userId !== "number") {
+        return;
+      }
+      const userId = socket.data.userId;
+      // Resolve by state + terrain; stay silent when nothing applies (this fires
+      // on every action-button press that hit no NPC/event).
+      if (player.isSurfing) {
+        if ((await world.tryDive(player, userId)).ok) {
+          world.players.set(player.socketId, player);
+          world.presentPlayerToMap(player);
+          player.socketConnections.forEach((socketId) => {
+            world.presentPlayersOnMapTo(socketId, player.currentMapId);
+          });
+          void eventRuntime.runAutorunForMap(userId);
+          return;
+        }
+        await world.tryWaterfall(player, userId);
+        return;
+      }
+      if ((await world.beginSurf(player, userId)).ok) {
+        return;
+      }
+      await world.tryStrengthPush(player, userId);
+    });
+
     socket.on("shotProjectil", (data) => {
       world.shotProjectil(data.mouse_x,data.mouse_y, socket.id);
     });
@@ -2129,10 +2209,20 @@ function createConnectionHandler(
       const result = await battleManager.teachInventoryMove(
         socket.data.userId,
         data.itemId,
-        data.targetPokemonId
+        data.targetPokemonId,
+        data.replaceMoveName
       );
 
       if (!result.ok) {
+        if ("needsReplace" in result && result.needsReplace) {
+          socket.emit("inventory:teach-replace-needed", {
+            itemId: data.itemId,
+            targetPokemonId: data.targetPokemonId,
+            moveName: result.moveName ?? "",
+            moves: result.moves ?? []
+          });
+          return;
+        }
         socket.emit("auth:error", { message: result.message });
         return;
       }

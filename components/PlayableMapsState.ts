@@ -217,12 +217,22 @@ export type MapEditorFishingSpot = {
   }>;
 };
 
+/** A pushable Strength boulder at a cell (moved one cell by pbStrength / the
+ * player:strength-push field skill). None migrated from Venova yet — seed via
+ * editorData when authoring Strength puzzles. */
+export type MapEditorBoulder = {
+  id: string;
+  x: number;
+  y: number;
+};
+
 export type PlayableMapEditorData = {
   version: 1;
   objects: MapEditorObjectPlacement[];
   portals: MapEditorPortalPlacement[];
   grass: MapEditorGrassPlacement[];
   fishingSpots?: MapEditorFishingSpot[];
+  boulders?: MapEditorBoulder[];
   npcs: MapEditorNpcPlacement[];
   tileMap?: PlayableMapTileMapProfile;
   essentials?: {
@@ -587,6 +597,7 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
       portals: [],
       grass: [],
       fishingSpots: [],
+      boulders: [],
       npcs: [],
       essentials: undefined,
     };
@@ -703,6 +714,20 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
                     typeof row.weight === "number"
                 )
               : undefined,
+          }))
+      : [],
+    boulders: Array.isArray(candidate.boulders)
+      ? candidate.boulders
+          .filter(
+            (item): item is MapEditorBoulder =>
+              typeof item?.id === "string" &&
+              typeof item?.x === "number" &&
+              typeof item?.y === "number"
+          )
+          .map((item) => ({
+            id: item.id,
+            x: Math.max(0, clampInteger(item.x)),
+            y: Math.max(0, clampInteger(item.y)),
           }))
       : [],
     npcs: Array.isArray(candidate.npcs)

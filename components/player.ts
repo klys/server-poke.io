@@ -18,6 +18,8 @@ export default class Player {
     speedMultiplier:number = 1;
     /** True while the Bicycle is out (drives speedMultiplier and the sprite). */
     cycling:boolean = false;
+    /** True while Surf is active: water-tagged solid cells become passable. */
+    isSurfing:boolean = false;
     socketId:string;
     socketConnections:Set<string>;
     userId:number | null;
@@ -392,6 +394,8 @@ export default class Player {
     public teleport(mapId:string, x:number, y:number) {
         const nextPosition = this.world.resolveOpenPlayerPosition(mapId, x, y, this.width, this.height);
 
+        // Landing anywhere via teleport/Fly ends surfing (destinations are land).
+        this.isSurfing = false;
         this.currentMapId = mapId;
         this.x = nextPosition.x;
         this.y = nextPosition.y;

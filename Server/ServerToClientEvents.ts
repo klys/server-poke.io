@@ -194,6 +194,21 @@ export default interface ServerToClientEvents {
   "portal:used": (data: { mapId: string }) => void;
   // Volar (Fly) request rejected — the world-map window shows the message.
   "player:fly-error": (data: { message: string }) => void;
+  // A field skill (Surf/Dive/Strength/Waterfall/Cut/Rock Smash) could not be
+  // used — the client shows the message near the player.
+  "player:field-skill-error": (data: { skill: string; message: string }) => void;
+  // Surf started/ended for the local player (drives the surf sprite + prompt).
+  "player:surf-state": (data: { surfing: boolean }) => void;
+  // A Strength boulder moved to a new cell (all clients on the map re-render it).
+  "world:boulder-moved": (data: { mapId: string; boulderId: string; x: number; y: number }) => void;
+  // Teaching an MO/MT to a Venomon that already knows four moves: the client
+  // must ask which move to replace, then re-send inventory:teach-move with it.
+  "inventory:teach-replace-needed": (data: {
+    itemId: string;
+    targetPokemonId: string;
+    moveName: string;
+    moves: string[];
+  }) => void;
   // A used bag key item asks the client to open a window / toggle a mode
   // (e.g. Town Map -> open the world map). No party state changed.
   "inventory:action": (data: {

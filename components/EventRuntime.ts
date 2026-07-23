@@ -11,6 +11,7 @@ import {
   resolveInitialSpawnFromPlayableMapsState,
   sanitizeNpcStoreItems,
 } from "./PlayableMapsState";
+import { ERASED_SELF_SWITCH } from "./eventPageSelection";
 
 type TypedSocketServer = Server<
   ClientToServerEvents,
@@ -126,6 +127,14 @@ const RE_POKEMON_PC = /pbPokeCenterPC|pbTrainerPC/i;
 const RE_SE_PLAY = /pbSEPlay\(\s*"([^"]+)"/i;
 const RE_PB_WAIT = /pbWait\(\s*(\d+)\s*\)/i;
 const RE_BUTTON_SCREEN = /pbEventScreen\(\s*ButtonEventScene\s*\)/i;
+
+// Field-skill (MO/HM) obstacle events. Cut trees + Rock Smash rocks are authored
+// as a conditional branch gated by pbCut / pbRockSmash whose body erases the
+// event (pbEraseThisEvent) and, for rocks, rolls a wild encounter.
+const RE_CUT = /pbCut\b/i;
+const RE_ROCKSMASH_COND = /pbRockSmash(?!Random)/i;
+const RE_ERASE_EVENT = /pbEraseThisEvent/i;
+const RE_ROCKSMASH_ENCOUNTER = /pbRockSmashRandomEncounter/i;
 
 // Venova gender pick (pbChangePlayer 0/1) -> migrated protagonist skins.
 const PLAYER_SKIN_BY_INDEX: Record<string, string> = {
@@ -1057,6 +1066,27 @@ export default class EventRuntime {
           const badges = await this.auth.getBadges(session.userId);
           return badges.includes(Number(hasBadge[1]));
         }
+        // Field-skill obstacle gates (Cut trees, Rock Smash rocks): the branch —
+        // whose body erases the obstacle — only runs when a party Venomon knows
+        // the move. Otherwise the obstacle stays put and we hint what's needed.
+        const isCut = RE_CUT.test(test.text);
+        if (isCut || RE_ROCKSMASH_COND.test(test.text)) {
+          const skill = isCut ? "cut" : "rocksmash";
+          const knows = this.battleManager
+            ? await this.battleManager.partyKnowsFieldSkill(session.userId, skill)
+            : false;
+          if (!knows) {
+            this.emitStep(session, {
+              type: "info",
+              npcName: session.npcName,
+              text: isCut
+                ? "Parece que un árbol fino bloquea el paso. Se podría talar con Corte."
+                : "Una roca resquebrajada bloquea el paso. Se podría romper con Golpe Roca."
+            });
+            await this.waitAdvance(session.userId);
+          }
+          return knows;
+        }
         // Unknown script tests keep the old permissive behavior.
         return true;
       }
@@ -1152,6 +1182,22 @@ export default class EventRuntime {
   /** Returns "exit" when the rest of the event must not run (e.g. an
    *  unresolved wild encounter whose later commands would consume it). */
   private async applyScript(session: Session, text: string): Promise<"exit" | undefined> {
+    // Cut / Rock Smash body: remove the obstacle (persist + push immediately so
+    // it vanishes for this player even if a rock-smash encounter starts next),
+    // then optionally roll a wild encounter for rocks.
+    if (RE_ERASE_EVENT.test(text)) {
+      session.pendingWrites.selfSwitches[`${session.selfSwitchPrefix}${ERASED_SELF_SWITCH}`] = true;
+      await this.flushEventWrites(session);
+      await this.emitEventState(session.userId);
+      return;
+    }
+    if (RE_ROCKSMASH_ENCOUNTER.test(text)) {
+      if (this.battleManager) {
+        await this.battleManager.tryRockSmashEncounter(session.userId, session.player);
+      }
+      return;
+    }
+
     const addPokemon = text.match(RE_ADD_POKEMON);
     if (addPokemon) {
       const result = await this.auth.givePokemonBySpecies(

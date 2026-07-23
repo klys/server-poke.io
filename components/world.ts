@@ -4,6 +4,13 @@ import GameMath from "./gameMath";
 import Pathfinding = require("pathfinding")
 import type { MapEditorPortalPlacement, PlayableMapsStateSnapshot } from "./PlayableMapsState";
 import { isSolidCollisionCell, type MapCollisionGrid } from "./TileMapGrid";
+import {
+    decodeU8RleGrid,
+    isSurfableWaterTag,
+    isDeepWaterTag,
+    isWaterfallTag
+} from "./terrainTags";
+import { resolveDivePair } from "./diveMaps";
 import type BattleManager from "./BattleManager";
 import GroundItemStore, { type GroundItem } from "./GroundItemStore";
 import {
@@ -45,6 +52,8 @@ export default class World {
     objectsByMapId: Map<string, MapObstacle[]>;
     mapBoundsByMapId: Map<string, MapBounds>;
     collisionGridsByMapId: Map<string, MapCollisionGrid>;
+    /** Lazily-decoded per-cell terrain-tag grid per map (null = no tags). */
+    private terrainGridsByMapId = new Map<string, { width: number; height: number; cellSize: number; tags: Uint8Array } | null>();
     playableMapsState: PlayableMapsStateSnapshot | null;
     battleManager: BattleManager | null;
     groundItems: Map<string, GroundItem>;
@@ -261,6 +270,8 @@ export default class World {
             } else {
                 this.collisionGridsByMapId.delete(definition.mapId);
             }
+            // Terrain grids are lazily re-derived from the fresh collision dims.
+            this.terrainGridsByMapId.delete(definition.mapId);
         });
     }
 
@@ -272,12 +283,202 @@ export default class World {
         return this.collisionGridsByMapId.get(mapId) ?? null;
     }
 
+    /** Decoded terrain-tag grid for a map (lazy; cached; null when unavailable). */
+    private getTerrainGrid(mapId: string) {
+        if (this.terrainGridsByMapId.has(mapId)) {
+            return this.terrainGridsByMapId.get(mapId) ?? null;
+        }
+        const collision = this.collisionGridsByMapId.get(mapId);
+        const tileMap = this.playableMapsState?.editorDataByMapId?.[mapId]?.tileMap;
+        let result: { width: number; height: number; cellSize: number; tags: Uint8Array } | null = null;
+        if (collision && tileMap?.terrainTags) {
+            const tags = decodeU8RleGrid(tileMap.terrainTags, collision.width * collision.height);
+            if (tags) {
+                result = { width: collision.width, height: collision.height, cellSize: collision.cellSize, tags };
+            }
+        }
+        this.terrainGridsByMapId.set(mapId, result);
+        return result;
+    }
+
+    /** Terrain tag at a cell (0 when out of range / no terrain data). */
+    getTerrainTagAtCell(mapId: string, cellX: number, cellY: number): number {
+        const grid = this.getTerrainGrid(mapId);
+        if (!grid || cellX < 0 || cellY < 0 || cellX >= grid.width || cellY >= grid.height) {
+            return 0;
+        }
+        return grid.tags[cellY * grid.width + cellX];
+    }
+
+    /** The terrain tag of the cell the player currently occupies. */
+    getPlayerTerrainTag(player: Player): number {
+        const cellSize = this.getMapCellSize(player.currentMapId);
+        const cell = player.getCurrentCell(cellSize);
+        return this.getTerrainTagAtCell(player.currentMapId, cell.x, cell.y);
+    }
+
+    /** The map's collision-cell size (px), defaulting to 32. */
+    getMapCellSize(mapId: string): number {
+        return this.collisionGridsByMapId.get(mapId)?.cellSize ?? 32;
+    }
+
+    /** Place a player at an exact cell and broadcast, bypassing the open-position
+     * search (Surf/Dive deliberately land on water, which is otherwise solid). */
+    private forcePlayerToCell(player: Player, mapId: string, cellX: number, cellY: number) {
+        const cellSize = this.getMapCellSize(mapId);
+        player.currentMapId = mapId;
+        player.x = cellX * cellSize;
+        player.y = cellY * cellSize;
+        player.path = [];
+        player.path_pos = 0;
+        player.lastTouchCellKey = `${mapId}:${cellX}:${cellY}`;
+        player.touchLockUntil = Date.now() + 300;
+        this.persistPlayerLocation(player);
+        World.socketServer.emit("move" + player.socketId, {
+            x: player.x,
+            y: player.y,
+            angle: player.angle,
+            playerId: player.socketId,
+            id: player.id,
+            currentMapId: player.currentMapId,
+            teleported: true
+        });
+    }
+
+    /** Tell the player's client whether Surf is active (sprite / prompt state). */
+    private emitSurfState(player: Player) {
+        player.socketConnections.forEach((socketId) => {
+            World.socketServer.to(socketId).emit("player:surf-state", { surfing: player.isSurfing });
+        });
+    }
+
+    /** Surf: from land facing water, mount the water and start surfing. */
+    async beginSurf(player: Player, userId: number): Promise<{ ok: boolean; message?: string }> {
+        if (player.isSurfing) {
+            return { ok: false, message: "Ya estás surfeando." };
+        }
+        const knows = this.battleManager
+            ? await this.battleManager.partyKnowsFieldSkill(userId, "surf")
+            : false;
+        if (!knows) {
+            return { ok: false, message: "Ningún Venomon de tu equipo conoce Surf." };
+        }
+        const cellSize = this.getMapCellSize(player.currentMapId);
+        const facing = player.getFacingCell(cellSize);
+        if (!isSurfableWaterTag(this.getTerrainTagAtCell(player.currentMapId, facing.x, facing.y))) {
+            return { ok: false, message: "No hay agua por la que surfear." };
+        }
+        player.isSurfing = true;
+        this.forcePlayerToCell(player, player.currentMapId, facing.x, facing.y);
+        this.emitSurfState(player);
+        return { ok: true };
+    }
+
+    /** Dive: descend to the paired underwater map (over deep water), or resurface. */
+    async tryDive(player: Player, userId: number): Promise<{ ok: boolean; message?: string; mapChanged?: boolean }> {
+        const pair = resolveDivePair(player.currentMapId);
+        if (!pair) {
+            return { ok: false, message: "No puedes bucear aquí." };
+        }
+        const knows = this.battleManager
+            ? await this.battleManager.partyKnowsFieldSkill(userId, "dive")
+            : false;
+        if (!knows) {
+            return { ok: false, message: "Ningún Venomon de tu equipo conoce Buceo." };
+        }
+        const cellSize = this.getMapCellSize(player.currentMapId);
+        const cell = player.getCurrentCell(cellSize);
+        if (pair.role === "surface") {
+            if (!isDeepWaterTag(this.getPlayerTerrainTag(player))) {
+                return { ok: false, message: "Debes estar sobre aguas profundas para bucear." };
+            }
+            player.isSurfing = false; // underwater floor is walkable
+        } else {
+            player.isSurfing = true; // resurface onto the water, surfing
+        }
+        this.forcePlayerToCell(player, pair.pairedMapId, cell.x, cell.y);
+        this.emitSurfState(player);
+        return { ok: true, mapChanged: true };
+    }
+
+    /** Waterfall: climb up/down the waterfall column the player faces. */
+    async tryWaterfall(player: Player, userId: number): Promise<{ ok: boolean; message?: string }> {
+        const knows = this.battleManager
+            ? await this.battleManager.partyKnowsFieldSkill(userId, "waterfall")
+            : false;
+        if (!knows) {
+            return { ok: false, message: "Ningún Venomon de tu equipo conoce Cascada." };
+        }
+        const cellSize = this.getMapCellSize(player.currentMapId);
+        const start = player.getCurrentCell(cellSize);
+        const facing = player.getFacingCell(cellSize);
+        const dx = facing.x - start.x;
+        const dy = facing.y - start.y;
+        if (!isWaterfallTag(this.getTerrainTagAtCell(player.currentMapId, facing.x, facing.y))) {
+            return { ok: false, message: "No hay ninguna cascada aquí." };
+        }
+        // Advance across the waterfall column to the water on the far side (capped).
+        let cx = facing.x;
+        let cy = facing.y;
+        for (let step = 0; step < 32; step += 1) {
+            const nextX = cx + dx;
+            const nextY = cy + dy;
+            if (isWaterfallTag(this.getTerrainTagAtCell(player.currentMapId, nextX, nextY))) {
+                cx = nextX;
+                cy = nextY;
+                continue;
+            }
+            break;
+        }
+        player.isSurfing = true;
+        this.forcePlayerToCell(player, player.currentMapId, cx, cy);
+        this.emitSurfState(player);
+        return { ok: true };
+    }
+
+    /** Strength: push the boulder the player faces one cell further, if free. */
+    async tryStrengthPush(player: Player, userId: number): Promise<{ ok: boolean; message?: string }> {
+        const knows = this.battleManager
+            ? await this.battleManager.partyKnowsFieldSkill(userId, "strength")
+            : false;
+        if (!knows) {
+            return { ok: false, message: "Ningún Venomon de tu equipo conoce Fuerza." };
+        }
+        const cellSize = this.getMapCellSize(player.currentMapId);
+        const start = player.getCurrentCell(cellSize);
+        const facing = player.getFacingCell(cellSize);
+        const editorData = this.playableMapsState?.editorDataByMapId?.[player.currentMapId];
+        const boulder = (editorData?.boulders ?? []).find(
+            (candidate) => candidate.x === facing.x && candidate.y === facing.y
+        );
+        if (!boulder) {
+            return { ok: false, message: "No hay ninguna roca que empujar aquí." };
+        }
+        const destX = facing.x + (facing.x - start.x);
+        const destY = facing.y + (facing.y - start.y);
+        if (this.isRectBlocked(player.currentMapId, destX * cellSize, destY * cellSize, cellSize, cellSize)) {
+            return { ok: false, message: "La roca no se puede mover en esa dirección." };
+        }
+        if ((editorData?.boulders ?? []).some((candidate) => candidate.x === destX && candidate.y === destY)) {
+            return { ok: false, message: "La roca no se puede mover en esa dirección." };
+        }
+        boulder.x = destX;
+        boulder.y = destY;
+        this.broadcastBoulderMoved(player.currentMapId, boulder.id, destX, destY);
+        return { ok: true };
+    }
+
+    private broadcastBoulderMoved(mapId: string, boulderId: string, x: number, y: number) {
+        this.emitToMap(mapId, "world:boulder-moved", { mapId, boulderId, x, y });
+    }
+
     private isRectBlockedByCollisionGrid(
         mapId:string,
         x:number,
         y:number,
         width:number,
-        height:number
+        height:number,
+        passThroughWater = false
     ) {
         const grid = this.collisionGridsByMapId.get(mapId);
         if (!grid) {
@@ -300,6 +501,11 @@ export default class World {
         for (let row = firstRow; row <= lastRow; row += 1) {
             for (let column = firstColumn; column <= lastColumn; column += 1) {
                 if (isSolidCollisionCell(grid.cells[row * grid.width + column])) {
+                    // While surfing, water is solid to the grid but passable to us
+                    // (walls — solid + non-water — still block).
+                    if (passThroughWater && isSurfableWaterTag(this.getTerrainTagAtCell(mapId, column, row))) {
+                        continue;
+                    }
                     return true;
                 }
             }
@@ -340,7 +546,12 @@ export default class World {
         width:number,
         height:number
     ) {
-        if (this.isRectBlocked(player.currentMapId, x, y, width, height)) {
+        // Legacy obstacle rectangles + static grid, but let a surfing player
+        // cross water-tagged solids (Surf). Real walls always block.
+        if (this.getMapObjects(player.currentMapId).some((object) => this.checkCollision({ x, y, width, height }, object))) {
+            return true;
+        }
+        if (this.isRectBlockedByCollisionGrid(player.currentMapId, x, y, width, height, player.isSurfing)) {
             return true;
         }
 
@@ -598,6 +809,11 @@ export default class World {
     }
 
     handlePlayerStep(player: Player) {
+        // Surf ends the moment the player steps back onto dry land.
+        if (player.isSurfing && !isSurfableWaterTag(this.getPlayerTerrainTag(player))) {
+            player.isSurfing = false;
+            this.emitSurfState(player);
+        }
         this.battleManager?.handlePlayerStep(player);
         this.battleManager?.handleEggStep(player);
         void this.handleGroundItemPickup(player);

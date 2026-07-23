@@ -38,6 +38,7 @@ import {
   type FieldItemTargetKind,
   type FishingRodTier
 } from "./battle/fieldItemEffects";
+import { canSpeciesLearnMachineMove } from "./TmCompatibility";
 import { resolveHeldItemEffect, type HeldItemEffect } from "./battle/heldItems";
 import {
   parseMoveEffect,
@@ -381,6 +382,12 @@ type ItemDefinition = {
   iconSrc: string;
   skillId: string;
   skillName: string;
+  /** For MO/MT machines: the Essentials move internal (e.g. "CUT"), used as the
+   * tm.txt compatibility key. "" for non-machine items. */
+  moveInternal: string;
+  /** "mo" = reusable HM (never consumed), "mt" = single-use TM (consumed once),
+   * null = not a move machine. Derived from essentialsId (HM##/TM##). */
+  machineKind: "mo" | "mt" | null;
   effectKind: string;
   useCondition: string;
   isPokeball: boolean;
@@ -474,6 +481,19 @@ function normalizeType(value: string) {
 function normalizeText(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
+
+/** Field-skill key -> Essentials move internal, for resolving its display name
+ * and tm.txt compatibility. Keys are the lowercase ids used across the engine. */
+const FIELD_SKILL_MOVE_INTERNALS: Record<string, string> = {
+  cut: "CUT",
+  fly: "FLY",
+  surf: "SURF",
+  strength: "STRENGTH",
+  waterfall: "WATERFALL",
+  dive: "DIVE",
+  rocksmash: "ROCKSMASH",
+  flash: "FLASH"
+};
 
 function toInventoryCategory(value: string): InventoryItem["category"] {
   switch (value.toLowerCase()) {
@@ -1487,6 +1507,27 @@ export default class BattleManager {
     return { ok: true, message: `The ${item.name} found a rustling patch of grass!` };
   }
 
+  /**
+   * Rock Smash body script (pbRockSmashRandomEncounter): after a rock is broken,
+   * roll a chance to trigger a wild encounter drawn from the map's table.
+   */
+  public async tryRockSmashEncounter(userId: number, player: Player): Promise<void> {
+    const user = await this.auth.getUserForBattle(userId);
+    if (!user || !this.partyCanBattle(user)) {
+      return;
+    }
+    if (Math.random() > 0.25) {
+      return; // ~25% like Essentials rock-smash encounters
+    }
+    const snapshot = this.world.getPlayableMapsState();
+    const editorData = snapshot?.editorDataByMapId[player.currentMapId];
+    const table = this.getMapEncounterTable(editorData);
+    if (!table || (table.pokemonIds.length === 0 && !table.encounterRows?.length)) {
+      return;
+    }
+    await this.startWildBattle(player, table);
+  }
+
   /** The map's shared grass encounter table (fishing fallback pool). */
   private getMapEncounterTable(
     editorData:
@@ -1616,10 +1657,16 @@ export default class BattleManager {
   public async teachInventoryMove(
     userId: number,
     itemId: string,
-    targetPokemonId?: string
+    targetPokemonId?: string,
+    replaceMoveName?: string
   ) {
+    const player = this.world.getPlayerByUserId(userId);
+    if (player && this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "You can't teach moves during a battle." };
+    }
+
     const user = await this.auth.getUserForBattle(userId);
-    await this.loadCatalogs();
+    const catalogs = await this.loadCatalogs();
     const item = user?.inventory.find((candidate) => candidate.id === itemId);
     const itemDefinition = this.getCachedItemDefinition(itemId, item?.name ?? "");
 
@@ -1637,16 +1684,77 @@ export default class BattleManager {
       return { ok: false, message: "Choose a Pokemon to teach." };
     }
 
-    if (targetPokemon.moves.includes(itemDefinition.skillName)) {
-      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} already knows ${itemDefinition.skillName}.` };
+    // The item carries the move internal (CUT) + a stale lowercased skillId; the
+    // canonical stored name is the skill catalog's display name (Corte).
+    const moveInternal = itemDefinition.moveInternal || itemDefinition.skillName.toUpperCase();
+    const skillDefinition =
+      catalogs.skillsById.get(itemDefinition.skillId) ??
+      catalogs.skillsById.get(`skill-${moveInternal}`) ??
+      catalogs.skillsByName.get(itemDefinition.skillName.toLowerCase());
+
+    if (!skillDefinition) {
+      return { ok: false, message: "That item cannot teach a move." };
     }
 
+    const canonicalName = skillDefinition.name;
+    const sameMove = (name: string) => name.toLowerCase() === canonicalName.toLowerCase();
+
+    if (targetPokemon.moves.some(sameMove)) {
+      return {
+        ok: false,
+        message: `${getPokemonDisplayName(targetPokemon)} already knows ${canonicalName}.`
+      };
+    }
+
+    // Compatibility gate (tm.txt). MT, MO and Rock Smash TM are all gated when a
+    // list exists; custom moves with no list stay teachable.
+    const definition = targetPokemon.sourcePokemonId
+      ? catalogs.pokemonById.get(targetPokemon.sourcePokemonId)
+      : undefined;
+    const speciesEssentialsId = (definition?.essentialsId ?? "").toUpperCase();
+    if (!canSpeciesLearnMachineMove(moveInternal, speciesEssentialsId)) {
+      return {
+        ok: false,
+        message: `${getPokemonDisplayName(targetPokemon)} can't learn ${canonicalName}.`
+      };
+    }
+
+    const movePp = { ...(targetPokemon.movePp ?? {}) };
     if (targetPokemon.moves.length >= 4) {
-      return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} already knows four moves.` };
+      if (!replaceMoveName) {
+        return {
+          ok: false,
+          needsReplace: true,
+          moves: [...targetPokemon.moves],
+          moveName: canonicalName,
+          message: `${getPokemonDisplayName(targetPokemon)} already knows four moves. Choose one to replace.`
+        };
+      }
+      const replaceIndex = targetPokemon.moves.indexOf(replaceMoveName);
+      if (replaceIndex < 0) {
+        return {
+          ok: false,
+          message: `${getPokemonDisplayName(targetPokemon)} does not know ${replaceMoveName}.`
+        };
+      }
+      targetPokemon.moves = targetPokemon.moves.map((name, index) =>
+        index === replaceIndex ? canonicalName : name
+      );
+      delete movePp[replaceMoveName];
+    } else {
+      targetPokemon.moves = [...targetPokemon.moves, canonicalName];
     }
+    movePp[canonicalName] = skillDefinition.powerPoint;
+    targetPokemon.movePp = movePp;
 
-    targetPokemon.moves = [...targetPokemon.moves, itemDefinition.skillName];
-    const nextInventory = this.removeInventoryQuantity(user.inventory, item.id, 1);
+    // MO (HM) machines are reusable and never consumed; MT (TM) are single-use.
+    const consume = itemDefinition.machineKind !== "mo";
+    const nextInventory = consume
+      ? this.removeInventoryQuantity(user.inventory, item.id, 1)
+      : user.inventory;
+
+    this.updateActiveBattleMoves(userId, targetPokemon, catalogs);
+
     const nextUser = await this.auth.saveBattleState(userId, {
       pokemonParty: user.pokemonParty,
       inventory: nextInventory
@@ -1655,8 +1763,44 @@ export default class BattleManager {
     return {
       ok: true,
       user: nextUser,
-      message: `${getPokemonDisplayName(targetPokemon)} learned ${itemDefinition.skillName}.`
+      message: replaceMoveName
+        ? `${getPokemonDisplayName(targetPokemon)} forgot ${replaceMoveName} and learned ${canonicalName}!`
+        : `${getPokemonDisplayName(targetPokemon)} learned ${canonicalName}!`
     };
+  }
+
+  /** The localized display move name for a field skill (cut -> "Corte"), resolved
+   * from the skill catalog. null when the skill/move is unknown. */
+  public resolveFieldSkillMoveName(
+    fieldSkill: string,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): string | null {
+    const internal = FIELD_SKILL_MOVE_INTERNALS[fieldSkill.trim().toLowerCase()];
+    if (!internal) {
+      return null;
+    }
+    const skill =
+      catalogs.skillsById.get(`skill-${internal}`) ??
+      catalogs.skillsByName.get(internal.toLowerCase());
+    return skill?.name ?? null;
+  }
+
+  /** True when any party Venomon knows the given field skill's move (Fly's
+   * party-knows check, generalized and catalog-derived). */
+  public async partyKnowsFieldSkill(userId: number, fieldSkill: string): Promise<boolean> {
+    const user = await this.auth.getUserForBattle(userId);
+    if (!user) {
+      return false;
+    }
+    const catalogs = await this.loadCatalogs();
+    const moveName = this.resolveFieldSkillMoveName(fieldSkill, catalogs);
+    if (!moveName) {
+      return false;
+    }
+    const target = moveName.trim().toLowerCase();
+    return user.pokemonParty.some((pokemon) =>
+      (pokemon.moves ?? []).some((move) => move.trim().toLowerCase() === target)
+    );
   }
 
   public async resolveMoveLearn(
@@ -5609,6 +5753,13 @@ export default class BattleManager {
       iconSrc: typeof profile.iconSrc === "string" ? profile.iconSrc : "",
       skillId: typeof profile.skillId === "string" ? profile.skillId : "",
       skillName: typeof profile.skillName === "string" ? profile.skillName : "",
+      moveInternal:
+        typeof profile.skillName === "string" ? profile.skillName.trim().toUpperCase() : "",
+      machineKind: /^HM\d/i.test(essentialsId)
+        ? "mo"
+        : /^TM\d/i.test(essentialsId)
+          ? "mt"
+          : null,
       effectKind,
       useCondition,
       isPokeball,

@@ -38,6 +38,26 @@ export const EMPTY_EVENT_PLAYER_STATE: EventPlayerState = {
   selfSwitches: {}
 };
 
+/**
+ * Reserved self-switch set by `pbEraseThisEvent` (Cut trees, Rock Smash rocks).
+ * An erased event has no active page for that player: it stops blocking and
+ * renders nothing, persisting per-player like any self-switch.
+ */
+export const ERASED_SELF_SWITCH = "ERASED";
+
+/** Key for the erased marker of an event, matching the self-switch key scheme. */
+export function erasedSelfSwitchKey(essentials: { essentialsMapId: number; eventId: number }): string {
+  return `${essentials.essentialsMapId}:${essentials.eventId}:${ERASED_SELF_SWITCH}`;
+}
+
+/** True when the player has erased this event (e.g. cut the tree / smashed the rock). */
+export function isEventErased(
+  essentials: { essentialsMapId: number; eventId: number },
+  state: EventPlayerState
+): boolean {
+  return Boolean(state.selfSwitches[erasedSelfSwitchKey(essentials)]);
+}
+
 export function eventPageConditionsMet(
   conditions: EventPageConditions,
   state: EventPlayerState,
@@ -70,6 +90,9 @@ export function selectConditionMetPage(
   essentials: EssentialsEventRecord,
   state: EventPlayerState
 ): EssentialsEventPage | null {
+  if (isEventErased(essentials, state)) {
+    return null;
+  }
   const pages = essentials.pages ?? [];
   for (let index = pages.length - 1; index >= 0; index -= 1) {
     if (eventPageConditionsMet(pages[index].conditions ?? {}, state, essentials)) {

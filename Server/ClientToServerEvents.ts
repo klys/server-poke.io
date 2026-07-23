@@ -85,6 +85,14 @@ export default interface ClientToServerEvents {
   }) => void;
   "player:teleport": (data: { mapId: string; x: number; y: number }) => void;
   "player:fly": (data: { mapId: string }) => void;
+  // Field skills used out of battle by facing/standing on the relevant terrain.
+  "player:surf": () => void;
+  "player:dive": () => void;
+  "player:waterfall": () => void;
+  "player:strength-push": () => void;
+  // Action button pressed with nothing to interact with: the server resolves
+  // whichever field skill (Surf/Dive/Waterfall/Strength) the terrain allows.
+  "player:field-interact": () => void;
   move: (data: { x: number; y: number }) => void;
   stopMove: () => void;
   shotProjectil: (data: { mouse_x: number; mouse_y: number }) => void;
@@ -97,7 +105,11 @@ export default interface ClientToServerEvents {
   "battle:action": (data: BattleActionRequest) => void;
   "battle:learn-move": (data: { pokemonId: string; moveName: string; replaceMoveName?: string }) => void;
   "inventory:use-item": (data: { itemId: string; targetPokemonId?: string; targetMoveName?: string }) => void;
-  "inventory:teach-move": (data: { itemId: string; targetPokemonId: string }) => void;
+  "inventory:teach-move": (data: {
+    itemId: string;
+    targetPokemonId: string;
+    replaceMoveName?: string;
+  }) => void;
   "inventory:hold-item": (data: { pokemonId: string; itemId: string }) => void;
   "inventory:take-held-item": (data: { pokemonId: string }) => void;
   "inventory:throw-away": (data: { itemId: string; quantity: number }) => void;
