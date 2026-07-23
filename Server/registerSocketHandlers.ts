@@ -409,15 +409,38 @@ async function emitRefreshedAuthSessionToUserSockets(
 
   await Promise.all(
     matchingSockets.map(async (candidateSocket) => {
+      // readSocketToken, not data.token: sockets that authenticated through
+      // the handshake token never get data.token populated, and resolving
+      // undefined here used to push authenticated:false to a live player —
+      // the client then wiped its stored token and bounced to the login page.
       const session = await sanitizeAuthSessionInventory(
-        await auth.resolveSession(candidateSocket.data.token),
+        await auth.resolveSession(readSocketToken(candidateSocket)),
         auth,
         designerSectionStore
       );
 
+      // This is a background refresh, never a logout: if the token can't be
+      // resolved right now, keep the client's current session untouched.
+      if (!session.authenticated) {
+        return;
+      }
+
       applyAndEmitAuthSession(candidateSocket, session);
     })
   );
+}
+
+/**
+ * Toast a message on every connected client of a user. authContext listens for
+ * auth:info on each socket and shows it as a toast, so this is the channel for
+ * "an admin did something to your account" notices.
+ */
+function notifyUserSockets(io:TypedSocketServer, userId:number, message:string) {
+  for (const candidate of io.sockets.sockets.values()) {
+    if (candidate.data.userId === userId) {
+      candidate.emit("auth:info", { message });
+    }
+  }
 }
 
 function toInventoryCategory(value: string) {
@@ -1108,6 +1131,10 @@ function createConnectionHandler(
           return;
         }
 
+        // Snapshot before applying so gift notifications can name exactly
+        // what was added (new party members, item quantity deltas).
+        const before = await auth.getUserAdminDetails(userId);
+
         const result = await auth.updateUserByAdmin(userId, data.updates ?? {});
         if ("error" in result) {
           socket.emit("admin:error", {
@@ -1130,6 +1157,53 @@ function createConnectionHandler(
               world.presentPlayersOnMapTo(socketId, player.currentMapId);
             });
           }
+        }
+
+        // Tell the player what just happened to their account. Gifts are
+        // spelled out per item / per venomon; anything else gets a generic
+        // "<admin> updated your ..." notice.
+        const adminName = socket.data.username || "An admin";
+        const updates = data.updates ?? {};
+
+        if (updates.savedLocation) {
+          notifyUserSockets(io, userId, `${adminName} is relocating you`);
+        }
+
+        if (updates.inventory && before) {
+          const beforeQuantities = new Map(
+            before.inventory.map((item) => [item.id, item.quantity])
+          );
+          for (const item of result.user.inventory) {
+            const delta = item.quantity - (beforeQuantities.get(item.id) ?? 0);
+            if (delta > 0) {
+              notifyUserSockets(io, userId, `${adminName} give you ${item.name} x${delta}`);
+            }
+          }
+        }
+
+        if (updates.pokemonParty && before) {
+          const beforeIds = new Set(before.pokemonParty.map((pokemon) => pokemon.id));
+          for (const pokemon of result.user.pokemonParty) {
+            if (!beforeIds.has(pokemon.id)) {
+              notifyUserSockets(io, userId, `${adminName} give you ${pokemon.nickname || pokemon.name}`);
+            }
+          }
+        }
+
+        const profileFieldLabels: Array<[keyof typeof updates, string]> = [
+          ["name", "name"],
+          ["role", "role"],
+          ["profileImage", "profile image"],
+          ["description", "description"],
+          ["trainerGender", "trainer gender"],
+          ["money", "money"],
+          ["emailVerified", "email verification"]
+        ];
+        const touchedLabels = profileFieldLabels
+          .filter(([key]) => updates[key] !== undefined)
+          .map(([, label]) => label);
+        if (touchedLabels.length > 0) {
+          notifyUserSockets(io, userId, `${adminName} updated your ${touchedLabels.join(", ")}`);
         }
 
         socket.emit("admin:user:details", {
@@ -1204,6 +1278,12 @@ function createConnectionHandler(
           // conditional NPCs return to their new-game state.
           void eventRuntime.emitEventState(userId);
         }
+
+        notifyUserSockets(
+          io,
+          userId,
+          `${socket.data.username || "An admin"} reset your adventure to the beginning`
+        );
 
         socket.emit("admin:user:details", {
           user: result.user
@@ -1312,6 +1392,7 @@ function createConnectionHandler(
           return;
         }
 
+        notifyUserSockets(io, userId, `${socket.data.username || "An admin"} changed your password`);
         socket.emit("auth:info", { message: result.message });
       } catch (error) {
         console.error("Unable to set user password:", error);
@@ -1348,6 +1429,151 @@ function createConnectionHandler(
         console.error("Unable to send password recovery email:", error);
         socket.emit("admin:error", {
           message: "Unable to send the recovery email right now."
+        });
+      }
+    });
+
+    // Explicit admin-initiated disconnect. Gifts and relocation no longer
+    // touch the player's connection; this button is the only way an admin
+    // drops a player, and it never clears their stored credentials — they can
+    // simply log back in.
+    socket.on("admin:user:disconnect", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", { message: "Choose a valid user." });
+          return;
+        }
+
+        if (socket.data.userId === userId) {
+          socket.emit("admin:error", { message: "You cannot disconnect yourself from here." });
+          return;
+        }
+
+        const adminName = socket.data.username || "An admin";
+        const targetSockets = Array.from(io.sockets.sockets.values()).filter(
+          (candidate) => candidate.data.userId === userId
+        );
+
+        if (targetSockets.length === 0) {
+          socket.emit("admin:error", { message: "That trainer is not connected right now." });
+          return;
+        }
+
+        for (const targetSocket of targetSockets) {
+          targetSocket.emit("auth:info", { message: `${adminName} disconnected you` });
+          world.removePlayer(targetSocket.id);
+          targetSocket.disconnect(true);
+        }
+
+        broadcastAdminPresence(io, world);
+        socket.emit("auth:info", { message: `Disconnected ${targetSockets.length} session${targetSockets.length === 1 ? "" : "s"}.` });
+      } catch (error) {
+        console.error("Unable to disconnect user:", error);
+        socket.emit("admin:error", {
+          message: "Unable to disconnect that trainer right now."
+        });
+      }
+    });
+
+    socket.on("admin:user:event-state:get", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", { message: "Choose a valid user." });
+          return;
+        }
+
+        const state = await auth.getEventState(userId);
+        socket.emit("admin:user:event-state", { userId, ...state });
+      } catch (error) {
+        console.error("Unable to load user event state:", error);
+        socket.emit("admin:error", {
+          message: "Unable to load that trainer's game variables."
+        });
+      }
+    });
+
+    socket.on("admin:user:event-state:update", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", { message: "Choose a valid user." });
+          return;
+        }
+
+        await auth.setEventStateByAdmin(userId, {
+          switches: data?.switches && typeof data.switches === "object" ? data.switches : {},
+          variables: data?.variables && typeof data.variables === "object" ? data.variables : {}
+        });
+
+        // Push the fresh state into the live player (conditional NPCs and
+        // event pages react immediately) and tell them what happened.
+        await eventRuntime.emitEventState(userId);
+        notifyUserSockets(io, userId, `${socket.data.username || "An admin"} updated your game variables`);
+
+        const state = await auth.getEventState(userId);
+        socket.emit("admin:user:event-state", { userId, ...state });
+        socket.emit("auth:info", { message: "Game variables updated." });
+      } catch (error) {
+        console.error("Unable to update user event state:", error);
+        socket.emit("admin:error", {
+          message: "Unable to update that trainer's game variables."
+        });
+      }
+    });
+
+    socket.on("admin:user:storage:get", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+
+        const userId = typeof data?.userId === "number" ? Math.round(data.userId) : Number.NaN;
+        if (!Number.isFinite(userId) || userId <= 0) {
+          socket.emit("admin:error", { message: "Choose a valid user." });
+          return;
+        }
+
+        const storage = await auth.getUserStorageForAdmin(userId);
+        if (!storage) {
+          socket.emit("admin:error", { message: "User not found." });
+          return;
+        }
+
+        socket.emit("admin:user:storage", { userId, ...storage });
+      } catch (error) {
+        console.error("Unable to load user storage:", error);
+        socket.emit("admin:error", {
+          message: "Unable to load that trainer's PC box."
         });
       }
     });
@@ -1863,6 +2089,36 @@ function createConnectionHandler(
         return;
       }
       await world.tryStrengthPush(player, userId);
+    });
+
+    // Click-to-fish: the player tapped an adjacent water tile and chose "Fish".
+    // The server validates rod/adjacency/water, turns the player to face it, and
+    // casts; a bite opens a wild battle via battle:state.
+    socket.on("fishing:cast", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("fishing:result", { status: "error", message: "Log in to fish." });
+        return;
+      }
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player) {
+        socket.emit("fishing:result", { status: "error", message: "Enter the world to fish." });
+        return;
+      }
+      if (
+        !data ||
+        typeof data.x !== "number" ||
+        typeof data.y !== "number" ||
+        !Number.isFinite(data.x) ||
+        !Number.isFinite(data.y)
+      ) {
+        return;
+      }
+      const result = await battleManager.fishAtCell(socket.data.userId, player, {
+        x: Math.floor(data.x),
+        y: Math.floor(data.y)
+      });
+      const status = !result.ok ? "error" : result.battleStarted ? "bite" : "no-bite";
+      socket.emit("fishing:result", { status, message: result.message });
     });
 
     socket.on("shotProjectil", (data) => {

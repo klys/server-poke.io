@@ -1128,6 +1128,90 @@ export default class Auth {
         return this.toAdminUserDetails(user);
     }
 
+    /**
+     * Read-only PC box storage + public trainer profile for the admin panel.
+     * Box venomons are enriched with catalog icons the same way the party is.
+     */
+    public async getUserStorageForAdmin(userId:number):Promise<{
+        boxes:PokemonStorageBox[];
+        profile:{
+            name:string;
+            username:string;
+            description:string;
+            profileImage:string;
+            characterSkinId:string;
+            trainerCardColor:string;
+            badges:number[];
+            money:number;
+            createdAt:string;
+        };
+    } | null> {
+        const storedUser = await this.getStoredUserById(String(userId));
+        if (!storedUser) {
+            return null;
+        }
+
+        const base = this.toAuthenticatedUser(storedUser);
+        const [pokemonIcons, boxes] = await Promise.all([
+            this.readPokemonIconIndex(),
+            this.getPokemonStorage(userId)
+        ]);
+
+        return {
+            boxes: boxes.map((box) => ({
+                ...box,
+                pokemon: box.pokemon.map((pokemon) => {
+                    const icons =
+                        pokemonIcons.get(pokemon.sourcePokemonId ?? "") ??
+                        pokemonIcons.get(pokemon.id);
+                    return icons
+                        ? { ...pokemon, iconImageSrc: icons.iconImageSrc || pokemon.iconImageSrc }
+                        : pokemon;
+                })
+            })),
+            profile: {
+                name: base.name,
+                username: base.username,
+                description: base.description,
+                profileImage: base.profileImage,
+                characterSkinId: base.characterSkinId,
+                trainerCardColor: base.trainerCardColor,
+                badges: base.badges,
+                money: base.money,
+                createdAt: storedUser.created_at
+            }
+        };
+    }
+
+    /**
+     * Admin replacement of a user's event switches/variables. Self-switches
+     * are intentionally untouched — they are per-event internals; clearing
+     * them belongs to targeted recovery tools, not a bulk editor.
+     */
+    public async setEventStateByAdmin(userId:number, next:{
+        switches:Record<string, boolean>;
+        variables:Record<string, number>;
+    }) {
+        const switches:Record<string, boolean> = {};
+        for (const [id, on] of Object.entries(next.switches)) {
+            if (on === true && id.trim().length > 0) {
+                switches[id.trim()] = true;
+            }
+        }
+
+        const variables:Record<string, number> = {};
+        for (const [id, value] of Object.entries(next.variables)) {
+            if (id.trim().length > 0 && typeof value === "number" && Number.isFinite(value)) {
+                variables[id.trim()] = Math.round(value);
+            }
+        }
+
+        await this.redis.hSet(this.userKey(userId), {
+            event_switches: JSON.stringify(switches),
+            event_variables: JSON.stringify(variables)
+        });
+    }
+
     public async updateUserByAdmin(
         userId:number,
         updates:AdminUserUpdatePayload
@@ -1390,6 +1474,44 @@ export default class Auth {
         await this.redis.hSet(this.userKey(userId), {
             event_self_switches: JSON.stringify(state.selfSwitches)
         });
+    }
+
+    /**
+     * Egg re-gift cooldown bookkeeping. Egg-giving NPCs ("Regala huevo", the
+     * Day Care "Criador") record when they last handed a player an egg, keyed
+     * by NPC placement id, so the same NPC only gives another egg once the
+     * weekly cooldown has elapsed. A missing entry means "never given" (0), so
+     * first-time and existing players are eligible right away.
+     */
+    public async getEggGrantTimestamp(userId:number, key:string):Promise<number> {
+        const raw = await this.redis.hGet(this.userKey(userId), "egg_cooldowns");
+        if (!raw) {
+            return 0;
+        }
+        try {
+            const map = JSON.parse(raw);
+            const ts = map && typeof map === "object" ? Number(map[key]) : 0;
+            return Number.isFinite(ts) ? ts : 0;
+        } catch {
+            return 0;
+        }
+    }
+
+    public async setEggGrantTimestamp(userId:number, key:string, timestampMs:number):Promise<void> {
+        const raw = await this.redis.hGet(this.userKey(userId), "egg_cooldowns");
+        let map:Record<string, number> = {};
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw);
+                if (parsed && typeof parsed === "object") {
+                    map = parsed as Record<string, number>;
+                }
+            } catch {
+                map = {};
+            }
+        }
+        map[key] = Math.round(timestampMs);
+        await this.redis.hSet(this.userKey(userId), { egg_cooldowns: JSON.stringify(map) });
     }
 
     /**

@@ -92,6 +92,21 @@ const RE_ADD_POKEMON = /(?:Kernel\.)?pbAddPokemon\(\s*(?:PBSpecies::|:)(\w+)\s*,
 // hatches after walking. Only the species matters here; the obtain text arg is
 // flavour and ignored.
 const RE_GENERATE_EGG = /(?:Kernel\.)?pbGenerateEgg\(\s*(?:PBSpecies::|:)(\w+)/i;
+// Day Care egg pickup ("Criador"): `Kernel.pbEggGenerated?` gates whether an
+// egg is waiting, and `pbDayCareGenerateEgg` hands it over. We model these with
+// the same weekly egg cooldown as pbGenerateEgg; the handed-over egg is bred
+// from the player's lead species (the full breeding sim is not modelled).
+const RE_EGG_GENERATED = /pbEggGenerated\??/i;
+const RE_DAYCARE_GENERATE_EGG = /pbDayCareGenerateEgg/i;
+// Day-care party-space gates. `$Trainer.party.length` counts every slot (eggs
+// included, since an egg occupies a slot); `$Trainer.pokemonCount` counts only
+// battle-ready (non-egg) members. Previously these unknown script conditions
+// hit the permissive `return true`, so the Day Care always thought the party
+// was full ("no space") regardless of the real party.
+const RE_PARTY_LENGTH = /\$Trainer\.party\.length\s*(>=|<=|==|!=|>|<)\s*(\d+)/i;
+const RE_POKEMON_COUNT = /\$Trainer\.(?:pokemonCount|partyCount)\s*(>=|<=|==|!=|>|<)\s*(\d+)/i;
+// A player can receive a fresh egg from the same egg NPC once per week.
+const EGG_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
 const RE_RECEIVE_ITEM = /pbReceive(?:Item)?\(\s*(?:PBItems::|:)(\w+)/i;
 // pbItemBall(:POTION) — visible item balls; also used by hidden items.
 const RE_ITEM_BALL = /pbItemBall\(\s*(?:PBItems::|:)(\w+)/i;
@@ -287,7 +302,31 @@ export default class EventRuntime {
     }
 
     const essentials = placement.essentialsEvent;
-    const state = await this.auth.getEventState(userId);
+    let state = await this.auth.getEventState(userId);
+    // Re-gift: an egg NPC that permanently locks itself with a one-time Self
+    // Switch ("Regala huevo" flips A after giving the egg) becomes available
+    // again once its weekly cooldown elapses. Clear that lock when eligible so
+    // the give-egg page runs instead of the "already gave it" page. Players who
+    // got the egg before this feature existed have no recorded timestamp, so
+    // they are eligible right away.
+    const eggReset = this.scanEventForEggReset(essentials);
+    if (eggReset.givesEgg && eggReset.selfSwitchChannels.length > 0) {
+      const last = await this.auth.getEggGrantTimestamp(userId, npcPlacementId);
+      const eligible = !last || last + EGG_COOLDOWN_MS <= Date.now();
+      if (eligible) {
+        let cleared = false;
+        for (const ch of eggReset.selfSwitchChannels) {
+          const key = `${essentials.essentialsMapId}:${essentials.eventId}:${ch}`;
+          if (state.selfSwitches[key]) {
+            await this.auth.setEventSelfSwitch(userId, key, false);
+            cleared = true;
+          }
+        }
+        if (cleared) {
+          state = await this.auth.getEventState(userId);
+        }
+      }
+    }
     const page = this.selectActivePage(essentials.pages, state, essentials);
     // Only action/touch pages respond to a click; autorun/parallel pages are
     // driven by runAutorunForMap, not by talking.
@@ -310,6 +349,65 @@ export default class EventRuntime {
       npcPlacementId
     );
     return { ok: true as const };
+  }
+
+  /** ms remaining before this NPC hands out another egg (0 = eligible now). */
+  private async eggCooldownRemaining(session: Session): Promise<number> {
+    if (!session.placementId) {
+      return 0;
+    }
+    const last = await this.auth.getEggGrantTimestamp(session.userId, session.placementId);
+    if (!last) {
+      return 0;
+    }
+    return Math.max(0, last + EGG_COOLDOWN_MS - Date.now());
+  }
+
+  /** Stamps "an egg was given now" so the weekly cooldown starts counting. */
+  private async recordEggGrant(session: Session): Promise<void> {
+    if (!session.placementId) {
+      return;
+    }
+    await this.auth.setEggGrantTimestamp(session.userId, session.placementId, Date.now());
+  }
+
+  private compareNumbers(op: string, left: number, right: number): boolean {
+    switch (op) {
+      case ">=": return left >= right;
+      case "<=": return left <= right;
+      case ">": return left > right;
+      case "<": return left < right;
+      case "==": return left === right;
+      case "!=": return left !== right;
+      default: return false;
+    }
+  }
+
+  /**
+   * Scans an event for the pbGenerateEgg give (so we know it is an egg NPC) and
+   * the Self Switch channels it flips (code 123), which are the one-time locks
+   * to clear when the weekly cooldown makes the egg available again.
+   */
+  private scanEventForEggReset(essentials: EssentialsEvent): { givesEgg: boolean; selfSwitchChannels: string[] } {
+    let givesEgg = false;
+    const channels = new Set<string>();
+    for (const page of essentials.pages) {
+      for (const command of page.commands) {
+        // The pbGenerateEgg call sits in parameters[1] for a Conditional Branch
+        // script (code 111) and parameters[0] for a plain Script (355), so scan
+        // every string operand rather than assuming a slot.
+        for (const param of command.parameters ?? []) {
+          if (typeof param === "string" && RE_GENERATE_EGG.test(param)) {
+            givesEgg = true;
+          }
+        }
+        // Control Self Switch (123): parameters = [channel, 0|1].
+        if (command.code === 123 && typeof command.parameters?.[0] === "string") {
+          channels.add(command.parameters[0] as string);
+        }
+      }
+    }
+    return { givesEgg, selfSwitchChannels: [...channels] };
   }
 
   /**
@@ -1016,6 +1114,7 @@ export default class EventRuntime {
           // make room and come back — exactly what the NPC's dialogue promises.
           const result = await this.auth.giveEggBySpecies(session.userId, eggGift[1]);
           if (result.ok) {
+            await this.recordEggGrant(session);
             this.emitStep(session, {
               type: "info",
               npcName: session.npcName,
@@ -1035,6 +1134,25 @@ export default class EventRuntime {
             return false;
           }
           return false;
+        }
+        const eggReady = test.text.match(RE_EGG_GENERATED);
+        if (eggReady) {
+          // Day Care ("Criador"): an egg is waiting whenever this NPC's weekly
+          // cooldown has elapsed (or was never started). Saying yes then runs
+          // pbDayCareGenerateEgg, which actually hands the egg over.
+          return (await this.eggCooldownRemaining(session)) <= 0;
+        }
+        const partyLength = test.text.match(RE_PARTY_LENGTH);
+        if (partyLength) {
+          const user = await this.auth.getUserForBattle(session.userId);
+          const count = user?.pokemonParty?.length ?? 0;
+          return this.compareNumbers(partyLength[1], count, Number(partyLength[2]));
+        }
+        const pokemonCount = test.text.match(RE_POKEMON_COUNT);
+        if (pokemonCount) {
+          const user = await this.auth.getUserForBattle(session.userId);
+          const count = (user?.pokemonParty ?? []).filter((pokemon) => !pokemon.isEgg).length;
+          return this.compareNumbers(pokemonCount[1], count, Number(pokemonCount[2]));
         }
         // Item balls are usually authored as script conditions whose branch
         // body sets Self Switch A. Granting here (and failing the test when
@@ -1233,7 +1351,34 @@ export default class EventRuntime {
       });
       await this.waitAdvance(session.userId);
       if (result.ok) {
+        await this.recordEggGrant(session);
         await this.refreshSession(session);
+      }
+      return;
+    }
+
+    const daycareEgg = text.match(RE_DAYCARE_GENERATE_EGG);
+    if (daycareEgg) {
+      // Day Care ("Criador") egg pickup. The script's own Show Text already
+      // announced the egg and guarded the party-space check ($Trainer.party
+      // .length>=6), so here we just hand it over. Without a breeding sim the
+      // egg is bred from the player's lead (non-egg) species.
+      const user = await this.auth.getUserForBattle(session.userId);
+      const lead = (user?.pokemonParty ?? []).find((pokemon) => !pokemon.isEgg);
+      const speciesInternal = lead?.sourcePokemonId
+        ? lead.sourcePokemonId.replace(/^pokemon-/i, "")
+        : "EEVEE";
+      const result = await this.auth.giveEggBySpecies(session.userId, speciesInternal);
+      if (result.ok) {
+        await this.recordEggGrant(session);
+        await this.refreshSession(session);
+      } else if (result.partyFull) {
+        this.emitStep(session, {
+          type: "info",
+          npcName: session.npcName,
+          text: "No tienes espacio en tu equipo para el Huevo."
+        });
+        await this.waitAdvance(session.userId);
       }
       return;
     }

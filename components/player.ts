@@ -156,6 +156,33 @@ export default class Player {
     }
 
     /**
+     * Turns to face an adjacent cell (no movement) and broadcasts the new
+     * facing so every client re-orients the sprite. Used by click-to-fish so
+     * the player looks at the water tile they tapped before casting.
+     */
+    public faceCell(target: { x: number; y: number }, cellSize: number) {
+        const current = this.getCurrentCell(cellSize);
+        const dx = target.x - current.x;
+        const dy = target.y - current.y;
+        if (dx === 0 && dy === 0) return;
+        // Inverse of getFacingCell: 90=up, 270=down, 180=right, 0=left.
+        if (Math.abs(dx) >= Math.abs(dy)) {
+            this.angle = dx > 0 ? 180 : 0;
+        } else {
+            this.angle = dy > 0 ? 270 : 90;
+        }
+        this.world.emitToMap(this.currentMapId, "move" + this.socketId, {
+            x: this.x,
+            y: this.y,
+            angle: this.angle,
+            playerId: this.socketId,
+            id: this.id,
+            currentMapId: this.currentMapId,
+            stopped: true
+        });
+    }
+
+    /**
      * Evaluates the current path segment and moves the player towards it.
      * While cycling, up to `speedMultiplier` path nodes are consumed per tick
      * (each still runs the full block/slide/touch logic), so the Bicycle just

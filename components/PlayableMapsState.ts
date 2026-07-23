@@ -4,6 +4,7 @@ import {
   TILE_MAP_LAYER_ENCODING,
   type MapCollisionGrid
 } from "./TileMapGrid";
+import { TOWN_MAP_POINTS } from "./townMapData";
 
 type DesignerItemDetail = {
   label: string;
@@ -884,13 +885,10 @@ export function resolvePlayableMapPortalDestination(
   };
 }
 
-// Town detection for the world map / Volar (Fly): the imported Essentials data
-// carries no healingSpot or town metadata, so a map counts as a fly-able town
-// when it holds a portal into a Pokémon Center map. The landing spot is one
-// cell south of that portal — right in front of the center's door. The client
-// mirrors this rule in worldMap.ts; keep both in sync.
-const POKECENTER_NAME_PATTERN = /centro\s*pok|pok[eé]\s*center|pokecenter/i;
-
+// Volar (Fly) destinations come from the original game's town-map data
+// (PBS/townmap.txt via tools/generateTownMapData.ts): each flyable point
+// carries the authored landing tile. Only towns whose map exists in the
+// current designer snapshot are offered.
 export type FlyDestination = {
   mapId: string;
   name: string;
@@ -899,37 +897,28 @@ export type FlyDestination = {
 };
 
 export function resolveFlyDestinations(snapshot: PlayableMapsStateSnapshot): FlyDestination[] {
-  const pokecenterMapIds = new Set(
-    snapshot.items
-      .filter((item) => POKECENTER_NAME_PATTERN.test(item.name))
-      .map((item) => item.id)
-  );
-
+  const itemsById = new Map(snapshot.items.map((item) => [item.id, item]));
   const destinations: FlyDestination[] = [];
+  const seen = new Set<string>();
 
-  for (const item of snapshot.items) {
-    if (pokecenterMapIds.has(item.id)) {
+  for (const point of TOWN_MAP_POINTS) {
+    if (!point.fly || seen.has(point.fly.mapId)) {
       continue;
     }
 
-    const portals = snapshot.editorDataByMapId[item.id]?.portals ?? [];
-    const pokecenterPortal = portals.find(
-      (portal) =>
-        portal.destinationType === "other-map" &&
-        pokecenterMapIds.has(portal.targetMapId)
-    );
-
-    if (!pokecenterPortal) {
+    const item = itemsById.get(point.fly.mapId);
+    if (!item) {
       continue;
     }
 
+    seen.add(item.id);
     const cellSize = item.playableMapConfig?.cellSize ?? DEFAULT_CELL_SIZE;
 
     destinations.push({
       mapId: item.id,
       name: item.name,
-      x: Math.max(0, Math.round(pokecenterPortal.x)) * cellSize,
-      y: Math.max(0, Math.round(pokecenterPortal.y) + 1) * cellSize,
+      x: Math.max(0, point.fly.cellX) * cellSize,
+      y: Math.max(0, point.fly.cellY) * cellSize,
     });
   }
 

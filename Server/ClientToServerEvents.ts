@@ -93,6 +93,8 @@ export default interface ClientToServerEvents {
   // Action button pressed with nothing to interact with: the server resolves
   // whichever field skill (Surf/Dive/Waterfall/Strength) the terrain allows.
   "player:field-interact": () => void;
+  // Click-to-fish: cast at an adjacent water tile (cell coords) the player tapped.
+  "fishing:cast": (data: { x: number; y: number }) => void;
   move: (data: { x: number; y: number }) => void;
   stopMove: () => void;
   shotProjectil: (data: { mouse_x: number; mouse_y: number }) => void;
@@ -305,6 +307,17 @@ export default interface ClientToServerEvents {
   "admin:user:delete": (data: { userId: number }) => void;
   "admin:user:set-password": (data: { userId: number; newPassword: string }) => void;
   "admin:user:send-recovery": (data: { userId: number }) => void;
+  /** Explicitly drop every live session of a user (admin decision — gifts and relocation never disconnect). */
+  "admin:user:disconnect": (data: { userId: number }) => void;
+  "admin:user:event-state:get": (data: { userId: number }) => void;
+  /** Replaces the user's event switches/variables (self-switches untouched). */
+  "admin:user:event-state:update": (data: {
+    userId: number;
+    switches?: Record<string, boolean>;
+    variables?: Record<string, number>;
+  }) => void;
+  /** Read-only PC box storage + public trainer profile for the admin panel. */
+  "admin:user:storage:get": (data: { userId: number }) => void;
   "admin:catalog:get": () => void;
   "admin:presence:subscribe": () => void;
   "admin:presence:unsubscribe": () => void;

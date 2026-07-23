@@ -2,6 +2,7 @@ import type {
   AdminCatalogPayload,
   AdminUserDetails,
   AdminUserListPayload,
+  PokemonSummary,
   RoleDefinitionWithCount
 } from "../components/Auth";
 import type {
@@ -214,6 +215,12 @@ export default interface ServerToClientEvents {
   "inventory:action": (data: {
     type: "town-map" | "bicycle" | "dowsing" | "fishing" | "poke-radar" | "generic";
   }) => void;
+  // Outcome of a click-to-fish cast. "bite" is followed by a battle:state; the
+  // client keeps the casting animation until this arrives, then shows the text.
+  "fishing:result": (data: {
+    status: "bite" | "no-bite" | "error";
+    message: string;
+  }) => void;
 
   shotProjectil: (data: ProjectilData) => void;
   explodeProjectil: (data: ProjectilData) => void;
@@ -321,6 +328,34 @@ export default interface ServerToClientEvents {
   "admin:users:list": (data: AdminUserListPayload) => void;
   "admin:user:details": (data: { user: AdminUserDetails | null }) => void;
   "admin:user:deleted": (data: { userId: number }) => void;
+  /** A user's event switches/variables snapshot for the admin Variables tab. */
+  "admin:user:event-state": (data: {
+    userId: number;
+    switches: Record<string, boolean>;
+    variables: Record<string, number>;
+    selfSwitches: Record<string, boolean>;
+  }) => void;
+  /** Read-only PC box storage + trainer profile for the admin panel. */
+  "admin:user:storage": (data: {
+    userId: number;
+    boxes: Array<{
+      id: string;
+      name: string;
+      capacity: number;
+      pokemon: PokemonSummary[];
+    }>;
+    profile: {
+      name: string;
+      username: string;
+      description: string;
+      profileImage: string;
+      characterSkinId: string;
+      trainerCardColor: string;
+      badges: number[];
+      money: number;
+      createdAt: string;
+    };
+  }) => void;
   "admin:catalog": (data: AdminCatalogPayload) => void;
   /** Real-time set of user ids currently online, pushed to subscribed admins. */
   "admin:presence:state": (data: { onlineUserIds: number[] }) => void;

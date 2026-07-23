@@ -723,6 +723,8 @@ export interface UseInventoryItemResult {
   user?: AuthenticatedUser | null;
   message: string;
   clientAction?: UseInventoryItemClientAction;
+  /** True when the action opened a wild battle (fishing bite / radar). */
+  battleStarted?: boolean;
 }
 
 export default class BattleManager {
@@ -1625,7 +1627,58 @@ export default class BattleManager {
       encounterRows: table.encounterRows
     };
     await this.startWildBattle(player, gated);
-    return { ok: true, message: `Oh! A bite! Something's on the ${item.name}!` };
+    return { ok: true, message: `Oh! A bite! Something's on the ${item.name}!`, battleStarted: true };
+  }
+
+  /**
+   * Click-to-fish entry point: the player tapped an adjacent water tile and
+   * chose "Fish". Picks the best rod they own, turns them to face the tile,
+   * and reuses the standard fishing cast (spot lookup / grass fallback /
+   * bite-chance). The wild battle, if any, arrives over `battle:state`.
+   */
+  public async fishAtCell(
+    userId: number,
+    player: Player,
+    target: { x: number; y: number }
+  ): Promise<UseInventoryItemResult> {
+    const user = await this.auth.getUserForBattle(userId);
+    if (!user) {
+      return { ok: false, message: "You can't fish right now." };
+    }
+    // Ensure item definitions are cached so essentialsId lookups resolve.
+    await this.loadCatalogs();
+
+    const rodOrder: Record<FishingRodTier, number> = { old: 0, good: 1, super: 2 };
+    let bestRod: { item: InventoryItem; tier: FishingRodTier } | null = null;
+    for (const inv of user.inventory) {
+      if (inv.quantity <= 0) {
+        continue;
+      }
+      const definition = this.getCachedItemDefinition(inv.id, inv.name);
+      const tier = definition
+        ? FISHING_ROD_TIERS[(definition.essentialsId ?? "").toUpperCase()]
+        : undefined;
+      if (!tier) {
+        continue;
+      }
+      if (!bestRod || rodOrder[tier] > rodOrder[bestRod.tier]) {
+        bestRod = { item: inv, tier };
+      }
+    }
+    if (!bestRod) {
+      return { ok: false, message: "You don't have a fishing rod." };
+    }
+
+    const cellSize = this.world.getMapCellSize(player.currentMapId);
+    const current = player.getCurrentCell(cellSize);
+    const distance = Math.abs(current.x - target.x) + Math.abs(current.y - target.y);
+    if (distance !== 1) {
+      return { ok: false, message: "Get closer to the water to fish." };
+    }
+
+    // Face the tapped tile, then run the standard facing-based cast.
+    player.faceCell(target, cellSize);
+    return this.useFishingRod(player, user, bestRod.tier, bestRod.item);
   }
 
   /**
