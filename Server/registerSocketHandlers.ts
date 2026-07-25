@@ -1135,7 +1135,41 @@ function createConnectionHandler(
         // what was added (new party members, item quantity deltas).
         const before = await auth.getUserAdminDetails(userId);
 
-        const result = await auth.updateUserByAdmin(userId, data.updates ?? {});
+        // Resolve an "automatic placement" savedLocation into concrete
+        // coordinates the persistence + teleport paths understand. The world's
+        // map definitions must be loaded first (they load lazily on addPlayer,
+        // so an admin acting on a fresh server may not have them yet) or the
+        // collision grid lookup would see an empty map and skip the safety
+        // spiral entirely.
+        const { savedLocation: rawSavedLocation, ...restUpdates } = data.updates ?? {};
+        let resolvedSavedLocation: { mapId: string; x: number; y: number } | null = null;
+        if (rawSavedLocation) {
+          const mapId = typeof rawSavedLocation.mapId === "string" ? rawSavedLocation.mapId.trim() : "";
+          if (!mapId) {
+            socket.emit("admin:error", { message: "Saved location must include a map and valid coordinates." });
+            return;
+          }
+
+          if (rawSavedLocation.automatic === true) {
+            applyPlayableMapsStateToWorld(world, await playableMapsStore.read());
+            const placement = world.resolveAutomaticPlacement(mapId);
+            resolvedSavedLocation = { mapId, x: placement.x, y: placement.y };
+          } else if (Number.isFinite(rawSavedLocation.x) && Number.isFinite(rawSavedLocation.y)) {
+            resolvedSavedLocation = { mapId, x: rawSavedLocation.x, y: rawSavedLocation.y };
+          } else {
+            socket.emit("admin:error", { message: "Saved location must include a map and valid coordinates." });
+            return;
+          }
+        }
+
+        // Hand updateUserByAdmin the concrete location (never the automatic
+        // form) so its validation and persistence stay coordinate-based.
+        const concreteUpdates = {
+          ...restUpdates,
+          ...(resolvedSavedLocation ? { savedLocation: resolvedSavedLocation } : {})
+        };
+
+        const result = await auth.updateUserByAdmin(userId, concreteUpdates);
         if ("error" in result) {
           socket.emit("admin:error", {
             message: result.error
@@ -1143,13 +1177,13 @@ function createConnectionHandler(
           return;
         }
 
-        if (data.updates?.savedLocation) {
+        if (resolvedSavedLocation) {
           const player = world.getPlayerByUserId(userId);
           if (player) {
             player.teleport(
-              data.updates.savedLocation.mapId,
-              data.updates.savedLocation.x,
-              data.updates.savedLocation.y
+              resolvedSavedLocation.mapId,
+              resolvedSavedLocation.x,
+              resolvedSavedLocation.y
             );
             world.players.set(player.socketId, player);
             world.presentPlayerToMap(player);
@@ -1165,7 +1199,7 @@ function createConnectionHandler(
         const adminName = socket.data.username || "An admin";
         const updates = data.updates ?? {};
 
-        if (updates.savedLocation) {
+        if (rawSavedLocation) {
           notifyUserSockets(io, userId, `${adminName} is relocating you`);
         }
 
@@ -2596,6 +2630,28 @@ function createConnectionHandler(
 
       socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
       socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("npc:store-sell-quotes", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to sell items." });
+        return;
+      }
+
+      const result = await battleManager.getNpcStoreSellQuotes(
+        socket.data.userId,
+        data?.npcPlacementId
+      );
+
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+
+      socket.emit("npc:store-sell-quotes", {
+        npcPlacementId: data?.npcPlacementId ?? "",
+        quotes: result.quotes
+      });
     });
 
     socket.on("npc:store-sell", async (data) => {

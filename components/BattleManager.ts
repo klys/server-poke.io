@@ -41,6 +41,7 @@ import {
 import { canSpeciesLearnMachineMove } from "./TmCompatibility";
 import { resolveHeldItemEffect, type HeldItemEffect } from "./battle/heldItems";
 import {
+  computeHiddenPower,
   computeModifiedPower,
   parseMoveEffect,
   rollMultiHitCount,
@@ -262,7 +263,52 @@ type BattleVolatileState = {
   /** Consecutive-use tracking (Fury Cutter). */
   lastMoveId: string | null;
   consecutiveMoveUses: number;
+  /** Disable: this move is sealed while turns remain. */
+  disable: { moveId: string; moveName: string; turns: number } | null;
+  /** Encore: locked into repeating this move. */
+  encore: { moveId: string; turns: number } | null;
+  tauntTurns: number;
+  torment: boolean;
+  healBlockTurns: number;
+  embargoTurns: number;
+  /** Imprison is set on the USER; opponents can't use its move names. */
+  imprison: boolean;
+  attractedToPokemonId: string | null;
+  /** Perish Song: 0 = off, otherwise counts down each end of turn; faint at 0. */
+  perishCount: number;
+  destinyBond: boolean;
+  grudge: boolean;
+  bide: { moveId: string; turnsLeft: number; storedDamage: number } | null;
+  stockpile: number;
+  substituteHp: number;
+  /** Transform: what to restore when the battler leaves the field. */
+  transformBackup: {
+    types: string[];
+    stats: BattleStats;
+    moves: BattleMove[];
+    frontImageSrc: string;
+    backImageSrc: string;
+  } | null;
+  lockOnTurns: number;
+  foresight: boolean;
+  miracleEye: boolean;
+  magnetRiseTurns: number;
+  telekinesisTurns: number;
+  electrified: boolean;
+  powdered: boolean;
+  /** Yawn: falls asleep when this reaches 0. */
+  yawnTurns: number;
+  /** Ghost-type Curse. */
+  cursed: boolean;
+  rampage: { moveId: string; turnsLeft: number; kind: "thrash" | "rollout" | "uproar" } | null;
+  /** Move ids used since entering the field (Last Resort). */
+  usedMoveIds: string[];
+  turnsOnField: number;
+  mudSport: boolean;
+  waterSport: boolean;
 };
+
+type BattleGender = "male" | "female" | "genderless";
 
 type BattlePokemon = {
   id: string;
@@ -271,6 +317,13 @@ type BattlePokemon = {
   nickname?: string;
   level: number;
   types: string[];
+  /** Species data used by Attract / Return / weight-based moves. */
+  gender: BattleGender;
+  baseHappiness: number;
+  weightKg: number;
+  /** Held item consumed this battle (Recycle) and berry-eaten flag (Belch). */
+  consumedItem: { id: string; name: string } | null;
+  ateBerry: boolean;
   hp: number;
   maxHp: number;
   experience: number;
@@ -315,6 +368,19 @@ type BattleSide = {
   screens?: { reflect: number; lightScreen: number };
   /** Whether this side's fight action already executed this turn (Sucker Punch, Payback). */
   hasActedThisTurn?: boolean;
+  /** Entry hazards laid on THIS side's field (hurt this side's switch-ins). */
+  hazards?: { spikes: number; toxicSpikes: number; stealthRock: boolean; stickyWeb: boolean };
+  /** Whole-side lingering effects, in turns remaining. */
+  sideEffects?: { tailwind: number; safeguard: number; mist: number; luckyChant: number };
+  /** Wish: heals whoever occupies the slot when the countdown ends. */
+  wish?: { turns: number; amount: number; wisherName: string } | null;
+  /** Future Sight aimed at this side's active slot. */
+  futureSight?: { turns: number; damage: number; moveName: string } | null;
+  /** Healing Wish/Lunar Dance blessing waiting for the next switch-in. */
+  pendingSwitchHeal?: "heal" | "lunar" | null;
+  /** A mon on this side fainted last turn (Retaliate). */
+  allyFaintedLastTurn?: boolean;
+  faintedThisTurn?: boolean;
 };
 
 type BattleQueuedAction =
@@ -349,6 +415,19 @@ type BattleSession = {
   battleBack: string | null;
   /** Active weather (Sunny Day/Rain Dance/Sandstorm/Hail/Shadow Sky). */
   weather: { kind: "sun" | "rain" | "sandstorm" | "hail" | "shadowsky"; turns: number } | null;
+  /** Field-wide effects, in turns remaining (0 = inactive). */
+  trickRoomTurns: number;
+  gravityTurns: number;
+  magicRoomTurns: number;
+  wonderRoomTurns: number;
+  terrain: { kind: "electric" | "grassy"; turns: number } | null;
+  /** Ion Deluge: Normal moves become Electric for the rest of this turn. */
+  ionDeluge: boolean;
+  /** Last move used by anyone this battle (Copycat). */
+  lastMoveUsed: { skillId: string; skillName: string } | null;
+  /** Pay Day pot and Happy Hour multiplier, paid to a winning player. */
+  extraMoney: number;
+  moneyMultiplier: number;
   /** Set while a player must choose which mon replaces their fainted active one. */
   replacementRequest: {
     sideId: BattleSideId;
@@ -377,11 +456,16 @@ type PokemonDefinition = {
   skills: Array<{ skillId: string; skillName: string; level: number }>;
   frontImageSrc: string;
   backImageSrc: string;
+  /** Fraction of the species that is female; -1 = genderless. */
+  femaleRatio: number;
+  baseHappiness: number;
+  weightKg: number;
 };
 
 type SkillDefinition = {
   id: string;
   name: string;
+  essentialsId: string;
   type: string;
   power: number;
   powerPoint: number;
@@ -650,7 +734,36 @@ function createEmptyVolatile(): BattleVolatileState {
     focusEnergy: false,
     damageTakenThisTurn: { physical: 0, special: 0, any: 0 },
     lastMoveId: null,
-    consecutiveMoveUses: 0
+    consecutiveMoveUses: 0,
+    disable: null,
+    encore: null,
+    tauntTurns: 0,
+    torment: false,
+    healBlockTurns: 0,
+    embargoTurns: 0,
+    imprison: false,
+    attractedToPokemonId: null,
+    perishCount: 0,
+    destinyBond: false,
+    grudge: false,
+    bide: null,
+    stockpile: 0,
+    substituteHp: 0,
+    transformBackup: null,
+    lockOnTurns: 0,
+    foresight: false,
+    miracleEye: false,
+    magnetRiseTurns: 0,
+    telekinesisTurns: 0,
+    electrified: false,
+    powdered: false,
+    yawnTurns: 0,
+    cursed: false,
+    rampage: null,
+    usedMoveIds: [],
+    turnsOnField: 0,
+    mudSport: false,
+    waterSport: false
   };
 }
 
@@ -726,6 +839,53 @@ function parseNumber(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isFinite(value)
     ? Math.round(value)
     : fallback;
+}
+
+function parseFloatNumber(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/** Essentials GenderRate names -> female fraction (-1 = genderless). */
+function parseFemaleRatio(raw: unknown): number {
+  switch (typeof raw === "string" ? raw.trim().toLowerCase() : "") {
+    case "alwaysmale":
+      return 0;
+    case "alwaysfemale":
+      return 1;
+    case "genderless":
+      return -1;
+    case "femaleoneeighth":
+      return 1 / 8;
+    case "female25percent":
+      return 0.25;
+    case "female75percent":
+      return 0.75;
+    case "femaleseveneighths":
+      return 7 / 8;
+    default:
+      return 0.5;
+  }
+}
+
+/**
+ * Stable per-individual gender: summaries don't persist one, so derive it
+ * from the pokemon's id so the same mon is always the same gender.
+ */
+function deriveGender(id: string, femaleRatio: number): BattleGender {
+  if (femaleRatio < 0) {
+    return "genderless";
+  }
+  if (femaleRatio <= 0) {
+    return "male";
+  }
+  if (femaleRatio >= 1) {
+    return "female";
+  }
+  let hash = 0;
+  for (let index = 0; index < id.length; index += 1) {
+    hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
+  }
+  return (hash % 1000) / 1000 < femaleRatio ? "female" : "male";
 }
 
 function normalizeStatKey(raw: string): BattleStatKey | null {
@@ -2449,6 +2609,53 @@ export default class BattleManager {
     };
   }
 
+  /**
+   * Per-unit prices this store pays for everything currently in the player's
+   * bag. Players don't hold the item catalog client-side, so the sell list's
+   * prices have to come from here.
+   */
+  public async getNpcStoreSellQuotes(userId: number, npcPlacementId?: string) {
+    const interaction = this.resolveNpcInteraction(userId, npcPlacementId);
+
+    if (!interaction.ok) {
+      return interaction;
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    await this.loadCatalogs();
+    const storeStock = this.resolveStoreStock(userId, interaction.placement);
+
+    if (!user || !storeStock) {
+      return { ok: false as const, message: "That store is unavailable right now." };
+    }
+
+    const quotes = user.inventory
+      .filter((item) => item.quantity > 0)
+      .map((item) => {
+        const definition = this.getCachedItemDefinition(item.id, item.name);
+
+        if (!definition || !this.isItemSellableToStores(definition)) {
+          return null;
+        }
+
+        const sellPrice = this.getStoreUnitBuybackPrice(definition, storeStock);
+
+        if (sellPrice <= 0) {
+          return null;
+        }
+
+        return {
+          itemId: item.id,
+          itemName: item.name,
+          quantity: item.quantity,
+          sellPrice
+        };
+      })
+      .filter((quote): quote is NonNullable<typeof quote> => Boolean(quote));
+
+    return { ok: true as const, quotes };
+  }
+
   public async sellToNpcStore(
     userId: number,
     npcPlacementId?: string,
@@ -2468,22 +2675,23 @@ export default class BattleManager {
       typeof quantity === "number" && Number.isFinite(quantity)
         ? Math.max(1, Math.round(quantity))
         : 1;
-    const storeItem = storeStock?.find((candidate) => candidate.itemId === itemId);
     const inventoryItem = user?.inventory.find((candidate) => candidate.id === itemId);
 
     if (!user || !storeStock) {
       return { ok: false, message: "That store is unavailable right now." };
     }
 
-    if (!storeItem) {
-      return { ok: false, message: "This store only buys items it keeps in stock." };
-    }
-
     if (!inventoryItem || inventoryItem.quantity < sellCount) {
       return { ok: false, message: "You do not have that many items to sell." };
     }
 
-    const sellPricePerUnit = this.getNpcStoreSellPrice(storeItem);
+    const itemDefinition = this.getCachedItemDefinition(inventoryItem.id, inventoryItem.name);
+
+    if (!itemDefinition || !this.isItemSellableToStores(itemDefinition)) {
+      return { ok: false, message: "This store does not buy that item." };
+    }
+
+    const sellPricePerUnit = this.getStoreUnitBuybackPrice(itemDefinition, storeStock);
 
     if (sellPricePerUnit <= 0) {
       return { ok: false, message: "This store is not buying that item right now." };
@@ -3391,6 +3599,15 @@ export default class BattleManager {
       summary: null,
       battleBack,
       weather: null,
+      trickRoomTurns: 0,
+      gravityTurns: 0,
+      magicRoomTurns: 0,
+      wonderRoomTurns: 0,
+      terrain: null,
+      ionDeluge: false,
+      lastMoveUsed: null,
+      extraMoney: 0,
+      moneyMultiplier: 1,
       replacementRequest: null
     };
 
@@ -3426,11 +3643,18 @@ export default class BattleManager {
   private startChoiceTurn(battle: BattleSession) {
     battle.sides.forEach((side) => {
       side.action = null;
-      // A mon mid two-turn move (Fly/Dig/Solar Beam...) is locked into
-      // releasing it — no new choice this turn.
+      // A mon mid two-turn move (Fly/Dig/Solar Beam...), rampage
+      // (Thrash/Rollout/Uproar) or Bide is locked into it — no new choice.
       const active = getActivePokemon(side);
-      if (active && !isFainted(active) && active.volatile.charging) {
-        side.action = { type: "fight", moveId: active.volatile.charging.moveId };
+      if (active && !isFainted(active)) {
+        active.volatile.turnsOnField += 1;
+        if (active.volatile.charging) {
+          side.action = { type: "fight", moveId: active.volatile.charging.moveId };
+        } else if (active.volatile.rampage) {
+          side.action = { type: "fight", moveId: active.volatile.rampage.moveId };
+        } else if (active.volatile.bide) {
+          side.action = { type: "fight", moveId: active.volatile.bide.moveId };
+        }
       }
     });
 
@@ -3553,6 +3777,30 @@ export default class BattleManager {
           await this.emitBattleStep(battle);
           continue;
         }
+
+        // Pursuit intercepts the fleeing target at double power.
+        const opponent = this.getOpponentSide(battle, side);
+        if (opponent.action?.type === "fight" && !opponent.hasActedThisTurn) {
+          const queued = this.getQueuedMove(opponent);
+          const queuedSpec = queued
+            ? parseMoveEffect(resolveFunctionCode(queued.functionCode ?? ""))
+            : null;
+          const pursuer = getActivePokemon(opponent);
+          if (queued && queuedSpec?.pursuit && pursuer && !isFainted(pursuer)) {
+            await this.executeMoveAction(battle, opponent, side, queued.id, { powerMult: 2 });
+            opponent.hasActedThisTurn = true;
+            opponent.action = { type: "pass" };
+            if (await this.handleFaintChecks(battle)) {
+              return;
+            }
+            if (isFainted(getActivePokemon(side))) {
+              // The departing mon fell to Pursuit; the faint flow already
+              // brought in a replacement, so the chosen switch is moot.
+              continue;
+            }
+          }
+        }
+
         const switched = this.switchPokemon(battle, side, side.action.pokemonId);
         if (switched) {
           const sentOut = getActivePokemon(side);
@@ -3563,10 +3811,21 @@ export default class BattleManager {
           );
           this.recordParticipation(battle);
           await this.emitBattleStep(battle);
+          await this.applySwitchInEffects(battle, side);
+          if (await this.handleFaintChecks(battle)) {
+            return;
+          }
         }
       }
     }
 
+    const sideSpeed = (side: BattleSide) => {
+      let speed = this.getModifiedStat(getActivePokemon(side), "speed");
+      if ((side.sideEffects?.tailwind ?? 0) > 0) {
+        speed *= 2;
+      }
+      return speed;
+    };
     const attackOrder = [firstSide, secondSide]
       .filter((side) => side.action?.type === "fight" && !isFainted(getActivePokemon(side)))
       .sort((left, right) => {
@@ -3577,9 +3836,12 @@ export default class BattleManager {
           return priorityDiff;
         }
 
-        const leftSpeed = this.getModifiedStat(getActivePokemon(left), "speed");
-        const rightSpeed = this.getModifiedStat(getActivePokemon(right), "speed");
-        return rightSpeed - leftSpeed || (Math.random() > 0.5 ? 1 : -1);
+        const leftSpeed = sideSpeed(left);
+        const rightSpeed = sideSpeed(right);
+        // Trick Room: the slower battler moves first (priority unaffected).
+        const speedDiff =
+          battle.trickRoomTurns > 0 ? leftSpeed - rightSpeed : rightSpeed - leftSpeed;
+        return speedDiff || (Math.random() > 0.5 ? 1 : -1);
       });
 
     for (const side of attackOrder) {
@@ -3686,50 +3948,61 @@ export default class BattleManager {
       return true;
     }
 
-    for (const side of battle.sides) {
-      const active = getActivePokemon(side);
-      if (!active || !isFainted(active)) {
-        continue;
+    // Entry hazards can faint the replacement too; sweep until stable.
+    let sweepAgain = true;
+    while (sweepAgain && battle.status === "active") {
+      sweepAgain = false;
+
+      for (const side of battle.sides) {
+        const active = getActivePokemon(side);
+        if (!active || !isFainted(active)) {
+          continue;
+        }
+
+        this.pushEvent(
+          battle,
+          { kind: "faint", sideId: side.id, pokemonId: active.id, pokemonName: getPokemonDisplayName(active) },
+          `${getPokemonDisplayName(active)} fainted.`
+        );
+        side.faintedThisTurn = true;
+        this.clearBattlerLeaveEffects(battle, side);
+        await this.emitBattleStep(battle);
+        await this.awardExperienceForFaint(battle, side, active);
+
+        if ((battle.status as BattleStatus) !== "active") {
+          return true;
+        }
+
+        const replaced = await this.chooseReplacement(battle, side);
+        if ((battle.status as BattleStatus) !== "active") {
+          return true;
+        }
+
+        if (!replaced) {
+          const winner = this.getOpponentSide(battle, side);
+          await this.finishBattle(battle, `${winner.trainerName} won the battle.`, winner, side);
+          return true;
+        }
+
+        // The replacement enters mid-turn; it must not inherit the fainted
+        // mon's queued move (skill ids are shared across species).
+        if (side.action?.type === "fight") {
+          side.action = { type: "pass" };
+        }
+
+        const sentOut = getActivePokemon(side);
+        this.pushEvent(
+          battle,
+          { kind: "switch", sideId: side.id, pokemon: getPublicPokemon(sentOut) },
+          `${side.trainerName} sent out ${getPokemonDisplayName(sentOut)}.`
+        );
+        this.recordParticipation(battle);
+        await this.emitBattleStep(battle);
+        await this.applySwitchInEffects(battle, side);
+        if (isFainted(getActivePokemon(side))) {
+          sweepAgain = true;
+        }
       }
-
-      this.pushEvent(
-        battle,
-        { kind: "faint", sideId: side.id, pokemonId: active.id, pokemonName: getPokemonDisplayName(active) },
-        `${getPokemonDisplayName(active)} fainted.`
-      );
-      this.clearBattlerLeaveEffects(battle, side);
-      await this.emitBattleStep(battle);
-      await this.awardExperienceForFaint(battle, side, active);
-
-      if ((battle.status as BattleStatus) !== "active") {
-        return true;
-      }
-
-      const replaced = await this.chooseReplacement(battle, side);
-      if ((battle.status as BattleStatus) !== "active") {
-        return true;
-      }
-
-      if (!replaced) {
-        const winner = this.getOpponentSide(battle, side);
-        await this.finishBattle(battle, `${winner.trainerName} won the battle.`, winner, side);
-        return true;
-      }
-
-      // The replacement enters mid-turn; it must not inherit the fainted
-      // mon's queued move (skill ids are shared across species).
-      if (side.action?.type === "fight") {
-        side.action = { type: "pass" };
-      }
-
-      const sentOut = getActivePokemon(side);
-      this.pushEvent(
-        battle,
-        { kind: "switch", sideId: side.id, pokemon: getPublicPokemon(sentOut) },
-        `${side.trainerName} sent out ${getPokemonDisplayName(sentOut)}.`
-      );
-      this.recordParticipation(battle);
-      await this.emitBattleStep(battle);
     }
 
     return battle.status !== "active";
@@ -3918,6 +4191,113 @@ export default class BattleManager {
         }
       }
 
+      // Ghost-type Curse: a quarter of max HP every turn.
+      if (pokemon.volatile.cursed && !isFainted(pokemon)) {
+        pushResidualDamage(
+          side,
+          pokemon,
+          Math.floor(pokemon.maxHp / 4),
+          `${displayName} is afflicted by the curse!`
+        );
+      }
+
+      // Grassy Terrain heals grounded battlers.
+      if (
+        battle.terrain?.kind === "grassy" &&
+        !isFainted(pokemon) &&
+        this.isGrounded(battle, pokemon) &&
+        pokemon.hp < pokemon.maxHp
+      ) {
+        pushResidualHeal(
+          side,
+          pokemon,
+          Math.floor(pokemon.maxHp / 16),
+          `${displayName} is healed by the grassy terrain!`
+        );
+      }
+
+      // Restriction & helper countdowns.
+      const volatile = pokemon.volatile;
+      if (volatile.disable) {
+        volatile.disable.turns -= 1;
+        if (volatile.disable.turns <= 0) {
+          this.say(battle, `${displayName}'s ${volatile.disable.moveName} is no longer disabled!`);
+          volatile.disable = null;
+          pushedAnyEvent = true;
+        }
+      }
+      if (volatile.encore) {
+        volatile.encore.turns -= 1;
+        const encoredMove = pokemon.moves.find((known) => known.id === volatile.encore?.moveId);
+        if (volatile.encore.turns <= 0 || !encoredMove || encoredMove.currentPp <= 0) {
+          volatile.encore = null;
+          this.say(battle, `${displayName}'s encore ended!`);
+          pushedAnyEvent = true;
+        }
+      }
+      if (volatile.tauntTurns > 0) {
+        volatile.tauntTurns -= 1;
+        if (volatile.tauntTurns <= 0) {
+          this.say(battle, `${displayName}'s taunt wore off!`);
+          pushedAnyEvent = true;
+        }
+      }
+      if (volatile.healBlockTurns > 0) {
+        volatile.healBlockTurns -= 1;
+        if (volatile.healBlockTurns <= 0) {
+          this.say(battle, `${displayName}'s Heal Block wore off!`);
+          pushedAnyEvent = true;
+        }
+      }
+      if (volatile.embargoTurns > 0) {
+        volatile.embargoTurns -= 1;
+        if (volatile.embargoTurns <= 0) {
+          this.say(battle, `${displayName} can use items again!`);
+          pushedAnyEvent = true;
+        }
+      }
+      if (volatile.magnetRiseTurns > 0) {
+        volatile.magnetRiseTurns -= 1;
+        if (volatile.magnetRiseTurns <= 0) {
+          this.say(battle, `${displayName}'s electromagnetism wore off!`);
+          pushedAnyEvent = true;
+        }
+      }
+      if (volatile.telekinesisTurns > 0) {
+        volatile.telekinesisTurns -= 1;
+        if (volatile.telekinesisTurns <= 0) {
+          this.say(battle, `${displayName} was freed from the telekinesis!`);
+          pushedAnyEvent = true;
+        }
+      }
+      if (volatile.lockOnTurns > 0) {
+        volatile.lockOnTurns -= 1;
+      }
+
+      // Yawn: the drowsy battler drops off at the end of the next turn.
+      if (volatile.yawnTurns > 0 && !isFainted(pokemon)) {
+        volatile.yawnTurns -= 1;
+        if (volatile.yawnTurns <= 0 && !pokemon.status && !isImmuneToStatus("sleep", pokemon.types)) {
+          pokemon.status = createStatusState("sleep");
+          this.pushEvent(
+            battle,
+            { kind: "status-applied", sideId: side.id, pokemonId: pokemon.id, status: "sleep" },
+            `${displayName} fell asleep!`
+          );
+          pushedAnyEvent = true;
+        }
+      }
+
+      // Perish Song.
+      if (volatile.perishCount > 0 && !isFainted(pokemon)) {
+        volatile.perishCount -= 1;
+        this.say(battle, `${displayName}'s perish count fell to ${volatile.perishCount}!`);
+        pushedAnyEvent = true;
+        if (volatile.perishCount <= 0) {
+          pushResidualDamage(side, pokemon, pokemon.hp, null);
+        }
+      }
+
       if (!isFainted(pokemon) && this.applyHeldItemTriggers(battle, side, pokemon)) {
         pushedAnyEvent = true;
       }
@@ -3926,6 +4306,84 @@ export default class BattleManager {
       pokemon.volatile.protected = false;
       pokemon.volatile.endure = false;
     }
+
+    // Wish and Future Sight resolve against whoever holds the slot now.
+    for (const side of battle.sides) {
+      const wish = side.wish;
+      if (wish) {
+        wish.turns -= 1;
+        if (wish.turns <= 0) {
+          side.wish = null;
+          const beneficiary = getActivePokemon(side);
+          if (beneficiary && !isFainted(beneficiary) && beneficiary.hp < beneficiary.maxHp) {
+            pushResidualHeal(side, beneficiary, wish.amount, `${wish.wisherName}'s wish came true!`);
+          }
+        }
+      }
+
+      const pendingHit = side.futureSight;
+      if (pendingHit) {
+        pendingHit.turns -= 1;
+        if (pendingHit.turns <= 0) {
+          side.futureSight = null;
+          const victim = getActivePokemon(side);
+          if (victim && !isFainted(victim)) {
+            this.say(battle, `${getPokemonDisplayName(victim)} took the ${pendingHit.moveName} attack!`);
+            pushResidualDamage(side, victim, pendingHit.damage, null);
+          }
+        }
+      }
+
+      const effects = side.sideEffects;
+      if (effects) {
+        if (effects.tailwind > 0 && --effects.tailwind <= 0) {
+          this.say(battle, `${side.trainerName}'s tailwind petered out!`);
+          pushedAnyEvent = true;
+        }
+        if (effects.safeguard > 0 && --effects.safeguard <= 0) {
+          this.say(battle, `${side.trainerName}'s team is no longer protected by Safeguard!`);
+          pushedAnyEvent = true;
+        }
+        if (effects.mist > 0 && --effects.mist <= 0) {
+          this.say(battle, `${side.trainerName}'s mist faded!`);
+          pushedAnyEvent = true;
+        }
+        if (effects.luckyChant > 0 && --effects.luckyChant <= 0) {
+          this.say(battle, `${side.trainerName}'s Lucky Chant wore off!`);
+          pushedAnyEvent = true;
+        }
+      }
+
+      side.allyFaintedLastTurn = Boolean(side.faintedThisTurn);
+      side.faintedThisTurn = false;
+    }
+
+    // Field-wide countdowns.
+    if (battle.trickRoomTurns > 0 && --battle.trickRoomTurns <= 0) {
+      this.say(battle, "The twisted dimensions returned to normal!");
+      pushedAnyEvent = true;
+    }
+    if (battle.gravityTurns > 0 && --battle.gravityTurns <= 0) {
+      this.say(battle, "Gravity returned to normal!");
+      pushedAnyEvent = true;
+    }
+    if (battle.magicRoomTurns > 0 && --battle.magicRoomTurns <= 0) {
+      this.say(battle, "The area returned to normal!");
+      pushedAnyEvent = true;
+    }
+    if (battle.wonderRoomTurns > 0 && --battle.wonderRoomTurns <= 0) {
+      this.say(battle, "Wonder Room wore off!");
+      pushedAnyEvent = true;
+    }
+    if (battle.terrain) {
+      battle.terrain.turns -= 1;
+      if (battle.terrain.turns <= 0) {
+        battle.terrain = null;
+        this.say(battle, "The terrain returned to normal.");
+        pushedAnyEvent = true;
+      }
+    }
+    battle.ionDeluge = false;
 
     // Screens wear off.
     for (const side of battle.sides) {
@@ -3959,6 +4417,11 @@ export default class BattleManager {
   /** Returns true when at least one event was pushed. */
   private applyHeldItemTriggers(battle: BattleSession, side: BattleSide, pokemon: BattlePokemon): boolean {
     if (!pokemon.heldItemId) {
+      return false;
+    }
+
+    // Magic Room suspends every held item; Embargo blocks this battler's.
+    if (battle.magicRoomTurns > 0 || pokemon.volatile.embargoTurns > 0) {
       return false;
     }
 
@@ -4055,6 +4518,13 @@ export default class BattleManager {
   }
 
   private consumeHeldItem(pokemon: BattlePokemon) {
+    // Remember what was eaten for Recycle and Belch.
+    if (pokemon.heldItemId) {
+      pokemon.consumedItem = { id: pokemon.heldItemId, name: pokemon.heldItemName ?? "" };
+      if (this.pokemonHoldsBerry(pokemon)) {
+        pokemon.ateBerry = true;
+      }
+    }
     pokemon.heldItemId = null;
     pokemon.heldItemName = null;
     if (pokemon.originalSummary) {
@@ -4363,6 +4833,8 @@ export default class BattleManager {
     this.clearBattleTimer(battle);
     // Unblock a turn that is suspended waiting for a replacement choice.
     battle.replacementRequest?.resolve(null);
+    // Transform is battle-only: revert copies before anything persists.
+    battle.sides.forEach((side) => side.party.forEach((pokemon) => this.restoreTransform(pokemon)));
 
     if (battle.kind === "trainer" && winner?.userId && loser?.userId) {
       const transferAmount = Math.max(0, Math.min(PVP_SURRENDER_REWARD, loser.money));
@@ -4373,13 +4845,24 @@ export default class BattleManager {
         `${winner.trainerName} received $${transferAmount}.`
       ];
     } else if (battle.kind === "trainer" && winner?.userId && loser?.isAi && loser.money > 0) {
-      const prize = loser.money;
+      // Happy Hour doubles the prize money.
+      const prize = loser.money * Math.max(1, battle.moneyMultiplier);
       loser.money = 0;
       winner.money += prize;
       this.pushEvent(
         battle,
         { kind: "message", text: `${winner.trainerName} got $${prize} for winning!` },
         `${winner.trainerName} got $${prize} for winning!`
+      );
+    }
+
+    // Pay Day's scattered coins go to a victorious player.
+    if (battle.extraMoney > 0 && winner?.userId) {
+      winner.money += battle.extraMoney;
+      this.pushEvent(
+        battle,
+        { kind: "message", text: `${winner.trainerName} picked up $${battle.extraMoney}!` },
+        `${winner.trainerName} picked up $${battle.extraMoney}!`
       );
     }
 
@@ -4721,7 +5204,29 @@ export default class BattleManager {
 
   private chooseAiAction(side: BattleSide, opponent: BattleSide): BattleQueuedAction {
     const activePokemon = getActivePokemon(side);
-    const moves = getUsableMoves(activePokemon);
+    const volatile = activePokemon.volatile;
+    const opponentActive = getActivePokemon(opponent);
+    let moves = getUsableMoves(activePokemon).filter((move) => {
+      if (volatile.disable?.moveId === move.id) {
+        return false;
+      }
+      if (volatile.encore && move.id !== volatile.encore.moveId) {
+        return false;
+      }
+      if (volatile.tauntTurns > 0 && move.damageClass === "status") {
+        return false;
+      }
+      if (volatile.torment && volatile.lastMoveId === move.id) {
+        return false;
+      }
+      if (opponentActive?.volatile.imprison && opponentActive.moves.some((known) => known.name === move.name)) {
+        return false;
+      }
+      return true;
+    });
+    if (moves.length === 0) {
+      moves = getUsableMoves(activePokemon);
+    }
 
     if (moves.length === 0) {
       return { type: "pass" };
@@ -4964,6 +5469,8 @@ export default class BattleManager {
   }
 
   private cachedItemDefinitions: ItemDefinition[] = [];
+  private cachedSkillsById = new Map<string, SkillDefinition>();
+  private cachedSkillsByEssentialsId = new Map<string, SkillDefinition>();
   private eventMartResolver:
     | ((userId: number, placementId: string) => NpcStoreDefinition[] | null)
     | null = null;
@@ -5136,6 +5643,39 @@ export default class BattleManager {
     return Math.max(0, Math.floor(perUnitBuyPrice / 2));
   }
 
+  /** Stores refuse to trade move machines (MO/MT), quest items and anything
+   * without a catalog price. */
+  private isItemSellableToStores(definition: ItemDefinition) {
+    if (definition.machineKind !== null) {
+      return false;
+    }
+
+    if (
+      definition.type === "machines" ||
+      definition.type === "skill item" ||
+      definition.type === "quest item"
+    ) {
+      return false;
+    }
+
+    return definition.price > 0;
+  }
+
+  /** Per-unit buyback: half the store's own price when the item is in stock,
+   * half the catalog price otherwise. */
+  private getStoreUnitBuybackPrice(
+    definition: ItemDefinition,
+    storeStock: NpcStoreDefinition[]
+  ) {
+    const storeItem = storeStock.find((candidate) => candidate.itemId === definition.id);
+
+    if (storeItem) {
+      return this.getNpcStoreSellPrice(storeItem);
+    }
+
+    return Math.max(0, Math.floor(definition.price / 2));
+  }
+
   private switchPokemon(battle: BattleSession, side: BattleSide, pokemonId: string) {
     const targetIndex = side.party.findIndex((pokemon) => pokemon.id === pokemonId);
     if (targetIndex < 0 || targetIndex === side.activeIndex || isFainted(side.party[targetIndex])) {
@@ -5167,64 +5707,625 @@ export default class BattleManager {
       if (opponent.volatile.trappedByPokemonId === leaving.id) {
         opponent.volatile.trappedByPokemonId = null;
       }
+      if (opponent.volatile.attractedToPokemonId === leaving.id) {
+        opponent.volatile.attractedToPokemonId = null;
+      }
     }
 
+    this.restoreTransform(leaving);
     leaving.volatile = createEmptyVolatile();
+  }
+
+  /** Undo a Transform copy when the battler leaves the field (or battle ends). */
+  private restoreTransform(pokemon: BattlePokemon) {
+    const backup = pokemon.volatile.transformBackup;
+    if (!backup) {
+      return;
+    }
+    pokemon.types = backup.types;
+    pokemon.stats = backup.stats;
+    pokemon.moves = backup.moves;
+    pokemon.frontImageSrc = backup.frontImageSrc;
+    pokemon.backImageSrc = backup.backImageSrc;
+    pokemon.volatile.transformBackup = null;
+  }
+
+  /**
+   * Pre-move restriction checks mirroring pbCanChooseMove: Disable, Taunt,
+   * Torment, Imprison, Heal Block, Gravity, Focus Punch, Last Resort, Belch.
+   * Returns the failure message, or null when the move may proceed.
+   */
+  private checkMoveRestrictions(
+    battle: BattleSession,
+    side: BattleSide,
+    target: BattleSide,
+    attacker: BattlePokemon,
+    move: BattleMove,
+    spec: MoveEffectSpec
+  ): string | null {
+    const name = getPokemonDisplayName(attacker);
+
+    if (attacker.volatile.disable?.moveId === move.id) {
+      return `${name}'s ${move.name} is disabled!`;
+    }
+
+    if (attacker.volatile.tauntTurns > 0 && move.damageClass === "status") {
+      return `${name} can't use ${move.name} after the taunt!`;
+    }
+
+    if (
+      attacker.volatile.torment &&
+      attacker.volatile.lastMoveId === move.id &&
+      attacker.volatile.consecutiveMoveUses > 0
+    ) {
+      return `${name} can't use the same move twice in a row due to the torment!`;
+    }
+
+    const opponent = getActivePokemon(target);
+    if (
+      opponent &&
+      !isFainted(opponent) &&
+      opponent.volatile.imprison &&
+      opponent.moves.some((known) => known.name === move.name)
+    ) {
+      return `${name} can't use its sealed ${move.name}!`;
+    }
+
+    if (
+      attacker.volatile.healBlockTurns > 0 &&
+      (spec.healUserFraction > 0 ||
+        spec.healUserByWeather ||
+        spec.drainFraction > 0 ||
+        spec.wishUser ||
+        spec.swallow ||
+        spec.aquaRing ||
+        spec.ingrain ||
+        spec.healTargetHalf)
+    ) {
+      return `${name} can't use ${move.name} because of Heal Block!`;
+    }
+
+    if (
+      battle.gravityTurns > 0 &&
+      (spec.twoTurn?.invulnerable === "sky" || spec.magnetRiseUser || spec.telekinesisTarget)
+    ) {
+      return `${name} can't use ${move.name} because of gravity!`;
+    }
+
+    if (spec.focusPunch && attacker.volatile.damageTakenThisTurn.any > 0) {
+      return `${name} lost its focus and couldn't move!`;
+    }
+
+    if (
+      spec.lastResort &&
+      (attacker.moves.length < 2 ||
+        attacker.moves.some(
+          (known) => known.id !== move.id && !attacker.volatile.usedMoveIds.includes(known.id)
+        ))
+    ) {
+      return `${name} can't use ${move.name} until its other moves have been used!`;
+    }
+
+    if (spec.belch && !attacker.ateBerry) {
+      return `${name} hasn't eaten a berry, so ${move.name} failed!`;
+    }
+
+    // Fake Out: only on the user's first turn after entering the field.
+    if (spec.failsIfNotFirstTurn && attacker.volatile.turnsOnField > 1) {
+      return `${name} can't use ${move.name} except right after entering battle!`;
+    }
+
+    return null;
+  }
+
+  /** Resolves the move a call move (Metronome, Mirror Move...) will execute. */
+  private resolveCalledMove(
+    battle: BattleSession,
+    side: BattleSide,
+    target: BattleSide,
+    attacker: BattlePokemon,
+    kind: NonNullable<MoveEffectSpec["callMove"]>
+  ): { move: BattleMove; powerMult?: number } | null {
+    const buildFromSkill = (skill: SkillDefinition | undefined | null) =>
+      skill ? this.buildBattleMove(skill) : null;
+
+    switch (kind) {
+      case "metronome": {
+        const candidates = [...this.cachedSkillsById.values()].filter((skill) => {
+          const calledSpec = parseMoveEffect(resolveFunctionCode(skill.functionCode ?? ""));
+          return !calledSpec.callMove && !calledSpec.protectUser && !calledSpec.struggleRecoil;
+        });
+        if (candidates.length === 0) {
+          return null;
+        }
+        const built = buildFromSkill(chooseRandom(candidates));
+        return built ? { move: built } : null;
+      }
+      case "mirror-move": {
+        const opponent = getActivePokemon(target);
+        const lastId = opponent?.volatile.lastMoveId ?? null;
+        const built = buildFromSkill(lastId ? this.cachedSkillsById.get(lastId) : null);
+        return built ? { move: built } : null;
+      }
+      case "copycat": {
+        const last = battle.lastMoveUsed;
+        if (!last) {
+          return null;
+        }
+        const skill = this.cachedSkillsById.get(last.skillId);
+        const calledSpec = skill ? parseMoveEffect(resolveFunctionCode(skill.functionCode ?? "")) : null;
+        if (!skill || calledSpec?.callMove === "copycat") {
+          return null;
+        }
+        const built = buildFromSkill(skill);
+        return built ? { move: built } : null;
+      }
+      case "sleep-talk": {
+        const usable = attacker.moves.filter((known) => {
+          const knownSpec = parseMoveEffect(resolveFunctionCode(known.functionCode ?? ""));
+          return !knownSpec.callMove && !knownSpec.twoTurn && !knownSpec.bide;
+        });
+        if (usable.length === 0) {
+          return null;
+        }
+        return { move: { ...chooseRandom(usable) } };
+      }
+      case "assist": {
+        const pool = side.party
+          .filter((member) => member.id !== attacker.id)
+          .flatMap((member) => member.moves)
+          .filter((known) => {
+            const knownSpec = parseMoveEffect(resolveFunctionCode(known.functionCode ?? ""));
+            return !knownSpec.callMove && !knownSpec.protectUser && !knownSpec.teleportUser;
+          });
+        if (pool.length === 0) {
+          return null;
+        }
+        return { move: { ...chooseRandom(pool) } };
+      }
+      case "nature-power": {
+        // Environment mapping from the battleback, as the original does from
+        // the terrain tag; Tri Attack is the default.
+        const back = (battle.battleBack ?? "").toLowerCase();
+        const internal =
+          back.includes("water") || back.includes("sea") || back.includes("underwater")
+            ? "SURF"
+            : back.includes("cave") || back.includes("rock") || back.includes("mountain")
+              ? "ROCKSLIDE"
+              : back.includes("sand")
+                ? "EARTHQUAKE"
+                : back.includes("grass") || back.includes("forest")
+                  ? "STUNSPORE"
+                  : "TRIATTACK";
+        const built = buildFromSkill(
+          this.cachedSkillsByEssentialsId.get(internal) ?? this.cachedSkillsByEssentialsId.get("TRIATTACK")
+        );
+        return built ? { move: built } : null;
+      }
+      case "me-first": {
+        const queued = this.getQueuedMove(target);
+        if (!queued || queued.damageClass === "status" || target.hasActedThisTurn) {
+          return null;
+        }
+        return { move: { ...queued }, powerMult: 1.5 };
+      }
+      default:
+        return null;
+    }
+  }
+
+  /** Type effectiveness with Foresight/Miracle Eye/Gravity/airborne overrides. */
+  private getEffectivenessAgainst(battle: BattleSession, moveType: string, defender: BattlePokemon) {
+    let effectiveness = this.getEffectiveness(moveType, defender.types);
+    const upperType = moveType.trim().toUpperCase();
+    const defenderTypes = defender.types.map((type) => type.trim().toUpperCase());
+
+    if (
+      effectiveness === 0 &&
+      defender.volatile.foresight &&
+      (upperType === "NORMAL" || upperType === "FIGHTING") &&
+      defenderTypes.includes("GHOST")
+    ) {
+      effectiveness = 1;
+    }
+
+    if (
+      effectiveness === 0 &&
+      defender.volatile.miracleEye &&
+      upperType === "PSYCHIC" &&
+      defenderTypes.includes("DARK")
+    ) {
+      effectiveness = 1;
+    }
+
+    if (upperType === "GROUND") {
+      if (battle.gravityTurns > 0) {
+        if (effectiveness === 0 && defenderTypes.includes("FLYING")) {
+          effectiveness = 1;
+        }
+      } else if (defender.volatile.magnetRiseTurns > 0 || defender.volatile.telekinesisTurns > 0) {
+        effectiveness = 0;
+      }
+    }
+
+    return effectiveness;
+  }
+
+  private isGrounded(battle: BattleSession, pokemon: BattlePokemon) {
+    if (battle.gravityTurns > 0) {
+      return true;
+    }
+    if (pokemon.volatile.magnetRiseTurns > 0 || pokemon.volatile.telekinesisTurns > 0) {
+      return false;
+    }
+    return !pokemon.types.some((type) => type.trim().toUpperCase() === "FLYING");
+  }
+
+  private pokemonHoldsBerry(pokemon: BattlePokemon) {
+    if (!pokemon.heldItemId) {
+      return false;
+    }
+    const definition = this.getCachedItemDefinition(pokemon.heldItemId, pokemon.heldItemName ?? "");
+    const name = (pokemon.heldItemName ?? definition?.name ?? "").toLowerCase();
+    return definition?.category === "berries" || name.includes("baya") || name.includes("berry");
+  }
+
+  /** Roar / Whirlwind / Dragon Tail: drag out a random replacement. */
+  private async applyForcedSwitch(battle: BattleSession, side: BattleSide, target: BattleSide) {
+    const defender = getActivePokemon(target);
+    if (battle.kind === "wild" && target.isAi) {
+      this.say(battle, `${getPokemonDisplayName(defender)} was blown away!`);
+      await this.emitBattleStep(battle);
+      await this.finishBattle(battle, "The wild Pokemon was blown away!", null, null);
+      return;
+    }
+
+    const candidates = target.party.filter(
+      (member) => member.id !== defender.id && !isFainted(member)
+    );
+    if (candidates.length === 0) {
+      this.say(battle, "But it failed!");
+      return;
+    }
+
+    const chosen = chooseRandom(candidates);
+    this.switchPokemon(battle, target, chosen.id);
+    const sentOut = getActivePokemon(target);
+    this.pushEvent(
+      battle,
+      { kind: "switch", sideId: target.id, pokemon: getPublicPokemon(sentOut) },
+      `${getPokemonDisplayName(sentOut)} was dragged out!`
+    );
+    // A dragged-out replacement loses its queued action.
+    if (target.action?.type === "fight") {
+      target.action = { type: "pass" };
+    }
+    this.recordParticipation(battle);
+    await this.emitBattleStep(battle);
+    await this.applySwitchInEffects(battle, target);
+  }
+
+  /** U-turn / Volt Switch / Baton Pass: the user rotates out mid-turn. */
+  private async applyUserSwitch(battle: BattleSession, side: BattleSide, batonPass: boolean) {
+    const active = getActivePokemon(side);
+    const candidates = side.party.filter((member) => member.id !== active.id && !isFainted(member));
+    if (candidates.length === 0) {
+      if (batonPass) {
+        this.say(battle, "But it failed!");
+      }
+      return;
+    }
+
+    const passState = batonPass
+      ? {
+          stages: { ...active.stages },
+          confusionTurns: active.volatile.confusionTurns,
+          substituteHp: active.volatile.substituteHp,
+          perishCount: active.volatile.perishCount,
+          seededBySideId: active.volatile.seededBySideId,
+          focusEnergy: active.volatile.focusEnergy,
+          aquaRing: active.volatile.aquaRing,
+          ingrain: active.volatile.ingrain,
+          trappedByPokemonId: active.volatile.trappedByPokemonId,
+          embargoTurns: active.volatile.embargoTurns,
+          healBlockTurns: active.volatile.healBlockTurns,
+          magnetRiseTurns: active.volatile.magnetRiseTurns,
+          telekinesisTurns: active.volatile.telekinesisTurns,
+          lockOnTurns: active.volatile.lockOnTurns,
+          cursed: active.volatile.cursed
+        }
+      : null;
+
+    this.say(battle, `${getPokemonDisplayName(active)} went back to ${side.trainerName}!`);
+
+    let chosenId = candidates[0].id;
+    if (!side.isAi && side.playerId && candidates.length > 1) {
+      this.say(battle, `${side.trainerName}, choose your next Pokemon.`);
+      const picked = await this.waitForReplacementChoice(battle, side);
+      if (battle.status !== "active") {
+        return;
+      }
+      if (picked && candidates.some((member) => member.id === picked)) {
+        chosenId = picked;
+      }
+    }
+
+    this.switchPokemon(battle, side, chosenId);
+    const sentOut = getActivePokemon(side);
+    if (passState) {
+      sentOut.stages = passState.stages;
+      sentOut.volatile.confusionTurns = passState.confusionTurns;
+      sentOut.volatile.substituteHp = passState.substituteHp;
+      sentOut.volatile.perishCount = passState.perishCount;
+      sentOut.volatile.seededBySideId = passState.seededBySideId;
+      sentOut.volatile.focusEnergy = passState.focusEnergy;
+      sentOut.volatile.aquaRing = passState.aquaRing;
+      sentOut.volatile.ingrain = passState.ingrain;
+      sentOut.volatile.trappedByPokemonId = passState.trappedByPokemonId;
+      sentOut.volatile.embargoTurns = passState.embargoTurns;
+      sentOut.volatile.healBlockTurns = passState.healBlockTurns;
+      sentOut.volatile.magnetRiseTurns = passState.magnetRiseTurns;
+      sentOut.volatile.telekinesisTurns = passState.telekinesisTurns;
+      sentOut.volatile.lockOnTurns = passState.lockOnTurns;
+      sentOut.volatile.cursed = passState.cursed;
+    }
+    this.pushEvent(
+      battle,
+      { kind: "switch", sideId: side.id, pokemon: getPublicPokemon(sentOut) },
+      `${side.trainerName} sent out ${getPokemonDisplayName(sentOut)}.`
+    );
+    if (side.action?.type === "fight") {
+      side.action = { type: "pass" };
+    }
+    this.recordParticipation(battle);
+    await this.emitBattleStep(battle);
+    await this.applySwitchInEffects(battle, side);
+  }
+
+  /**
+   * Everything that greets a switch-in: Healing Wish/Lunar Dance blessings,
+   * then entry hazards (Spikes 1/8-1/6-1/4, Stealth Rock 1/8 x type
+   * effectiveness, Toxic Spikes, Sticky Web), exactly as pbOnActiveOne does.
+   */
+  private async applySwitchInEffects(battle: BattleSession, side: BattleSide) {
+    const pokemon = getActivePokemon(side);
+    if (!pokemon || isFainted(pokemon)) {
+      return;
+    }
+    const displayName = getPokemonDisplayName(pokemon);
+    let pushedAny = false;
+
+    if (side.pendingSwitchHeal) {
+      const kind = side.pendingSwitchHeal;
+      side.pendingSwitchHeal = null;
+      const healed = pokemon.maxHp - pokemon.hp;
+      pokemon.hp = pokemon.maxHp;
+      pokemon.status = null;
+      if (kind === "lunar") {
+        pokemon.moves.forEach((known) => {
+          known.currentPp = known.maxPp;
+        });
+      }
+      this.pushEvent(
+        battle,
+        {
+          kind: "heal",
+          sideId: side.id,
+          pokemonId: pokemon.id,
+          amount: Math.max(1, healed),
+          hpAfter: pokemon.hp,
+          maxHp: pokemon.maxHp,
+          source: "move"
+        },
+        `The wish came true for ${displayName}!`
+      );
+      pushedAny = true;
+    }
+
+    const hazards = side.hazards;
+    if (hazards) {
+      const grounded = this.isGrounded(battle, pokemon);
+
+      if (hazards.spikes > 0 && grounded && !isFainted(pokemon)) {
+        const divisor = [8, 6, 4][Math.min(3, hazards.spikes) - 1];
+        const damage = Math.max(1, Math.floor(pokemon.maxHp / divisor));
+        pokemon.hp = Math.max(0, pokemon.hp - damage);
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: side.id,
+            pokemonId: pokemon.id,
+            amount: damage,
+            hpAfter: pokemon.hp,
+            maxHp: pokemon.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "status"
+          },
+          `${displayName} is hurt by the spikes!`
+        );
+        pushedAny = true;
+      }
+
+      if (hazards.stealthRock && !isFainted(pokemon)) {
+        const effectiveness = this.getEffectiveness("ROCK", pokemon.types);
+        if (effectiveness > 0) {
+          const damage = Math.max(1, Math.floor((pokemon.maxHp * effectiveness) / 8));
+          pokemon.hp = Math.max(0, pokemon.hp - damage);
+          this.pushEvent(
+            battle,
+            {
+              kind: "damage",
+              sideId: side.id,
+              pokemonId: pokemon.id,
+              amount: damage,
+              hpAfter: pokemon.hp,
+              maxHp: pokemon.maxHp,
+              effectiveness: 1,
+              critical: false,
+              source: "status"
+            },
+            `Pointed stones dug into ${displayName}!`
+          );
+          pushedAny = true;
+        }
+      }
+
+      if (hazards.toxicSpikes > 0 && grounded && !isFainted(pokemon)) {
+        const types = pokemon.types.map((type) => type.trim().toUpperCase());
+        if (types.includes("POISON")) {
+          hazards.toxicSpikes = 0;
+          this.say(battle, `The toxic spikes around ${displayName} disappeared!`);
+          pushedAny = true;
+        } else if (!pokemon.status && !isImmuneToStatus("poison", pokemon.types)) {
+          pokemon.status = createStatusState(hazards.toxicSpikes >= 2 ? "toxic" : "poison");
+          this.pushEvent(
+            battle,
+            {
+              kind: "status-applied",
+              sideId: side.id,
+              pokemonId: pokemon.id,
+              status: pokemon.status.id
+            },
+            `${displayName} was poisoned by the toxic spikes!`
+          );
+          pushedAny = true;
+        }
+      }
+
+      if (hazards.stickyWeb && grounded && !isFainted(pokemon)) {
+        this.say(battle, `${displayName} was caught in a sticky web!`);
+        this.applyStatStageChange(battle, side, pokemon, "speed", -1, true);
+        pushedAny = true;
+      }
+    }
+
+    if (pushedAny) {
+      await this.emitBattleStep(battle);
+    }
   }
 
   private async executeMoveAction(
     battle: BattleSession,
     side: BattleSide,
     target: BattleSide,
-    moveId: string
+    moveId: string,
+    opts: { calledMove?: BattleMove; depth?: number; powerMult?: number } = {}
   ) {
+    const depth = opts.depth ?? 0;
     const attacker = getActivePokemon(side);
     const defender = getActivePokemon(target);
-    const move = attacker.moves.find((candidate) => candidate.id === moveId);
+    let move = opts.calledMove ?? attacker.moves.find((candidate) => candidate.id === moveId);
     const attackerName = getPokemonDisplayName(attacker);
     const defenderName = getPokemonDisplayName(defender);
 
-    if (!move || move.currentPp <= 0) {
+    if (!move || (!opts.calledMove && move.currentPp <= 0)) {
       this.say(battle, `${attackerName} had no skill to use.`);
       await this.emitBattleStep(battle);
       return;
     }
 
-    if (attacker.volatile.flinched) {
-      this.pushEvent(
-        battle,
-        { kind: "flinch", sideId: side.id, pokemonId: attacker.id },
-        `${attackerName} flinched and couldn't move!`
-      );
-      await this.emitBattleStep(battle);
-      return;
+    if (depth === 0) {
+      // Destiny Bond / Grudge last until the user's next action.
+      attacker.volatile.destinyBond = false;
+      attacker.volatile.grudge = false;
+
+      if (attacker.volatile.flinched) {
+        if (attacker.volatile.rampage) {
+          attacker.volatile.rampage = null;
+        }
+        this.pushEvent(
+          battle,
+          { kind: "flinch", sideId: side.id, pokemonId: attacker.id },
+          `${attackerName} flinched and couldn't move!`
+        );
+        await this.emitBattleStep(battle);
+        return;
+      }
+
+      // Hyper Beam family: the turn after a successful hit is spent recharging.
+      if (attacker.volatile.recharging) {
+        attacker.volatile.recharging = false;
+        this.say(battle, `${attackerName} must recharge!`);
+        await this.emitBattleStep(battle);
+        return;
+      }
+
+      // Bide: two storing turns, then the payback replaces the move entirely.
+      const bide = attacker.volatile.bide;
+      if (bide) {
+        bide.turnsLeft -= 1;
+        if (bide.turnsLeft > 0) {
+          this.say(battle, `${attackerName} is storing energy!`);
+          await this.emitBattleStep(battle);
+          return;
+        }
+        attacker.volatile.bide = null;
+        this.say(battle, `${attackerName} unleashed its energy!`);
+        if (bide.storedDamage <= 0 || isFainted(defender)) {
+          this.say(battle, "But it failed!");
+        } else {
+          this.applyDirectDamage(battle, target, defender, bide.storedDamage * 2, parseMoveEffect(""));
+        }
+        await this.emitBattleStep(battle);
+        return;
+      }
+
+      // Encore: the target repeats its encored move no matter what it chose.
+      const encore = attacker.volatile.encore;
+      if (encore && move.id !== encore.moveId) {
+        const encored = attacker.moves.find((candidate) => candidate.id === encore.moveId);
+        if (encored && encored.currentPp > 0) {
+          move = encored;
+        }
+      }
+
+      const preSpec = parseMoveEffect(resolveFunctionCode(move.functionCode ?? ""));
+      const isAsleep = attacker.status?.id === "sleep";
+      const statusCheck = checkStatusBeforeMove(attacker.status, attackerName);
+      if (statusCheck.cured && attacker.status) {
+        this.pushEvent(
+          battle,
+          { kind: "status-cured", sideId: side.id, pokemonId: attacker.id, status: attacker.status.id },
+          statusCheck.message
+        );
+        attacker.status = null;
+      } else if (statusCheck.message) {
+        this.say(battle, statusCheck.message);
+      }
+      if (!statusCheck.canMove) {
+        // Sleep Talk and Snore work while asleep; everything else stays blocked.
+        const worksAsleep =
+          isAsleep && (preSpec.callMove === "sleep-talk" || preSpec.usableOnlyIfAsleep);
+        if (!worksAsleep) {
+          await this.emitBattleStep(battle);
+          return;
+        }
+      } else if (preSpec.usableOnlyIfAsleep && !isAsleep) {
+        this.say(battle, `${attackerName} used ${move.name}!`);
+        this.say(battle, "But it failed!");
+        move.currentPp = Math.max(0, move.currentPp - 1);
+        await this.emitBattleStep(battle);
+        return;
+      } else if (preSpec.callMove === "sleep-talk" && !isAsleep) {
+        this.say(battle, `${attackerName} used ${move.name}!`);
+        this.say(battle, "But it failed!");
+        move.currentPp = Math.max(0, move.currentPp - 1);
+        await this.emitBattleStep(battle);
+        return;
+      }
+
+      // Move restrictions: checked before any PP is spent.
+      const restriction = this.checkMoveRestrictions(battle, side, target, attacker, move, preSpec);
+      if (restriction) {
+        this.say(battle, restriction);
+        await this.emitBattleStep(battle);
+        return;
+      }
     }
 
-    // Hyper Beam family: the turn after a successful hit is spent recharging.
-    if (attacker.volatile.recharging) {
-      attacker.volatile.recharging = false;
-      this.say(battle, `${attackerName} must recharge!`);
-      await this.emitBattleStep(battle);
-      return;
-    }
-
-    const statusCheck = checkStatusBeforeMove(attacker.status, attackerName);
-    if (statusCheck.cured && attacker.status) {
-      this.pushEvent(
-        battle,
-        { kind: "status-cured", sideId: side.id, pokemonId: attacker.id, status: attacker.status.id },
-        statusCheck.message
-      );
-      attacker.status = null;
-    } else if (statusCheck.message) {
-      this.say(battle, statusCheck.message);
-    }
-    if (!statusCheck.canMove) {
-      await this.emitBattleStep(battle);
-      return;
-    }
-
-    if (attacker.volatile.confusionTurns > 0) {
+    if (depth === 0 && attacker.volatile.confusionTurns > 0) {
       attacker.volatile.confusionTurns -= 1;
       if (attacker.volatile.confusionTurns <= 0) {
         this.pushEvent(
@@ -5258,14 +6359,25 @@ export default class BattleManager {
       }
     }
 
+    // Attract: 50% chance of being immobilized while the beloved is active.
+    if (depth === 0 && attacker.volatile.attractedToPokemonId === defender.id && !isFainted(defender)) {
+      this.say(battle, `${attackerName} is in love with ${defenderName}!`);
+      if (Math.random() < 0.5) {
+        this.say(battle, `${attackerName} is immobilized by love!`);
+        await this.emitBattleStep(battle);
+        return;
+      }
+    }
+
     const spec = parseMoveEffect(resolveFunctionCode(move.functionCode ?? ""));
 
     // Two-turn moves: the charge turn locks the release (see startChoiceTurn);
-    // the release turn skips the PP cost (paid when charging).
+    // the release turn skips the PP cost (paid when charging). Called moves
+    // (Metronome/Mirror Move...) never cost their own PP.
     const isReleaseTurn = attacker.volatile.charging?.moveId === move.id;
     if (isReleaseTurn) {
       attacker.volatile.charging = null;
-    } else {
+    } else if (!opts.calledMove) {
       move.currentPp -= 1;
     }
 
@@ -5274,6 +6386,10 @@ export default class BattleManager {
       attacker.volatile.lastMoveId === move.id ? attacker.volatile.consecutiveMoveUses : 0;
     attacker.volatile.lastMoveId = move.id;
     attacker.volatile.consecutiveMoveUses = consecutiveUses + 1;
+    if (!attacker.volatile.usedMoveIds.includes(move.id)) {
+      attacker.volatile.usedMoveIds.push(move.id);
+    }
+    battle.lastMoveUsed = { skillId: move.id, skillName: move.name };
 
     this.pushEvent(
       battle,
@@ -5291,6 +6407,38 @@ export default class BattleManager {
       },
       `${attackerName} used ${move.name}!`
     );
+
+    // Gravity slams airborne moves out of the air.
+    if (battle.gravityTurns > 0 && spec.twoTurn?.invulnerable === "sky") {
+      this.say(battle, `${attackerName} can't use ${move.name} because of gravity!`);
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    // Call moves execute another move in their place.
+    if (spec.callMove) {
+      const called = this.resolveCalledMove(battle, side, target, attacker, spec.callMove);
+      if (!called) {
+        this.say(battle, "But it failed!");
+        await this.emitBattleStep(battle);
+        return;
+      }
+      await this.emitBattleStep(battle);
+      if (depth < 2) {
+        await this.executeMoveAction(battle, side, target, called.move.id, {
+          calledMove: called.move,
+          depth: depth + 1,
+          powerMult: called.powerMult
+        });
+      }
+      return;
+    }
+
+    if (spec.failsAlways) {
+      this.say(battle, "But it failed!");
+      await this.emitBattleStep(battle);
+      return;
+    }
 
     if (spec.twoTurn && !isReleaseTurn && !(spec.twoTurn.skipChargeInSun && battle.weather?.kind === "sun")) {
       attacker.volatile.charging = { moveId: move.id, invulnerable: spec.twoTurn.invulnerable };
@@ -5310,6 +6458,56 @@ export default class BattleManager {
     if (spec.protectUser) {
       attacker.volatile.protected = true;
       this.say(battle, `${attackerName} protected itself!`);
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    // Powder: a Fire-type move blows up in the user's face instead.
+    if (attacker.volatile.powdered && move.type.trim().toUpperCase() === "FIRE") {
+      attacker.volatile.powdered = false;
+      const blast = Math.max(1, Math.floor(attacker.maxHp / 4));
+      attacker.hp = Math.max(0, attacker.hp - blast);
+      this.pushEvent(
+        battle,
+        {
+          kind: "damage",
+          sideId: side.id,
+          pokemonId: attacker.id,
+          amount: blast,
+          hpAfter: attacker.hp,
+          maxHp: attacker.maxHp,
+          effectiveness: 1,
+          critical: false,
+          source: "move"
+        },
+        `The powder exploded when ${attackerName} used ${move.name}!`
+      );
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    // Dream Eater: only works on a sleeping target.
+    if (spec.failsUnlessTargetAsleep && defender.status?.id !== "sleep") {
+      this.say(battle, `${defenderName} wasn't affected!`);
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    // Synchronoise: only hurts targets sharing a type with the user.
+    if (
+      spec.failsUnlessTargetSharesType &&
+      !defender.types.some((theirs) =>
+        attacker.types.some((ours) => isSameType(this.typeChart, ours, theirs))
+      )
+    ) {
+      this.say(battle, `${defenderName} wasn't affected!`);
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    // Spit Up: needs at least one Stockpile charge.
+    if (spec.spitUp && attacker.volatile.stockpile <= 0) {
+      this.say(battle, "But it failed to spit up a thing!");
       await this.emitBattleStep(battle);
       return;
     }
@@ -5359,10 +6557,47 @@ export default class BattleManager {
       spec.leechSeedTarget ||
       spec.setTargetTypesToWater ||
       spec.addTypeToTarget !== null ||
-      spec.nightmareTarget;
+      spec.nightmareTarget ||
+      spec.disableTarget ||
+      spec.encoreTarget ||
+      spec.tauntTarget ||
+      spec.tormentTarget ||
+      spec.healBlockTarget ||
+      spec.embargoTarget ||
+      spec.spiteTarget ||
+      spec.attractTarget ||
+      spec.yawnTarget ||
+      spec.telekinesisTarget ||
+      spec.electrifyTarget ||
+      spec.powderTarget ||
+      spec.topsyTurvy ||
+      spec.psychoShift ||
+      spec.removeTargetItem ||
+      spec.stealTargetItem ||
+      spec.swapItems ||
+      spec.forceTargetSwitch;
 
     if (affectsTarget && defender.volatile.protected) {
-      this.say(battle, `${defenderName} protected itself!`);
+      if (spec.feint) {
+        defender.volatile.protected = false;
+        this.say(battle, `${defenderName} fell for the feint!`);
+      } else {
+        this.say(battle, `${defenderName} protected itself!`);
+        await this.emitBattleStep(battle);
+        return;
+      }
+    }
+
+    // A Substitute blocks status moves aimed at its owner (Roar and PP
+    // attacks still get through, as in the original).
+    if (
+      !isDamaging &&
+      affectsTarget &&
+      defender.volatile.substituteHp > 0 &&
+      !spec.forceTargetSwitch &&
+      !spec.spiteTarget
+    ) {
+      this.say(battle, "But it failed!");
       await this.emitBattleStep(battle);
       return;
     }
@@ -5376,12 +6611,19 @@ export default class BattleManager {
       return;
     }
 
-    if (affectsTarget && !spec.alwaysHits && !this.rollAccuracy(attacker, defender, move, spec)) {
+    // Lock-On guarantees the next strike; Telekinesis makes the target
+    // impossible to miss.
+    const cannotMiss =
+      spec.alwaysHits || attacker.volatile.lockOnTurns > 0 || defender.volatile.telekinesisTurns > 0;
+
+    if (affectsTarget && !cannotMiss && !this.rollAccuracy(attacker, defender, move, spec)) {
       this.pushEvent(
         battle,
         { kind: "move-missed", sideId: side.id, pokemonId: attacker.id, moveName: move.name },
         `${attackerName}'s attack missed!`
       );
+      // A missed rampage (Thrash/Rollout/Uproar) breaks the lock-in.
+      attacker.volatile.rampage = null;
       if (spec.crashDamageOnMiss) {
         const crash = Math.max(1, Math.floor(attacker.maxHp / 2));
         attacker.hp = Math.max(0, attacker.hp - crash);
@@ -5422,6 +6664,76 @@ export default class BattleManager {
       powerOverride = move.power * 2;
     }
 
+    // Hidden Power: type and power come from the user's IVs.
+    if (spec.hiddenPower) {
+      const hidden = computeHiddenPower(attacker.ivs);
+      effectiveMoveType = hidden.type;
+      powerOverride = hidden.power;
+    }
+
+    // Electrify / Ion Deluge turn the move Electric.
+    if (attacker.volatile.electrified) {
+      attacker.volatile.electrified = false;
+      effectiveMoveType = "ELECTRIC";
+      this.say(battle, `${attackerName}'s move became electrified!`);
+    } else if (battle.ionDeluge && effectiveMoveType.trim().toUpperCase() === "NORMAL") {
+      effectiveMoveType = "ELECTRIC";
+    }
+
+    // Natural Gift: fueled by the held berry.
+    if (spec.naturalGift) {
+      const holdsBerry = this.pokemonHoldsBerry(attacker);
+      if (!holdsBerry) {
+        this.say(battle, "But it failed!");
+        await this.emitBattleStep(battle);
+        return;
+      }
+      powerOverride = 80;
+      this.consumeHeldItem(attacker);
+    }
+
+    // Present: random power, or it heals the target instead.
+    if (spec.present) {
+      const roll = Math.random();
+      if (roll < 0.2) {
+        const healed = Math.max(1, Math.floor(defender.maxHp / 4));
+        defender.hp = Math.min(defender.maxHp, defender.hp + healed);
+        this.pushEvent(
+          battle,
+          {
+            kind: "heal",
+            sideId: target.id,
+            pokemonId: defender.id,
+            amount: healed,
+            hpAfter: defender.hp,
+            maxHp: defender.maxHp,
+            source: "move"
+          },
+          `The present restored ${defenderName}'s health!`
+        );
+        await this.emitBattleStep(battle);
+        return;
+      }
+      powerOverride = roll < 0.6 ? 40 : roll < 0.9 ? 80 : 120;
+    }
+
+    // Beat Up: one hit per able party member.
+    if (spec.beatUp) {
+      const able = side.party.filter((member) => !isFainted(member) && !member.status).length;
+      if (able <= 0) {
+        this.say(battle, "But it failed!");
+        await this.emitBattleStep(battle);
+        return;
+      }
+      spec.multiHit = { min: able, max: able };
+      powerOverride = 10;
+    }
+
+    // Spit Up: power scales with Stockpile charges (spent afterwards).
+    if (spec.spitUp) {
+      powerOverride = 100 * attacker.volatile.stockpile;
+    }
+
     // Conditional power formulas (Brine, Gyro Ball, Flail, Magnitude...).
     if (spec.powerModifier) {
       const modified = computeModifiedPower(powerOverride ?? move.power, spec.powerModifier, {
@@ -5440,7 +6752,12 @@ export default class BattleManager {
         targetActedThisTurn: Boolean(target.hasActedThisTurn),
         targetInvulnerable: defenderInvulnerable,
         consecutiveUses,
-        movePpLeft: move.currentPp
+        movePpLeft: move.currentPp,
+        userHappiness: attacker.baseHappiness,
+        userWeightKg: attacker.weightKg,
+        targetWeightKg: defender.weightKg,
+        userHasItem: attacker.heldItemId !== null && battle.magicRoomTurns <= 0,
+        allyFaintedLastTurn: Boolean(side.allyFaintedLastTurn)
       });
       powerOverride = modified.power;
       if (modified.message) {
@@ -5448,9 +6765,17 @@ export default class BattleManager {
       }
     }
 
+    // Pursuit interception / Me First run the move at boosted power.
+    if (opts.powerMult && opts.powerMult !== 1) {
+      powerOverride = Math.floor((powerOverride ?? move.power) * opts.powerMult);
+    }
+
     let totalDamage = 0;
+    let hitSubstitute = false;
     if (isDamaging) {
-      const effectiveness = spec.struggleRecoil ? 1 : this.getEffectiveness(effectiveMoveType, defender.types);
+      const effectiveness = spec.struggleRecoil
+        ? 1
+        : this.getEffectivenessAgainst(battle, effectiveMoveType, defender);
       if (effectiveness === 0) {
         this.say(battle, `It doesn't affect ${defenderName}...`);
         await this.emitBattleStep(battle);
@@ -5470,6 +6795,7 @@ export default class BattleManager {
         powerOverride
       );
       totalDamage = result.totalDamage;
+      hitSubstitute = result.hitSubstitute;
 
       if (result.hits > 1) {
         this.say(battle, `Hit ${result.hits} time(s)!`);
@@ -5483,7 +6809,13 @@ export default class BattleManager {
         this.say(battle, "It's not very effective...");
       }
 
-      if (spec.drainFraction > 0 && totalDamage > 0 && attacker.hp > 0 && attacker.hp < attacker.maxHp) {
+      if (
+        spec.drainFraction > 0 &&
+        totalDamage > 0 &&
+        attacker.hp > 0 &&
+        attacker.hp < attacker.maxHp &&
+        attacker.volatile.healBlockTurns <= 0
+      ) {
         const healed = Math.max(1, Math.floor(totalDamage * spec.drainFraction));
         attacker.hp = Math.min(attacker.maxHp, attacker.hp + healed);
         this.pushEvent(
@@ -5582,6 +6914,64 @@ export default class BattleManager {
       if (spec.rechargeNextTurn && totalDamage > 0) {
         attacker.volatile.recharging = true;
       }
+
+      // Spit Up spends every Stockpile charge.
+      if (spec.spitUp && totalDamage > 0) {
+        attacker.volatile.stockpile = 0;
+        this.say(battle, `${attackerName}'s stockpiled effect wore off!`);
+      }
+
+      // Destiny Bond / Grudge trigger when the direct hit KOs their user.
+      if (totalDamage > 0 && isFainted(defender)) {
+        if (defender.volatile.destinyBond && !isFainted(attacker)) {
+          attacker.hp = 0;
+          this.pushEvent(
+            battle,
+            {
+              kind: "damage",
+              sideId: side.id,
+              pokemonId: attacker.id,
+              amount: attacker.maxHp,
+              hpAfter: 0,
+              maxHp: attacker.maxHp,
+              effectiveness: 1,
+              critical: false,
+              source: "move"
+            },
+            `${defenderName} took its attacker down with it!`
+          );
+        } else if (defender.volatile.grudge) {
+          move.currentPp = 0;
+          this.say(battle, `${attackerName}'s ${move.name} lost all its PP due to the grudge!`);
+        }
+      }
+
+      // Rampages (Thrash/Rollout/Uproar) lock the user in for a few turns.
+      if (spec.rampage && totalDamage > 0 && !isFainted(attacker)) {
+        const rampage = attacker.volatile.rampage;
+        if (!rampage) {
+          const turns =
+            spec.rampage === "thrash"
+              ? 1 + Math.floor(Math.random() * 2)
+              : spec.rampage === "rollout"
+                ? 4
+                : 2;
+          attacker.volatile.rampage = { moveId: move.id, turnsLeft: turns, kind: spec.rampage };
+        } else {
+          rampage.turnsLeft -= 1;
+          if (rampage.turnsLeft <= 0) {
+            attacker.volatile.rampage = null;
+            if (spec.rampage === "thrash" && attacker.volatile.confusionTurns <= 0) {
+              attacker.volatile.confusionTurns = 2 + Math.floor(Math.random() * 4);
+              this.pushEvent(
+                battle,
+                { kind: "confusion-start", sideId: side.id, pokemonId: attacker.id },
+                `${attackerName} became confused due to fatigue!`
+              );
+            }
+          }
+        }
+      }
     }
 
     // Shadow Half: every battler loses half of its current HP.
@@ -5641,7 +7031,57 @@ export default class BattleManager {
       (isPureStatusMove || totalDamage > 0) && Math.random() * 100 < secondaryChance;
 
     if (applySecondary) {
-      this.applyMoveEffects(battle, side, target, attacker, defender, move, spec, isPureStatusMove);
+      this.applyMoveEffects(battle, side, target, attacker, defender, move, spec, isPureStatusMove, hitSubstitute);
+    }
+
+    // Healing Wish / Lunar Dance: the user faints; its replacement is blessed.
+    if ((spec.healingWish || spec.lunarDance) && !isFainted(attacker)) {
+      if (side.party.filter((member) => !isFainted(member)).length <= 1) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.hp = 0;
+        side.pendingSwitchHeal = spec.lunarDance ? "lunar" : "heal";
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: attacker.maxHp,
+            hpAfter: 0,
+            maxHp: attacker.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "move"
+          },
+          `${attackerName} made a wish for its team!`
+        );
+      }
+    }
+
+    // Roar / Whirlwind / Dragon Tail: drag the target's replacement out.
+    if (spec.forceTargetSwitch && (isPureStatusMove || totalDamage > 0) && !isFainted(defender)) {
+      await this.applyForcedSwitch(battle, side, target);
+    }
+
+    // U-turn / Volt Switch / Baton Pass: the user rotates out.
+    if (
+      ((spec.switchOutUser && totalDamage > 0) || (spec.batonPass && isPureStatusMove)) &&
+      !isFainted(attacker) &&
+      battle.status === "active"
+    ) {
+      await this.applyUserSwitch(battle, side, spec.batonPass);
+    }
+
+    // Teleport: escapes wild battles.
+    if (spec.teleportUser) {
+      if (battle.kind === "wild") {
+        this.say(battle, `${attackerName} fled from battle using Teleport!`);
+        await this.emitBattleStep(battle);
+        await this.finishBattle(battle, "Escaped using Teleport.", null, null);
+        return;
+      }
+      this.say(battle, "But it failed!");
     }
 
     if (isPureStatusMove && !spec.recognized) {
@@ -5671,6 +7111,7 @@ export default class BattleManager {
     let totalDamage = 0;
     let landedHits = 0;
     let anyCritical = false;
+    let hitSubstitute = false;
 
     for (let hit = 0; hit < hits && !isFainted(defender) && !isFainted(attacker); hit += 1) {
       let damage = 0;
@@ -5702,7 +7143,7 @@ export default class BattleManager {
                     : Math.max(1, Math.floor(defender.hp / 2));
         }
       } else {
-        critical = this.rollCritical(move, spec, attacker);
+        critical = this.rollCritical(move, spec, attacker, target);
         // Triple Kick ramps: hit 1 = x1, hit 2 = x2, hit 3 = x3.
         const hitPower = (powerOverride ?? move.power) * (spec.multiHitPowersUp ? hit + 1 : 1);
         damage = this.calculateDamage(
@@ -5720,6 +7161,22 @@ export default class BattleManager {
       }
 
       damage = Math.max(1, Math.floor(damage));
+
+      // A Substitute soaks the hit in place of its owner.
+      if (defender.volatile.substituteHp > 0) {
+        hitSubstitute = true;
+        const soaked = Math.min(defender.volatile.substituteHp, damage);
+        defender.volatile.substituteHp -= soaked;
+        totalDamage += soaked;
+        landedHits += 1;
+        anyCritical = anyCritical || critical;
+        if (defender.volatile.substituteHp <= 0) {
+          this.say(battle, `${getPokemonDisplayName(defender)}'s substitute faded!`);
+          break;
+        }
+        this.say(battle, `The substitute took the hit for ${getPokemonDisplayName(defender)}!`);
+        continue;
+      }
 
       // False Swipe never KOs; Endure keeps the battler at 1 HP.
       let enduredHit = false;
@@ -5745,6 +7202,11 @@ export default class BattleManager {
         taken.special += damage;
       }
 
+      // Bide keeps a tally of everything its user suffers.
+      if (defender.volatile.bide) {
+        defender.volatile.bide.storedDamage += damage;
+      }
+
       this.pushEvent(
         battle,
         {
@@ -5766,7 +7228,7 @@ export default class BattleManager {
       }
     }
 
-    return { totalDamage, hits: landedHits, anyCritical };
+    return { totalDamage, hits: landedHits, anyCritical, hitSubstitute };
   }
 
   /** Applies flat damage (Counter family) with the endure/never-faint clamps. */
@@ -5778,6 +7240,19 @@ export default class BattleManager {
     spec: MoveEffectSpec
   ) {
     let damage = Math.max(1, Math.floor(amount));
+
+    // A Substitute soaks flat damage too (Counter, Fling, Bide).
+    if (defender.volatile.substituteHp > 0) {
+      const soaked = Math.min(defender.volatile.substituteHp, damage);
+      defender.volatile.substituteHp -= soaked;
+      if (defender.volatile.substituteHp <= 0) {
+        this.say(battle, `${getPokemonDisplayName(defender)}'s substitute faded!`);
+      } else {
+        this.say(battle, `The substitute took the hit for ${getPokemonDisplayName(defender)}!`);
+      }
+      return;
+    }
+
     let enduredHit = false;
     if (damage >= defender.hp && (spec.neverFaintTarget || defender.volatile.endure)) {
       damage = Math.max(0, defender.hp - 1);
@@ -5786,6 +7261,9 @@ export default class BattleManager {
 
     defender.hp = Math.max(0, defender.hp - damage);
     defender.volatile.damageTakenThisTurn.any += damage;
+    if (defender.volatile.bide) {
+      defender.volatile.bide.storedDamage += damage;
+    }
 
     this.pushEvent(
       battle,
@@ -5816,15 +7294,29 @@ export default class BattleManager {
     defender: BattlePokemon,
     move: BattleMove,
     spec: MoveEffectSpec,
-    isPureStatusMove: boolean
+    isPureStatusMove: boolean,
+    hitSubstitute = false
   ) {
     const viaSecondary = !isPureStatusMove;
+    // A substitute soaks the hit AND the rider effects aimed at its owner.
+    const canAffectTarget = !hitSubstitute;
 
     spec.statChanges.forEach((change) => {
       const receiverSide = change.target === "user" ? side : target;
       const receiver = change.target === "user" ? attacker : defender;
+      if (change.target === "target" && !canAffectTarget) {
+        return;
+      }
       if (!isFainted(receiver) || change.target === "user") {
-        this.applyStatStageChange(battle, receiverSide, receiver, change.stat, change.delta, viaSecondary);
+        this.applyStatStageChange(
+          battle,
+          receiverSide,
+          receiver,
+          change.stat,
+          change.delta,
+          viaSecondary,
+          change.target === "user"
+        );
       }
     });
 
@@ -5866,12 +7358,19 @@ export default class BattleManager {
       const statusId = spec.status.random
         ? spec.status.random[Math.floor(Math.random() * spec.status.random.length)]
         : spec.status.id;
-      if (!isFainted(receiver)) {
-        this.applyStatusCondition(battle, receiverSide, receiver, statusId, viaSecondary);
+      if (!isFainted(receiver) && (spec.status.target === "user" || canAffectTarget)) {
+        this.applyStatusCondition(
+          battle,
+          receiverSide,
+          receiver,
+          statusId,
+          viaSecondary,
+          spec.status.target === "user"
+        );
       }
     }
 
-    if (spec.confuseTarget && !isFainted(defender)) {
+    if (spec.confuseTarget && !isFainted(defender) && canAffectTarget) {
       if (defender.volatile.confusionTurns > 0) {
         if (!viaSecondary) {
           this.say(battle, `${getPokemonDisplayName(defender)} is already confused!`);
@@ -5886,7 +7385,7 @@ export default class BattleManager {
       }
     }
 
-    if (spec.flinchTarget && !isFainted(defender)) {
+    if (spec.flinchTarget && !isFainted(defender) && canAffectTarget) {
       defender.volatile.flinched = true;
     }
 
@@ -5907,7 +7406,7 @@ export default class BattleManager {
     // Bind / Wrap / Fire Spin: 4-5 end-of-turn chip ticks, blocks escape.
     // Original sets MultiTurn = 5+rand(2); the tick before reaching 0 is the
     // "freed" turn, so the target takes 4-5 damage ticks.
-    if (spec.bindTarget && !isFainted(defender) && !defender.volatile.binding) {
+    if (spec.bindTarget && !isFainted(defender) && canAffectTarget && !defender.volatile.binding) {
       defender.volatile.binding = {
         turnsLeft: 5 + Math.floor(Math.random() * 2),
         moveName: move.name,
@@ -5916,7 +7415,7 @@ export default class BattleManager {
       this.say(battle, `${defenderName} was trapped by ${move.name}!`);
     }
 
-    if (spec.trapTarget && !isFainted(defender)) {
+    if (spec.trapTarget && !isFainted(defender) && canAffectTarget) {
       if (defender.volatile.trappedByPokemonId) {
         if (!viaSecondary) {
           this.say(battle, "But it failed!");
@@ -5927,7 +7426,7 @@ export default class BattleManager {
       }
     }
 
-    if (spec.leechSeedTarget && !isFainted(defender)) {
+    if (spec.leechSeedTarget && !isFainted(defender) && canAffectTarget) {
       const defenderTypes = defender.types.map((type) => type.trim().toUpperCase());
       if (defenderTypes.includes("GRASS")) {
         this.say(battle, `It doesn't affect ${defenderName}...`);
@@ -5968,12 +7467,12 @@ export default class BattleManager {
       }
     }
 
-    if (spec.setTargetTypesToWater && !isFainted(defender)) {
+    if (spec.setTargetTypesToWater && !isFainted(defender) && canAffectTarget) {
       defender.types = ["WATER"];
       this.say(battle, `${defenderName} became the WATER type!`);
     }
 
-    if (spec.addTypeToTarget && !isFainted(defender)) {
+    if (spec.addTypeToTarget && !isFainted(defender) && canAffectTarget) {
       const already = defender.types.some((type) => isSameType(this.typeChart, type, spec.addTypeToTarget!));
       if (already) {
         this.say(battle, "But it failed!");
@@ -6001,7 +7500,7 @@ export default class BattleManager {
       }
     }
 
-    if (spec.nightmareTarget && !isFainted(defender)) {
+    if (spec.nightmareTarget && !isFainted(defender) && canAffectTarget) {
       if (defender.status?.id === "sleep" && !defender.volatile.nightmare) {
         defender.volatile.nightmare = true;
         this.say(battle, `${defenderName} began having a nightmare!`);
@@ -6160,6 +7659,888 @@ export default class BattleManager {
       }
       this.say(battle, "The battlers shared their pain!");
     }
+
+    // ------------------------------------------------------------------
+    // Restrictions & harassment
+    // ------------------------------------------------------------------
+    if (spec.disableTarget && !isFainted(defender) && canAffectTarget) {
+      const lastId = defender.volatile.lastMoveId;
+      const lastMove = lastId ? defender.moves.find((known) => known.id === lastId) : null;
+      if (!lastMove || defender.volatile.disable) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.volatile.disable = { moveId: lastMove.id, moveName: lastMove.name, turns: 5 };
+        this.say(battle, `${defenderName}'s ${lastMove.name} was disabled!`);
+      }
+    }
+
+    if (spec.encoreTarget && !isFainted(defender) && canAffectTarget) {
+      const lastId = defender.volatile.lastMoveId;
+      const lastMove = lastId ? defender.moves.find((known) => known.id === lastId) : null;
+      if (!lastMove || lastMove.currentPp <= 0 || defender.volatile.encore) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.volatile.encore = { moveId: lastMove.id, turns: 4 };
+        this.say(battle, `${defenderName} received an encore!`);
+      }
+    }
+
+    if (spec.tauntTarget && !isFainted(defender) && canAffectTarget) {
+      if (defender.volatile.tauntTurns > 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.volatile.tauntTurns = 4;
+        this.say(battle, `${defenderName} fell for the taunt!`);
+      }
+    }
+
+    if (spec.tormentTarget && !isFainted(defender) && canAffectTarget) {
+      if (defender.volatile.torment) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.volatile.torment = true;
+        this.say(battle, `${defenderName} was subjected to torment!`);
+      }
+    }
+
+    if (spec.healBlockTarget && !isFainted(defender) && canAffectTarget) {
+      if (defender.volatile.healBlockTurns > 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.volatile.healBlockTurns = 5;
+        this.say(battle, `${defenderName} was prevented from healing!`);
+      }
+    }
+
+    if (spec.imprisonUser) {
+      if (attacker.volatile.imprison) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.volatile.imprison = true;
+        this.say(battle, `${attackerName} sealed the opponent's moves!`);
+      }
+    }
+
+    if (spec.embargoTarget && !isFainted(defender) && canAffectTarget) {
+      if (defender.volatile.embargoTurns > 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.volatile.embargoTurns = 5;
+        this.say(battle, `${defenderName} can't use items anymore!`);
+      }
+    }
+
+    if (spec.spiteTarget && !isFainted(defender)) {
+      const lastId = defender.volatile.lastMoveId;
+      const lastMove = lastId ? defender.moves.find((known) => known.id === lastId) : null;
+      if (!lastMove || lastMove.currentPp <= 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        const reduction = Math.min(4, lastMove.currentPp);
+        lastMove.currentPp -= reduction;
+        this.say(battle, `It reduced the PP of ${defenderName}'s ${lastMove.name} by ${reduction}!`);
+      }
+    }
+
+    if (spec.attractTarget && !isFainted(defender) && canAffectTarget) {
+      const canAttract =
+        attacker.gender !== "genderless" &&
+        defender.gender !== "genderless" &&
+        attacker.gender !== defender.gender &&
+        !defender.volatile.attractedToPokemonId;
+      if (canAttract) {
+        defender.volatile.attractedToPokemonId = attacker.id;
+        this.say(battle, `${defenderName} fell in love!`);
+      } else {
+        this.say(battle, "But it failed!");
+      }
+    }
+
+    if (spec.yawnTarget && !isFainted(defender) && canAffectTarget) {
+      if (defender.status || defender.volatile.yawnTurns > 0 || isImmuneToStatus("sleep", defender.types)) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.volatile.yawnTurns = 2;
+        this.say(battle, `${attackerName} made ${defenderName} drowsy!`);
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Curse (Ghost pays half HP; everyone else gets the stat trade)
+    // ------------------------------------------------------------------
+    if (spec.curse) {
+      const isGhost = attacker.types.some((type) => type.trim().toUpperCase() === "GHOST");
+      if (isGhost) {
+        if (isFainted(defender) || defender.volatile.cursed || !canAffectTarget) {
+          this.say(battle, "But it failed!");
+        } else {
+          const cost = Math.max(1, Math.floor(attacker.maxHp / 2));
+          attacker.hp = Math.max(0, attacker.hp - cost);
+          defender.volatile.cursed = true;
+          this.pushEvent(
+            battle,
+            {
+              kind: "damage",
+              sideId: side.id,
+              pokemonId: attacker.id,
+              amount: cost,
+              hpAfter: attacker.hp,
+              maxHp: attacker.maxHp,
+              effectiveness: 1,
+              critical: false,
+              source: "move"
+            },
+            `${attackerName} cut its own HP and laid a curse on ${defenderName}!`
+          );
+        }
+      } else {
+        this.applyStatStageChange(battle, side, attacker, "speed", -1, false, true);
+        this.applyStatStageChange(battle, side, attacker, "attack", 1, false, true);
+        this.applyStatStageChange(battle, side, attacker, "defense", 1, false, true);
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Held items
+    // ------------------------------------------------------------------
+    if (spec.removeTargetItem && !isFainted(defender) && canAffectTarget) {
+      if (defender.heldItemId) {
+        const itemName = defender.heldItemName ?? "its item";
+        defender.heldItemId = null;
+        defender.heldItemName = null;
+        this.say(battle, `${attackerName} knocked off ${defenderName}'s ${itemName}!`);
+      }
+    }
+
+    if (spec.stealTargetItem && !isFainted(defender) && canAffectTarget) {
+      if (!attacker.heldItemId && defender.heldItemId) {
+        attacker.heldItemId = defender.heldItemId;
+        attacker.heldItemName = defender.heldItemName;
+        defender.heldItemId = null;
+        defender.heldItemName = null;
+        this.say(battle, `${attackerName} stole ${defenderName}'s ${attacker.heldItemName}!`);
+      }
+    }
+
+    if (spec.swapItems && !isFainted(defender) && canAffectTarget) {
+      if (!attacker.heldItemId && !defender.heldItemId) {
+        this.say(battle, "But it failed!");
+      } else {
+        const ownItemId = attacker.heldItemId;
+        const ownItemName = attacker.heldItemName;
+        attacker.heldItemId = defender.heldItemId;
+        attacker.heldItemName = defender.heldItemName;
+        defender.heldItemId = ownItemId;
+        defender.heldItemName = ownItemName;
+        this.say(battle, `${attackerName} switched items with its opponent!`);
+        if (attacker.heldItemName) {
+          this.say(battle, `${attackerName} obtained one ${attacker.heldItemName}.`);
+        }
+        if (defender.heldItemName) {
+          this.say(battle, `${defenderName} obtained one ${defender.heldItemName}.`);
+        }
+      }
+    }
+
+    if (spec.bestowItem && !isFainted(defender) && canAffectTarget) {
+      if (!attacker.heldItemId || defender.heldItemId) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.heldItemId = attacker.heldItemId;
+        defender.heldItemName = attacker.heldItemName;
+        attacker.heldItemId = null;
+        attacker.heldItemName = null;
+        this.say(battle, `${attackerName} gave ${defenderName} its ${defender.heldItemName}!`);
+      }
+    }
+
+    if (spec.eatTargetBerry && !isFainted(defender) && canAffectTarget) {
+      if (this.pokemonHoldsBerry(defender)) {
+        const berryName = defender.heldItemName ?? "berry";
+        defender.heldItemId = null;
+        defender.heldItemName = null;
+        attacker.ateBerry = true;
+        this.say(battle, `${attackerName} stole and ate ${defenderName}'s ${berryName}!`);
+      }
+    }
+
+    if (spec.incinerateBerry && !isFainted(defender) && canAffectTarget) {
+      if (this.pokemonHoldsBerry(defender)) {
+        const berryName = defender.heldItemName ?? "berry";
+        defender.heldItemId = null;
+        defender.heldItemName = null;
+        this.say(battle, `${defenderName}'s ${berryName} was burned up!`);
+      }
+    }
+
+    if (spec.recycleItem) {
+      if (attacker.consumedItem && !attacker.heldItemId) {
+        attacker.heldItemId = attacker.consumedItem.id;
+        attacker.heldItemName = attacker.consumedItem.name;
+        attacker.consumedItem = null;
+        this.say(battle, `${attackerName} found one ${attacker.heldItemName}!`);
+      } else {
+        this.say(battle, "But it failed!");
+      }
+    }
+
+    if (spec.flingItem) {
+      if (!attacker.heldItemId || battle.magicRoomTurns > 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        const itemName = attacker.heldItemName ?? "its item";
+        attacker.heldItemId = null;
+        attacker.heldItemName = null;
+        this.say(battle, `${attackerName} flung its ${itemName}!`);
+        if (!isFainted(defender) && canAffectTarget) {
+          this.applyDirectDamage(battle, target, defender, 30, spec);
+        }
+      }
+    }
+
+    if (spec.payDay) {
+      battle.extraMoney += 5 * attacker.level;
+      this.say(battle, "Coins scattered everywhere!");
+    }
+
+    if (spec.doubleMoney) {
+      battle.moneyMultiplier = 2;
+      this.say(battle, "Everyone is caught up in the happy atmosphere!");
+    }
+
+    // ------------------------------------------------------------------
+    // Entry hazards
+    // ------------------------------------------------------------------
+    if (spec.hazard) {
+      const hazards = (target.hazards ??= {
+        spikes: 0,
+        toxicSpikes: 0,
+        stealthRock: false,
+        stickyWeb: false
+      });
+      if (spec.hazard === "spikes") {
+        if (hazards.spikes >= 3) {
+          this.say(battle, "But it failed!");
+        } else {
+          hazards.spikes += 1;
+          this.say(battle, `Spikes were scattered around ${target.trainerName}'s team!`);
+        }
+      } else if (spec.hazard === "toxic-spikes") {
+        if (hazards.toxicSpikes >= 2) {
+          this.say(battle, "But it failed!");
+        } else {
+          hazards.toxicSpikes += 1;
+          this.say(battle, `Poison spikes were scattered around ${target.trainerName}'s team!`);
+        }
+      } else if (spec.hazard === "stealth-rock") {
+        if (hazards.stealthRock) {
+          this.say(battle, "But it failed!");
+        } else {
+          hazards.stealthRock = true;
+          this.say(battle, `Pointed stones float in the air around ${target.trainerName}'s team!`);
+        }
+      } else if (hazards.stickyWeb) {
+        this.say(battle, "But it failed!");
+      } else {
+        hazards.stickyWeb = true;
+        this.say(battle, `A sticky web spreads out beneath ${target.trainerName}'s team!`);
+      }
+    }
+
+    if (spec.clearUserHazards) {
+      let cleared = false;
+      if (attacker.volatile.binding) {
+        this.say(battle, `${attackerName} got free of ${attacker.volatile.binding.moveName}!`);
+        attacker.volatile.binding = null;
+        cleared = true;
+      }
+      if (attacker.volatile.seededBySideId) {
+        attacker.volatile.seededBySideId = null;
+        this.say(battle, `${attackerName} shed Leech Seed!`);
+        cleared = true;
+      }
+      const ownHazards = side.hazards;
+      if (
+        ownHazards &&
+        (ownHazards.spikes > 0 || ownHazards.toxicSpikes > 0 || ownHazards.stealthRock || ownHazards.stickyWeb)
+      ) {
+        side.hazards = { spikes: 0, toxicSpikes: 0, stealthRock: false, stickyWeb: false };
+        this.say(battle, `${attackerName} blew away the hazards on its side!`);
+        cleared = true;
+      }
+      if (!cleared && isPureStatusMove) {
+        this.say(battle, "But it failed!");
+      }
+    }
+
+    if (spec.defog) {
+      if (target.screens) {
+        target.screens.reflect = 0;
+        target.screens.lightScreen = 0;
+      }
+      target.hazards = { spikes: 0, toxicSpikes: 0, stealthRock: false, stickyWeb: false };
+      if (target.sideEffects) {
+        target.sideEffects.safeguard = 0;
+        target.sideEffects.mist = 0;
+      }
+      this.say(battle, `${target.trainerName}'s side was cleared of obstacles!`);
+    }
+
+    // ------------------------------------------------------------------
+    // Delayed effects & lethal bonds
+    // ------------------------------------------------------------------
+    if (spec.futureSight) {
+      if (target.futureSight) {
+        this.say(battle, "But it failed!");
+      } else {
+        // Damage is computed with the user's stats now (classic behavior:
+        // typeless, so no STAB and no type matchups).
+        const typelessSpec = { ...spec, struggleRecoil: true };
+        const damage = this.calculateDamage(
+          battle,
+          attacker,
+          defender,
+          target,
+          move,
+          typelessSpec,
+          1,
+          false,
+          move.type
+        );
+        target.futureSight = { turns: 3, damage, moveName: move.name };
+        this.say(battle, `${attackerName} foresaw an attack!`);
+      }
+    }
+
+    if (spec.wishUser) {
+      if (side.wish) {
+        this.say(battle, "But it failed!");
+      } else {
+        side.wish = {
+          turns: 2,
+          amount: Math.max(1, Math.floor(attacker.maxHp / 2)),
+          wisherName: attackerName
+        };
+        this.say(battle, `${attackerName} made a wish!`);
+      }
+    }
+
+    if (spec.perishSong) {
+      let affected = 0;
+      for (const anySide of battle.sides) {
+        const battler = getActivePokemon(anySide);
+        if (battler && !isFainted(battler) && battler.volatile.perishCount === 0) {
+          battler.volatile.perishCount = 4;
+          affected += 1;
+        }
+      }
+      this.say(
+        battle,
+        affected > 0 ? "All Pokemon that heard the song will faint in three turns!" : "But it failed!"
+      );
+    }
+
+    if (spec.destinyBond) {
+      attacker.volatile.destinyBond = true;
+      this.say(battle, `${attackerName} is trying to take its foe down with it!`);
+    }
+
+    if (spec.grudgeUser) {
+      attacker.volatile.grudge = true;
+      this.say(battle, `${attackerName} wants its opponent to bear a grudge!`);
+    }
+
+    if (spec.bide && !attacker.volatile.bide) {
+      attacker.volatile.bide = { moveId: move.id, turnsLeft: 2, storedDamage: 0 };
+      this.say(battle, `${attackerName} is storing energy!`);
+    }
+
+    // ------------------------------------------------------------------
+    // Transform & Substitute
+    // ------------------------------------------------------------------
+    if (spec.transformUser) {
+      if (isFainted(defender) || attacker.volatile.transformBackup || defender.volatile.transformBackup) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.volatile.transformBackup = {
+          types: attacker.types,
+          stats: attacker.stats,
+          moves: attacker.moves,
+          frontImageSrc: attacker.frontImageSrc,
+          backImageSrc: attacker.backImageSrc
+        };
+        attacker.types = [...defender.types];
+        attacker.stats = { ...defender.stats, hp: attacker.stats.hp };
+        attacker.stages = { ...defender.stages };
+        attacker.moves = defender.moves.map((known) => ({
+          ...known,
+          currentPp: Math.min(5, known.maxPp),
+          maxPp: Math.min(5, known.maxPp)
+        }));
+        attacker.frontImageSrc = defender.frontImageSrc;
+        attacker.backImageSrc = defender.backImageSrc;
+        this.say(battle, `${attackerName} transformed into ${defender.name}!`);
+      }
+    }
+
+    if (spec.substitute) {
+      if (attacker.volatile.substituteHp > 0) {
+        this.say(battle, `${attackerName} already has a substitute!`);
+      } else {
+        const cost = Math.max(1, Math.floor(attacker.maxHp / 4));
+        if (attacker.hp <= cost) {
+          this.say(battle, "It was too weak to make a substitute!");
+        } else {
+          attacker.hp -= cost;
+          attacker.volatile.substituteHp = cost;
+          this.pushEvent(
+            battle,
+            {
+              kind: "damage",
+              sideId: side.id,
+              pokemonId: attacker.id,
+              amount: cost,
+              hpAfter: attacker.hp,
+              maxHp: attacker.maxHp,
+              effectiveness: 1,
+              critical: false,
+              source: "move"
+            },
+            `${attackerName} created a substitute!`
+          );
+        }
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Stockpile family
+    // ------------------------------------------------------------------
+    if (spec.stockpileUser) {
+      if (attacker.volatile.stockpile >= 3) {
+        this.say(battle, `${attackerName} can't stockpile any more!`);
+      } else {
+        attacker.volatile.stockpile += 1;
+        this.say(battle, `${attackerName} stockpiled ${attacker.volatile.stockpile}!`);
+        this.applyStatStageChange(battle, side, attacker, "defense", 1, true);
+        this.applyStatStageChange(battle, side, attacker, "specialDefense", 1, true);
+      }
+    }
+
+    if (spec.swallow) {
+      const count = attacker.volatile.stockpile;
+      if (count <= 0) {
+        this.say(battle, "But it failed to swallow a thing!");
+      } else if (attacker.hp >= attacker.maxHp) {
+        this.say(battle, `${attackerName}'s HP is already full!`);
+      } else {
+        const fraction = count === 1 ? 0.25 : count === 2 ? 0.5 : 1;
+        const healed = Math.min(
+          attacker.maxHp - attacker.hp,
+          Math.max(1, Math.floor(attacker.maxHp * fraction))
+        );
+        attacker.hp += healed;
+        attacker.volatile.stockpile = 0;
+        this.pushEvent(
+          battle,
+          {
+            kind: "heal",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: healed,
+            hpAfter: attacker.hp,
+            maxHp: attacker.maxHp,
+            source: "move"
+          },
+          `${attackerName} regained health! Its stockpiled effect wore off!`
+        );
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Stat & type plays
+    // ------------------------------------------------------------------
+    if (spec.acupressure) {
+      const stats: BattleStageKey[] = [
+        "attack",
+        "defense",
+        "specialAttack",
+        "specialDefense",
+        "speed",
+        "accuracy",
+        "evasion"
+      ];
+      const raisable = stats.filter((stat) => attacker.stages[stat] < 6);
+      if (raisable.length === 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        this.applyStatStageChange(battle, side, attacker, chooseRandom(raisable), 2, false);
+      }
+    }
+
+    if (spec.swapStages && !isFainted(defender) && canAffectTarget) {
+      const keys: BattleStageKey[] =
+        spec.swapStages === "offense"
+          ? ["attack", "specialAttack"]
+          : spec.swapStages === "defense"
+            ? ["defense", "specialDefense"]
+            : ["attack", "defense", "specialAttack", "specialDefense", "speed", "accuracy", "evasion"];
+      for (const key of keys) {
+        const own = attacker.stages[key];
+        attacker.stages[key] = defender.stages[key];
+        defender.stages[key] = own;
+      }
+      this.say(battle, `${attackerName} switched stat changes with ${defenderName}!`);
+    }
+
+    if (spec.copyTargetStages && !isFainted(defender)) {
+      attacker.stages = { ...defender.stages };
+      this.say(battle, `${attackerName} copied ${defenderName}'s stat changes!`);
+    }
+
+    if (spec.powerTrick) {
+      const own = attacker.stats.attack;
+      attacker.stats = { ...attacker.stats, attack: attacker.stats.defense, defense: own };
+      this.say(battle, `${attackerName} switched its Attack and Defense!`);
+    }
+
+    if (spec.averageStats && !isFainted(defender) && canAffectTarget) {
+      const keys: Array<"attack" | "specialAttack" | "defense" | "specialDefense"> =
+        spec.averageStats === "offense" ? ["attack", "specialAttack"] : ["defense", "specialDefense"];
+      for (const key of keys) {
+        const average = Math.max(1, Math.floor((attacker.stats[key] + defender.stats[key]) / 2));
+        attacker.stats = { ...attacker.stats, [key]: average };
+        defender.stats = { ...defender.stats, [key]: average };
+      }
+      this.say(
+        battle,
+        spec.averageStats === "offense"
+          ? `${attackerName} shared its power with the target!`
+          : `${attackerName} shared its guard with the target!`
+      );
+    }
+
+    if (spec.topsyTurvy && !isFainted(defender) && canAffectTarget) {
+      const stats: BattleStageKey[] = [
+        "attack",
+        "defense",
+        "specialAttack",
+        "specialDefense",
+        "speed",
+        "accuracy",
+        "evasion"
+      ];
+      const hasStages = stats.some((stat) => defender.stages[stat] !== 0);
+      if (!hasStages) {
+        this.say(battle, "But it failed!");
+      } else {
+        stats.forEach((stat) => {
+          defender.stages[stat] = -defender.stages[stat];
+        });
+        this.say(battle, `${defenderName}'s stat changes were all reversed!`);
+      }
+    }
+
+    if ((spec.mimic || spec.sketch) && !isFainted(defender)) {
+      const lastId = defender.volatile.lastMoveId;
+      const skill = lastId ? this.cachedSkillsById.get(lastId) : null;
+      if (!skill || attacker.moves.some((known) => known.id === skill.id)) {
+        this.say(battle, "But it failed!");
+      } else {
+        const copied = this.buildBattleMove(skill);
+        if (spec.mimic) {
+          copied.maxPp = Math.min(5, copied.maxPp);
+          copied.currentPp = copied.maxPp;
+        }
+        const slot = attacker.moves.findIndex((known) => known.id === move.id);
+        if (slot >= 0) {
+          attacker.moves[slot] = copied;
+          this.say(battle, `${attackerName} learned ${copied.name}!`);
+        } else {
+          this.say(battle, "But it failed!");
+        }
+      }
+    }
+
+    if (spec.conversion2 && !isFainted(defender)) {
+      const lastId = defender.volatile.lastMoveId;
+      const lastSkill = lastId ? this.cachedSkillsById.get(lastId) : null;
+      if (!lastSkill) {
+        this.say(battle, "But it failed!");
+      } else {
+        const allTypes = [
+          "NORMAL", "FIRE", "WATER", "ELECTRIC", "GRASS", "ICE", "FIGHTING", "POISON", "GROUND",
+          "FLYING", "PSYCHIC", "BUG", "ROCK", "GHOST", "DRAGON", "DARK", "STEEL", "FAIRY"
+        ];
+        const resistant = allTypes.filter(
+          (candidate) =>
+            this.getEffectiveness(lastSkill.type, [candidate]) < 1 &&
+            !attacker.types.some((own) => isSameType(this.typeChart, own, candidate))
+        );
+        if (resistant.length === 0) {
+          this.say(battle, "But it failed!");
+        } else {
+          const chosen = chooseRandom(resistant);
+          attacker.types = [chosen];
+          this.say(battle, `${attackerName} transformed into the ${chosen} type!`);
+        }
+      }
+    }
+
+    if (spec.camouflage) {
+      const back = (battle.battleBack ?? "").toLowerCase();
+      const newType =
+        back.includes("water") || back.includes("sea") || back.includes("underwater")
+          ? "WATER"
+          : back.includes("cave") || back.includes("rock") || back.includes("mountain")
+            ? "ROCK"
+            : back.includes("sand")
+              ? "GROUND"
+              : back.includes("grass") || back.includes("forest")
+                ? "GRASS"
+                : "NORMAL";
+      if (attacker.types.some((own) => isSameType(this.typeChart, own, newType))) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.types = [newType];
+        this.say(battle, `${attackerName} transformed into the ${newType} type!`);
+      }
+    }
+
+    if (spec.psychoShift && !isFainted(defender) && canAffectTarget) {
+      if (!attacker.status || defender.status || isImmuneToStatus(attacker.status.id, defender.types)) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.status = { ...attacker.status };
+        this.pushEvent(
+          battle,
+          { kind: "status-applied", sideId: target.id, pokemonId: defender.id, status: defender.status.id },
+          `${attackerName} moved its status problem to ${defenderName}!`
+        );
+        this.pushEvent(
+          battle,
+          { kind: "status-cured", sideId: side.id, pokemonId: attacker.id, status: attacker.status.id },
+          null
+        );
+        attacker.status = null;
+      }
+    }
+
+    if (spec.curePartyStatus) {
+      let cured = 0;
+      side.party.forEach((member) => {
+        if (member.status) {
+          if (member.id === attacker.id) {
+            this.pushEvent(
+              battle,
+              { kind: "status-cured", sideId: side.id, pokemonId: member.id, status: member.status.id },
+              null
+            );
+          }
+          member.status = null;
+          cured += 1;
+        }
+      });
+      this.say(
+        battle,
+        cured > 0 ? "A bell chimed! The team was cured of its status problems!" : "But it failed!"
+      );
+    }
+
+    if (spec.healTargetHalf && !isFainted(defender) && canAffectTarget) {
+      if (defender.hp >= defender.maxHp) {
+        this.say(battle, `${defenderName}'s HP is already full!`);
+      } else {
+        const healed = Math.min(defender.maxHp - defender.hp, Math.max(1, Math.floor(defender.maxHp / 2)));
+        defender.hp += healed;
+        this.pushEvent(
+          battle,
+          {
+            kind: "heal",
+            sideId: target.id,
+            pokemonId: defender.id,
+            amount: healed,
+            hpAfter: defender.hp,
+            maxHp: defender.maxHp,
+            source: "move"
+          },
+          `${defenderName} had its HP restored.`
+        );
+      }
+    }
+
+    if (spec.grassStatBoost) {
+      let boosted = 0;
+      for (const anySide of battle.sides) {
+        const battler = getActivePokemon(anySide);
+        if (!battler || isFainted(battler)) {
+          continue;
+        }
+        if (!battler.types.some((type) => type.trim().toUpperCase() === "GRASS")) {
+          continue;
+        }
+        if (spec.grassStatBoost === "defense") {
+          this.applyStatStageChange(battle, anySide, battler, "defense", 1, true);
+        } else {
+          this.applyStatStageChange(battle, anySide, battler, "attack", 1, true);
+          this.applyStatStageChange(battle, anySide, battler, "specialAttack", 1, true);
+        }
+        boosted += 1;
+      }
+      if (boosted === 0) {
+        this.say(battle, "But it failed!");
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Field-wide effects
+    // ------------------------------------------------------------------
+    if (spec.startFieldEffect) {
+      switch (spec.startFieldEffect) {
+        case "gravity":
+          if (battle.gravityTurns > 0) {
+            this.say(battle, "But it failed!");
+          } else {
+            battle.gravityTurns = 5;
+            this.say(battle, "Gravity intensified!");
+            for (const anySide of battle.sides) {
+              const battler = getActivePokemon(anySide);
+              if (!battler || isFainted(battler)) {
+                continue;
+              }
+              battler.volatile.magnetRiseTurns = 0;
+              battler.volatile.telekinesisTurns = 0;
+              if (battler.volatile.charging?.invulnerable === "sky") {
+                battler.volatile.charging = null;
+                this.say(battle, `${getPokemonDisplayName(battler)} fell from the sky!`);
+              }
+            }
+          }
+          break;
+        case "trick-room":
+          if (battle.trickRoomTurns > 0) {
+            battle.trickRoomTurns = 0;
+            this.say(battle, "The twisted dimensions returned to normal!");
+          } else {
+            battle.trickRoomTurns = 5;
+            this.say(battle, `${attackerName} twisted the dimensions!`);
+          }
+          break;
+        case "magic-room":
+          if (battle.magicRoomTurns > 0) {
+            battle.magicRoomTurns = 0;
+            this.say(battle, "The area returned to normal!");
+          } else {
+            battle.magicRoomTurns = 5;
+            this.say(battle, "It created a bizarre area in which held items lose their effects!");
+          }
+          break;
+        case "wonder-room":
+          if (battle.wonderRoomTurns > 0) {
+            battle.wonderRoomTurns = 0;
+            this.say(battle, "Wonder Room wore off!");
+          } else {
+            battle.wonderRoomTurns = 5;
+            this.say(battle, "It created a bizarre area in which Defense and Sp. Def stats are swapped!");
+          }
+          break;
+        case "electric-terrain":
+          if (battle.terrain?.kind === "electric") {
+            this.say(battle, "But it failed!");
+          } else {
+            battle.terrain = { kind: "electric", turns: 5 };
+            this.say(battle, "An electric current runs across the battlefield!");
+          }
+          break;
+        case "grassy-terrain":
+          if (battle.terrain?.kind === "grassy") {
+            this.say(battle, "But it failed!");
+          } else {
+            battle.terrain = { kind: "grassy", turns: 5 };
+            this.say(battle, "Grass grew to cover the battlefield!");
+          }
+          break;
+        case "ion-deluge":
+          battle.ionDeluge = true;
+          this.say(battle, "A deluge of ions showers the battlefield!");
+          break;
+      }
+    }
+
+    if (spec.startSideEffect) {
+      const effects = (side.sideEffects ??= { tailwind: 0, safeguard: 0, mist: 0, luckyChant: 0 });
+      const config = {
+        tailwind: { turns: 4, message: "A tailwind blew from behind the team!" },
+        safeguard: { turns: 5, message: `${side.trainerName}'s team became cloaked in a mystical veil!` },
+        mist: { turns: 5, message: `${side.trainerName}'s team became shrouded in mist!` },
+        "lucky-chant": { turns: 5, message: "The Lucky Chant shielded the team from critical hits!" }
+      }[spec.startSideEffect];
+      const key = spec.startSideEffect === "lucky-chant" ? "luckyChant" : spec.startSideEffect;
+      if (effects[key as keyof typeof effects] > 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        effects[key as keyof typeof effects] = config.turns;
+        this.say(battle, config.message);
+      }
+    }
+
+    if (spec.sport) {
+      if (spec.sport === "mud") {
+        attacker.volatile.mudSport = true;
+        this.say(battle, "Electricity's power was weakened!");
+      } else {
+        attacker.volatile.waterSport = true;
+        this.say(battle, "Fire's power was weakened!");
+      }
+    }
+
+    if (spec.magnetRiseUser) {
+      if (attacker.volatile.magnetRiseTurns > 0 || battle.gravityTurns > 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.volatile.magnetRiseTurns = 5;
+        this.say(battle, `${attackerName} levitated with electromagnetism!`);
+      }
+    }
+
+    if (spec.telekinesisTarget && !isFainted(defender) && canAffectTarget) {
+      if (defender.volatile.telekinesisTurns > 0 || battle.gravityTurns > 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.volatile.telekinesisTurns = 3;
+        this.say(battle, `${defenderName} was hurled into the air!`);
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Targeting helpers
+    // ------------------------------------------------------------------
+    if (spec.lockOnUser) {
+      attacker.volatile.lockOnTurns = 2;
+      this.say(battle, `${attackerName} took aim at ${defenderName}!`);
+    }
+
+    if (spec.foresight && !isFainted(defender) && canAffectTarget) {
+      if (spec.foresight === "normal") {
+        defender.volatile.foresight = true;
+      } else {
+        defender.volatile.miracleEye = true;
+      }
+      this.say(battle, `${attackerName} identified ${defenderName}!`);
+    }
+
+    if (spec.electrifyTarget && !isFainted(defender) && canAffectTarget) {
+      if (target.action?.type === "fight" && !target.hasActedThisTurn) {
+        defender.volatile.electrified = true;
+        this.say(battle, `${defenderName}'s moves have been electrified!`);
+      } else {
+        this.say(battle, "But it failed!");
+      }
+    }
+
+    if (spec.powderTarget && !isFainted(defender) && canAffectTarget) {
+      defender.volatile.powdered = true;
+      this.say(battle, `${defenderName} is covered in powder!`);
+    }
   }
 
   private applyStatStageChange(
@@ -6168,12 +8549,22 @@ export default class BattleManager {
     pokemon: BattlePokemon,
     stat: BattleStageKey,
     delta: number,
-    viaSecondary: boolean
+    viaSecondary: boolean,
+    selfInflicted = false
   ) {
+    const displayName = getPokemonDisplayName(pokemon);
+
+    // Mist blocks stat drops caused by the opponent.
+    if (delta < 0 && !selfInflicted && (side.sideEffects?.mist ?? 0) > 0) {
+      if (!viaSecondary) {
+        this.say(battle, `${displayName} is protected by the mist!`);
+      }
+      return;
+    }
+
     const current = pokemon.stages[stat];
     const next = clamp(current + delta, -6, 6);
     const actual = next - current;
-    const displayName = getPokemonDisplayName(pokemon);
     const statLabel = STAGE_DISPLAY_NAMES[stat];
 
     if (actual === 0) {
@@ -6215,7 +8606,8 @@ export default class BattleManager {
     side: BattleSide,
     pokemon: BattlePokemon,
     statusId: BattleStatusId,
-    viaSecondary: boolean
+    viaSecondary: boolean,
+    selfInflicted = false
   ) {
     const displayName = getPokemonDisplayName(pokemon);
 
@@ -6224,6 +8616,34 @@ export default class BattleManager {
         this.say(battle, `${displayName} is already ${STATUS_DISPLAY_NAMES[pokemon.status.id]}!`);
       }
       return;
+    }
+
+    // Safeguard shields the side from statuses inflicted by the opponent.
+    if (!selfInflicted && (side.sideEffects?.safeguard ?? 0) > 0) {
+      if (!viaSecondary) {
+        this.say(battle, `${displayName} is protected by Safeguard!`);
+      }
+      return;
+    }
+
+    // Electric Terrain keeps grounded battlers awake; an Uproar wakes the field.
+    if (statusId === "sleep") {
+      if (battle.terrain?.kind === "electric" && this.isGrounded(battle, pokemon)) {
+        if (!viaSecondary) {
+          this.say(battle, `${displayName} can't sleep on the Electric Terrain!`);
+        }
+        return;
+      }
+      const uproarActive = battle.sides.some((anySide) => {
+        const battler = getActivePokemon(anySide);
+        return battler && !isFainted(battler) && battler.volatile.rampage?.kind === "uproar";
+      });
+      if (uproarActive) {
+        if (!viaSecondary) {
+          this.say(battle, `But the uproar kept ${displayName} awake!`);
+        }
+        return;
+      }
     }
 
     const typeIds = pokemon.types.map((type) => resolveTypeId(this.typeChart, type));
@@ -6268,12 +8688,25 @@ export default class BattleManager {
       return true;
     }
 
-    const stageDelta = clamp(attacker.stages.accuracy - defender.stages.evasion, -6, 6);
+    // Foresight/Miracle Eye ignore the target's evasion boosts.
+    const identified = defender.volatile.foresight || defender.volatile.miracleEye;
+    const evasion = identified ? Math.min(0, defender.stages.evasion) : defender.stages.evasion;
+    const stageDelta = clamp(attacker.stages.accuracy - evasion, -6, 6);
     const chance = move.accuracy * getAccuracyStageMultiplier(stageDelta);
     return Math.random() * 100 < chance;
   }
 
-  private rollCritical(move: BattleMove, spec: MoveEffectSpec, attacker?: BattlePokemon): boolean {
+  private rollCritical(
+    move: BattleMove,
+    spec: MoveEffectSpec,
+    attacker?: BattlePokemon,
+    defenderSide?: BattleSide
+  ): boolean {
+    // Lucky Chant wards off critical hits entirely.
+    if ((defenderSide?.sideEffects?.luckyChant ?? 0) > 0) {
+      return false;
+    }
+
     if (spec.alwaysCrit) {
       return true;
     }
@@ -6321,9 +8754,13 @@ export default class BattleManager {
         ? this.getModifiedStat(attackSource, "attack")
         : this.getModifiedStat(attacker, "specialAttack");
     // Psyshock hits the physical Defense with a special move; Chip Away
-    // ignores the target's defensive stat stages.
-    const defenseStatKey: "defense" | "specialDefense" =
+    // ignores the target's defensive stat stages; Wonder Room swaps the
+    // defensive stats of every battler.
+    let defenseStatKey: "defense" | "specialDefense" =
       move.damageClass === "physical" || spec.psyshock ? "defense" : "specialDefense";
+    if (battle.wonderRoomTurns > 0) {
+      defenseStatKey = defenseStatKey === "defense" ? "specialDefense" : "defense";
+    }
     const defenseStat = spec.ignoreDefensiveStages
       ? Math.max(1, defender.stats[defenseStatKey])
       : this.getModifiedStat(defender, defenseStatKey);
@@ -6348,6 +8785,33 @@ export default class BattleManager {
       weatherMultiplier = upperType === "WATER" ? 1.5 : upperType === "FIRE" ? 0.5 : 1;
     }
 
+    // Terrains boost their type for grounded attackers.
+    let terrainMultiplier = 1;
+    if (battle.terrain && this.isGrounded(battle, attacker)) {
+      if (battle.terrain.kind === "electric" && upperType === "ELECTRIC") {
+        terrainMultiplier = 1.5;
+      } else if (battle.terrain.kind === "grassy" && upperType === "GRASS") {
+        terrainMultiplier = 1.5;
+      }
+    }
+
+    // Mud Sport / Water Sport dampen Electric/Fire while their user is out.
+    const sportActive = (kind: "mud" | "water") =>
+      battle.sides.some((anySide) => {
+        const battler = getActivePokemon(anySide);
+        return (
+          battler &&
+          !isFainted(battler) &&
+          (kind === "mud" ? battler.volatile.mudSport : battler.volatile.waterSport)
+        );
+      });
+    let sportMultiplier = 1;
+    if (upperType === "ELECTRIC" && sportActive("mud")) {
+      sportMultiplier = 0.5;
+    } else if (upperType === "FIRE" && sportActive("water")) {
+      sportMultiplier = 0.5;
+    }
+
     // Reflect / Light Screen halve the matching damage class (crits pierce).
     const screens = defenderSide.screens;
     const screenMultiplier =
@@ -6359,7 +8823,14 @@ export default class BattleManager {
         : 1;
 
     const modifier =
-      stab * effectiveness * criticalMultiplier * randomFactor * weatherMultiplier * screenMultiplier;
+      stab *
+      effectiveness *
+      criticalMultiplier *
+      randomFactor *
+      weatherMultiplier *
+      screenMultiplier *
+      terrainMultiplier *
+      sportMultiplier;
 
     if (effectiveness === 0) {
       return 0;
@@ -6517,6 +8988,15 @@ export default class BattleManager {
       skillsByName.set(skill.name.toLowerCase(), skill);
     });
 
+    // Kept for mid-battle lookups: call moves (Metronome, Mirror Move...),
+    // Nature Power's Tri Attack, Mimic copies.
+    this.cachedSkillsById = skillsById;
+    this.cachedSkillsByEssentialsId = new Map(
+      [...skillsById.values()]
+        .filter((skill) => skill.essentialsId)
+        .map((skill) => [skill.essentialsId.toUpperCase(), skill] as const)
+    );
+
     (pokemonPayload?.state.items ?? []).map(this.toPokemonDefinition).forEach((pokemon) => {
       if (pokemon) {
         pokemonById.set(pokemon.id, pokemon);
@@ -6634,7 +9114,10 @@ export default class BattleManager {
       evolutions,
       skills,
       frontImageSrc: normalizeText(profile.frontImageSrc),
-      backImageSrc: normalizeText(profile.backImageSrc)
+      backImageSrc: normalizeText(profile.backImageSrc),
+      femaleRatio: parseFemaleRatio((profile as { genderRatio?: unknown }).genderRatio),
+      baseHappiness: parseNumber((profile as { happiness?: unknown }).happiness, 70),
+      weightKg: parseFloatNumber((profile as { weight?: unknown }).weight, 50)
     };
   }
 
@@ -6669,6 +9152,7 @@ export default class BattleManager {
     return {
       id: item.id,
       name: item.name,
+      essentialsId: normalizeText((profile as { essentialsId?: unknown }).essentialsId),
       type,
       power: Math.max(0, parseNumber(profile.power, 0)),
       powerPoint: Math.max(1, parseNumber(profile.powerPoint, 1)),
@@ -7011,6 +9495,11 @@ export default class BattleManager {
       stages: createEmptyStages(),
       status: sanitizeStatusState(pokemon.status),
       volatile: createEmptyVolatile(),
+      gender: deriveGender(pokemon.id, definition?.femaleRatio ?? 0.5),
+      baseHappiness: definition?.baseHappiness ?? 70,
+      weightKg: definition?.weightKg ?? 50,
+      consumedItem: null,
+      ateBerry: false,
       heldItemId: typeof pokemon.heldItemId === "string" ? pokemon.heldItemId : null,
       heldItemName: typeof pokemon.heldItemName === "string" ? pokemon.heldItemName : null,
       learnset: definition?.skills ?? [],
@@ -7062,6 +9551,11 @@ export default class BattleManager {
       stages: createEmptyStages(),
       status: null,
       volatile: createEmptyVolatile(),
+      gender: deriveGender(`wild:${definition.id}:${Math.floor(Math.random() * 100000)}`, definition.femaleRatio),
+      baseHappiness: definition.baseHappiness,
+      weightKg: definition.weightKg,
+      consumedItem: null,
+      ateBerry: false,
       heldItemId: null,
       heldItemName: null,
       learnset: definition.skills,

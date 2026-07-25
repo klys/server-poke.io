@@ -277,6 +277,16 @@ export default interface ServerToClientEvents {
   "auth:error": (data: { message: string }) => void;
 
   /**
+   * Answer to npc:store-sell-quotes: per-unit prices the store pays for every
+   * sellable item in the player's bag (stores buy items they don't stock too;
+   * move machines, quest items and priceless items are excluded server-side).
+   */
+  "npc:store-sell-quotes": (data: {
+    npcPlacementId: string;
+    quotes: Array<{ itemId: string; itemName: string; quantity: number; sellPrice: number }>;
+  }) => void;
+
+  /**
    * Emitted right before the socket is signed out because the authenticated user
    * deleted their own account. The frontend should clear any persisted auth
    * token and return to the logged-out state.

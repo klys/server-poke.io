@@ -936,6 +936,43 @@ export default class World {
         return requestedPosition;
     }
 
+    /**
+     * Picks a safe, non-stuck spot on a map with no requested coordinates —
+     * the "automatic placement" the admin panel uses. Seeds from the map's
+     * designer-authored initial spawn (falling back to the map centre) and
+     * spirals out with resolveOpenPlayerPosition until it lands on a cell the
+     * player is not blocked inside. Coordinates are map pixels, matching
+     * savedLocation / teleport.
+     */
+    resolveAutomaticPlacement(
+        mapId:string,
+        playerWidth = 32,
+        playerHeight = 32
+    ) {
+        const config = this.playableMapsState?.items.find(
+            (item) => item.id === mapId
+        )?.playableMapConfig;
+
+        let seedX:number;
+        let seedY:number;
+        if (
+            config &&
+            typeof config.initialPositionX === "number" &&
+            Number.isFinite(config.initialPositionX) &&
+            typeof config.initialPositionY === "number" &&
+            Number.isFinite(config.initialPositionY)
+        ) {
+            seedX = config.initialPositionX;
+            seedY = config.initialPositionY;
+        } else {
+            const bounds = this.getMapBounds(mapId);
+            seedX = Math.round(bounds.width / 2);
+            seedY = Math.round(bounds.height / 2);
+        }
+
+        return this.resolveOpenPlayerPosition(mapId, seedX, seedY, playerWidth, playerHeight);
+    }
+
     createGridForMap(mapId:string) {
         const mapBounds = this.getMapBounds(mapId);
         const gridWidth = Math.max(1, Math.ceil(mapBounds.width / World.moveScale));

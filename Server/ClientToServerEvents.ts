@@ -1,5 +1,5 @@
 import type {
-  AdminUserUpdatePayload,
+  AdminUserUpdateInput,
   RolePermission,
   UserRoleKey
 } from "../components/Auth";
@@ -122,6 +122,7 @@ export default interface ClientToServerEvents {
   "event:choice": (data: { index: number }) => void;
   "npc:store-buy": (data: { npcPlacementId: string; itemId: string; quantity: number }) => void;
   "npc:store-sell": (data: { npcPlacementId: string; itemId: string; quantity: number }) => void;
+  "npc:store-sell-quotes": (data: { npcPlacementId: string }) => void;
   "pokemon:name": (data: AuthNamePokemonPayload) => void;
 
   /**
@@ -302,7 +303,7 @@ export default interface ClientToServerEvents {
     pageSize?: number;
   }) => void;
   "admin:user:get": (data: { userId: number }) => void;
-  "admin:user:update": (data: { userId: number; updates: AdminUserUpdatePayload }) => void;
+  "admin:user:update": (data: { userId: number; updates: AdminUserUpdateInput }) => void;
   "admin:user:reset-progress": (data: { userId: number }) => void;
   "admin:user:delete": (data: { userId: number }) => void;
   "admin:user:set-password": (data: { userId: number; newPassword: string }) => void;

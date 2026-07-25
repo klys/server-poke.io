@@ -34,7 +34,14 @@ export type MovePowerModifier =
   | "fury-cutter"
   | "trump-card"
   | "flail"
-  | "magnitude";
+  | "magnitude"
+  | "return"
+  | "frustration"
+  | "low-kick"
+  | "heavy-slam"
+  | "double-if-user-no-item"
+  | "retaliate"
+  | "rollout";
 
 export type MoveEffectSpec = {
   recognized: boolean;
@@ -127,6 +134,162 @@ export type MoveEffectSpec = {
   struggleRecoil: boolean;
   /** Splash/Celebrate: the move does nothing on purpose */
   doesNothing: boolean;
+  /** Needs mechanics (abilities, doubles) this engine doesn't model: "But it failed!" */
+  failsAlways: boolean;
+  // --- move restrictions & harassment ---
+  /** Disable: seal the target's last used move for 5 turns */
+  disableTarget: boolean;
+  /** Encore: lock the target into repeating its last move for 4 turns */
+  encoreTarget: boolean;
+  /** Taunt: target can't use status moves for 4 turns */
+  tauntTarget: boolean;
+  /** Torment: target can't use the same move twice in a row */
+  tormentTarget: boolean;
+  /** Heal Block: target can't heal for 5 turns */
+  healBlockTarget: boolean;
+  /** Imprison: opponents can't use moves the user also knows */
+  imprisonUser: boolean;
+  /** Embargo: target's held item stops working for 5 turns */
+  embargoTarget: boolean;
+  /** Spite: cut 4 PP from the target's last used move */
+  spiteTarget: boolean;
+  /** Attract: infatuate the target (opposite genders only) */
+  attractTarget: boolean;
+  /** Yawn: the target falls asleep at the end of the next turn */
+  yawnTarget: boolean;
+  /** Snore: only usable while the user is asleep */
+  usableOnlyIfAsleep: boolean;
+  /** Fake Out: fails unless this is the user's first turn on the field */
+  failsIfNotFirstTurn: boolean;
+  /** Dream Eater: fails unless the target is asleep */
+  failsUnlessTargetAsleep: boolean;
+  /** Synchronoise: fails unless the target shares a type with the user */
+  failsUnlessTargetSharesType: boolean;
+  /** Focus Punch: fails if the user was damaged earlier this turn */
+  focusPunch: boolean;
+  /** Last Resort: fails while the user still has an unused other move */
+  lastResort: boolean;
+  /** Belch: fails unless the user has eaten a berry this battle */
+  belch: boolean;
+  // --- held items ---
+  removeTargetItem: boolean;
+  stealTargetItem: boolean;
+  swapItems: boolean;
+  bestowItem: boolean;
+  eatTargetBerry: boolean;
+  incinerateBerry: boolean;
+  recycleItem: boolean;
+  flingItem: boolean;
+  /** Natural Gift: consumes the held berry to attack (fails without one) */
+  naturalGift: boolean;
+  payDay: boolean;
+  doubleMoney: boolean;
+  // --- entry hazards ---
+  hazard: "spikes" | "toxic-spikes" | "stealth-rock" | "sticky-web" | null;
+  /** Rapid Spin: frees the user side of binding/seeding/hazards */
+  clearUserHazards: boolean;
+  /** Defog: also clears the target side's screens and hazards */
+  defog: boolean;
+  // --- call moves ---
+  callMove: "metronome" | "mirror-move" | "copycat" | "sleep-talk" | "assist" | "nature-power" | "me-first" | null;
+  // --- delayed & lethal bonds ---
+  /** Future Sight/Doom Desire: the hit lands 2 turns later */
+  futureSight: boolean;
+  /** Wish: heal the user's position at the end of the next turn */
+  wishUser: boolean;
+  /** Perish Song: every battler faints in 3 turns unless switched out */
+  perishSong: boolean;
+  /** Destiny Bond: if the user faints before acting again, the attacker faints */
+  destinyBond: boolean;
+  /** Grudge: the KOing move loses all its PP */
+  grudgeUser: boolean;
+  /** Bide: endure 2 turns, then return double the damage taken */
+  bide: boolean;
+  /** Healing Wish: user faints; its replacement is fully healed */
+  healingWish: boolean;
+  /** Lunar Dance: like Healing Wish, also restores PP */
+  lunarDance: boolean;
+  // --- transform & substitute & curse ---
+  transformUser: boolean;
+  substitute: boolean;
+  /** Curse: Ghost types pay half HP to curse; others get -Spd +Atk +Def */
+  curse: boolean;
+  // --- switching ---
+  /** Roar/Whirlwind/Dragon Tail: drag a random replacement out */
+  forceTargetSwitch: boolean;
+  /** U-turn/Volt Switch: user switches out after a successful hit */
+  switchOutUser: boolean;
+  /** Baton Pass: switch out, passing stat stages and volatiles along */
+  batonPass: boolean;
+  /** Teleport: escape a wild battle */
+  teleportUser: boolean;
+  /** Pursuit: intercepts a switching target at double power */
+  pursuit: boolean;
+  // --- field-wide effects ---
+  startFieldEffect:
+    | "gravity"
+    | "trick-room"
+    | "magic-room"
+    | "wonder-room"
+    | "electric-terrain"
+    | "grassy-terrain"
+    | "ion-deluge"
+    | null;
+  startSideEffect: "tailwind" | "safeguard" | "mist" | "lucky-chant" | null;
+  /** Mud Sport / Water Sport: weaken Electric/Fire while the user is active */
+  sport: "mud" | "water" | null;
+  magnetRiseUser: boolean;
+  telekinesisTarget: boolean;
+  // --- targeting helpers ---
+  /** Lock-On/Mind Reader: the user's moves can't miss this and next turn */
+  lockOnUser: boolean;
+  /** Foresight ("normal") / Miracle Eye ("psychic"): negate immunities+evasion */
+  foresight: "normal" | "psychic" | null;
+  /** Feint: hits through protection and lifts it */
+  feint: boolean;
+  /** Electrify: the target's move becomes Electric-type this turn */
+  electrifyTarget: boolean;
+  /** Powder: the target explodes if it uses a Fire move this turn */
+  powderTarget: boolean;
+  // --- stats & types ---
+  /** Acupressure: sharply raise one random stat */
+  acupressure: boolean;
+  swapStages: "offense" | "defense" | "all" | null;
+  copyTargetStages: boolean;
+  /** Power Trick: swap the user's Attack and Defense stats */
+  powerTrick: boolean;
+  /** Power Split / Guard Split: average the raw stats with the target */
+  averageStats: "offense" | "defense" | null;
+  /** Topsy-Turvy: invert the target's stat stages */
+  topsyTurvy: boolean;
+  /** Mimic: copy the target's last move over this one (this battle) */
+  mimic: boolean;
+  /** Sketch: like Mimic (kept battle-only in this engine) */
+  sketch: boolean;
+  /** Conversion 2: become a type that resists the target's last move */
+  conversion2: boolean;
+  /** Camouflage: type change based on the battle environment */
+  camouflage: boolean;
+  /** Psycho Shift: pass the user's status problem to the target */
+  psychoShift: boolean;
+  /** Aromatherapy/Heal Bell: cure the whole party's status problems */
+  curePartyStatus: boolean;
+  /** Heal Pulse: restore half the target's max HP */
+  healTargetHalf: boolean;
+  /** Flower Shield / Rototiller: boost every active Grass-type */
+  grassStatBoost: "defense" | "offense" | null;
+  // --- special damage ---
+  /** Hidden Power: type and power derived from the user's IVs */
+  hiddenPower: boolean;
+  /** Present: random 40/80/120 power, or heals the target 1/4 */
+  present: boolean;
+  /** Beat Up: one hit per healthy party member */
+  beatUp: boolean;
+  stockpileUser: boolean;
+  spitUp: boolean;
+  swallow: boolean;
+  /** Thrash/Outrage, Rollout, Uproar: locked-in multi-turn attacks */
+  rampage: "thrash" | "rollout" | "uproar" | null;
 };
 
 const STAT_TOKEN_PATTERN =
@@ -204,7 +367,87 @@ function emptySpec(recognized: boolean): MoveEffectSpec {
     ignoreDefensiveStages: false,
     multiHitPowersUp: false,
     struggleRecoil: false,
-    doesNothing: false
+    doesNothing: false,
+    failsAlways: false,
+    disableTarget: false,
+    encoreTarget: false,
+    tauntTarget: false,
+    tormentTarget: false,
+    healBlockTarget: false,
+    imprisonUser: false,
+    embargoTarget: false,
+    spiteTarget: false,
+    attractTarget: false,
+    yawnTarget: false,
+    usableOnlyIfAsleep: false,
+    failsIfNotFirstTurn: false,
+    failsUnlessTargetAsleep: false,
+    failsUnlessTargetSharesType: false,
+    focusPunch: false,
+    lastResort: false,
+    belch: false,
+    removeTargetItem: false,
+    stealTargetItem: false,
+    swapItems: false,
+    bestowItem: false,
+    eatTargetBerry: false,
+    incinerateBerry: false,
+    recycleItem: false,
+    flingItem: false,
+    naturalGift: false,
+    payDay: false,
+    doubleMoney: false,
+    hazard: null,
+    clearUserHazards: false,
+    defog: false,
+    callMove: null,
+    futureSight: false,
+    wishUser: false,
+    perishSong: false,
+    destinyBond: false,
+    grudgeUser: false,
+    bide: false,
+    healingWish: false,
+    lunarDance: false,
+    transformUser: false,
+    substitute: false,
+    curse: false,
+    forceTargetSwitch: false,
+    switchOutUser: false,
+    batonPass: false,
+    teleportUser: false,
+    pursuit: false,
+    startFieldEffect: null,
+    startSideEffect: null,
+    sport: null,
+    magnetRiseUser: false,
+    telekinesisTarget: false,
+    lockOnUser: false,
+    foresight: null,
+    feint: false,
+    electrifyTarget: false,
+    powderTarget: false,
+    acupressure: false,
+    swapStages: null,
+    copyTargetStages: false,
+    powerTrick: false,
+    averageStats: null,
+    topsyTurvy: false,
+    mimic: false,
+    sketch: false,
+    conversion2: false,
+    camouflage: false,
+    psychoShift: false,
+    curePartyStatus: false,
+    healTargetHalf: false,
+    grassStatBoost: null,
+    hiddenPower: false,
+    present: false,
+    beatUp: false,
+    stockpileUser: false,
+    spitUp: false,
+    swallow: false,
+    rampage: null
   };
 }
 
@@ -311,7 +554,159 @@ const NAMED_EFFECTS: Record<string, Partial<MoveEffectSpec>> = {
   UseTargetAttackInsteadOfUserAttack: { foulPlay: true },
   UseTargetDefenseInsteadOfTargetSpDef: { psyshock: true },
   IgnoreTargetDefSpDefEvaStatStages: { ignoreDefensiveStages: true },
-  HitThreeTimesPowersUpWithEachHit: { multiHit: { min: 3, max: 3 }, multiHitPowersUp: true }
+  HitThreeTimesPowersUpWithEachHit: { multiHit: { min: 3, max: 3 }, multiHitPowersUp: true },
+  // parser false-positive fixes: these names contain status tokens ("Sleep",
+  // "Confuse"...) that must not be treated as inflicted statuses
+  SleepTargetNextTurn: { yawnTarget: true },
+  FlinchTargetFailsIfUserNotAsleep: { flinchTarget: true, usableOnlyIfAsleep: true },
+  FlinchTargetFailsIfNotUserFirstTurn: { flinchTarget: true, failsIfNotFirstTurn: true },
+  HealUserByHalfOfDamageDoneIfTargetAsleep: { drainFraction: 0.5, failsUnlessTargetAsleep: true },
+  MultiTurnAttackPreventSleeping: { rampage: "uproar" },
+  MultiTurnAttackConfuseUserAtEnd: { rampage: "thrash" },
+  MultiTurnAttackPowersUpEachTurn: { rampage: "rollout", powerModifier: "rollout" },
+  MultiTurnAttackBideThenReturnDoubleDamage: { bide: true },
+  // restrictions & harassment
+  DisableTargetLastMoveUsed: { disableTarget: true },
+  DisableTargetUsingDifferentMove: { encoreTarget: true },
+  DisableTargetStatusMoves: { tauntTarget: true },
+  DisableTargetUsingSameMoveConsecutively: { tormentTarget: true },
+  DisableTargetHealingMoves: { healBlockTarget: true },
+  DisableTargetMovesKnownByUser: { imprisonUser: true },
+  StartTargetCannotUseItem: { embargoTarget: true },
+  LowerPPOfTargetLastMoveBy4: { spiteTarget: true },
+  AttractTarget: { attractTarget: true },
+  FailsIfUserDamagedThisTurn: { focusPunch: true },
+  FailsIfUserHasUnusedMove: { lastResort: true },
+  FailsIfUserNotConsumedBerry: { belch: true },
+  FailsUnlessTargetSharesTypeWithUser: { failsUnlessTargetSharesType: true },
+  // held items
+  RemoveTargetItem: { removeTargetItem: true },
+  UserTakesTargetItem: { stealTargetItem: true },
+  UserTargetSwapItems: { swapItems: true },
+  TargetTakesUserItem: { bestowItem: true },
+  UserConsumeTargetBerry: { eatTargetBerry: true },
+  DestroyTargetBerryOrGem: { incinerateBerry: true },
+  RestoreUserConsumedItem: { recycleItem: true },
+  ThrowUserItemAtTarget: { flingItem: true },
+  TypeAndPowerDependOnUserBerry: { naturalGift: true },
+  DoublePowerIfUserHasNoItem: { powerModifier: "double-if-user-no-item" },
+  AddMoneyGainedFromBattle: { payDay: true },
+  DoubleMoneyGainedFromBattle: { doubleMoney: true },
+  // entry hazards
+  AddSpikesToFoeSide: { hazard: "spikes" },
+  AddToxicSpikesToFoeSide: { hazard: "toxic-spikes" },
+  AddStealthRocksToFoeSide: { hazard: "stealth-rock" },
+  AddStickyWebToFoeSide: { hazard: "sticky-web" },
+  RemoveUserBindingAndEntryHazards: { clearUserHazards: true },
+  LowerTargetEvasion1RemoveSideEffects: {
+    statChanges: [{ target: "target", stat: "evasion", delta: -1 }],
+    defog: true
+  },
+  // call moves
+  UseRandomMove: { callMove: "metronome" },
+  UseLastMoveUsedByTarget: { callMove: "mirror-move" },
+  UseLastMoveUsed: { callMove: "copycat" },
+  UseRandomUserMoveIfAsleep: { callMove: "sleep-talk" },
+  UseRandomMoveFromUserParty: { callMove: "assist" },
+  UseMoveDependingOnEnvironment: { callMove: "nature-power" },
+  UseMoveTargetIsAboutToUse: { callMove: "me-first" },
+  // delayed effects & lethal bonds
+  AttackTwoTurnsLater: { futureSight: true },
+  HealUserPositionNextTurn: { wishUser: true },
+  StartPerishCountsForAllBattlers: { perishSong: true },
+  AttackerFaintsIfUserFaints: { destinyBond: true },
+  SetAttackerMovePPTo0IfUserFaints: { grudgeUser: true },
+  UserFaintsHealAndCureReplacement: { healingWish: true },
+  UserFaintsHealAndCureReplacementRestorePP: { lunarDance: true },
+  // transform, substitute, curse
+  TransformUserIntoTarget: { transformUser: true },
+  UserMakeSubstitute: { substitute: true },
+  CurseTargetOrLowerUserSpd1RaiseUserAtkDef1: { curse: true },
+  // switching
+  SwitchOutTargetStatusMove: { forceTargetSwitch: true },
+  SwitchOutTargetDamagingMove: { forceTargetSwitch: true },
+  SwitchOutUserDamagingMove: { switchOutUser: true },
+  SwitchOutUserPassOnEffects: { batonPass: true },
+  SwitchOutUserStatusMove: { teleportUser: true },
+  PursueSwitchingFoe: { pursuit: true },
+  // field-wide effects
+  StartGravity: { startFieldEffect: "gravity" },
+  StartSlowerBattlersActFirst: { startFieldEffect: "trick-room" },
+  StartNegateHeldItems: { startFieldEffect: "magic-room" },
+  StartSwapAllBattlersBaseDefensiveStats: { startFieldEffect: "wonder-room" },
+  StartElectricTerrain: { startFieldEffect: "electric-terrain" },
+  StartGrassyTerrain: { startFieldEffect: "grassy-terrain" },
+  NormalMovesBecomeElectric: { startFieldEffect: "ion-deluge" },
+  StartUserSideDoubleSpeed: { startSideEffect: "tailwind" },
+  StartUserSideImmunityToInflictedStatus: { startSideEffect: "safeguard" },
+  StartUserSideImmunityToStatStageLowering: { startSideEffect: "mist" },
+  StartPreventCriticalHitsAgainstUserSide: { startSideEffect: "lucky-chant" },
+  StartWeakenElectricMoves: { sport: "mud" },
+  StartWeakenFireMoves: { sport: "water" },
+  StartUserAirborne: { magnetRiseUser: true },
+  StartTargetAirborneAndAlwaysHitByMoves: { telekinesisTarget: true },
+  // targeting helpers
+  EnsureNextMoveAlwaysHits: { lockOnUser: true },
+  StartNegateTargetEvasionStatStageAndGhostImmunity: { foresight: "normal" },
+  StartNegateTargetEvasionStatStageAndDarkImmunity: { foresight: "psychic" },
+  RemoveProtections: { feint: true },
+  TargetMovesBecomeElectric: { electrifyTarget: true },
+  TargetNextFireMoveDamagesTarget: { powderTarget: true },
+  // stats & types
+  RaiseTargetRandomStat2: { acupressure: true },
+  UserTargetSwapAtkSpAtkStages: { swapStages: "offense" },
+  UserTargetSwapDefSpDefStages: { swapStages: "defense" },
+  UserTargetSwapStatStages: { swapStages: "all" },
+  UserCopyTargetStatStages: { copyTargetStages: true },
+  UserSwapBaseAtkDef: { powerTrick: true },
+  UserTargetAverageBaseAtkSpAtk: { averageStats: "offense" },
+  UserTargetAverageBaseDefSpDef: { averageStats: "defense" },
+  InvertTargetStatStages: { topsyTurvy: true },
+  ReplaceMoveThisBattleWithTargetLastMoveUsed: { mimic: true },
+  ReplaceMoveWithTargetLastMoveUsed: { sketch: true },
+  SetUserTypesToResistLastAttack: { conversion2: true },
+  SetUserTypesBasedOnEnvironment: { camouflage: true },
+  GiveUserStatusToTarget: { psychoShift: true },
+  CureUserPartyStatus: { curePartyStatus: true },
+  HealTargetHalfOfTotalHP: { healTargetHalf: true },
+  RaiseGrassBattlersDef1: { grassStatBoost: "defense" },
+  RaiseGroundedGrassBattlersAtkSpAtk1: { grassStatBoost: "offense" },
+  // special damage
+  TypeDependsOnUserIVs: { hiddenPower: true },
+  RandomlyDamageOrHealTarget: { present: true },
+  HitOncePerUserTeamMember: { beatUp: true },
+  UserAddStockpileRaiseDefSpDef1: { stockpileUser: true },
+  PowerDependsOnUserStockpile: { spitUp: true },
+  HealUserDependingOnUserStockpile: { swallow: true },
+  PowerHigherWithUserHappiness: { powerModifier: "return" },
+  PowerLowerWithUserHappiness: { powerModifier: "frustration" },
+  PowerHigherWithTargetWeight: { powerModifier: "low-kick" },
+  PowerHigherWithUserHeavierThanTarget: { powerModifier: "heavy-slam" },
+  DoublePowerIfAllyFaintedLastTurn: { powerModifier: "retaliate" },
+  // Secret Power: the default (building/plain) secondary is paralysis
+  EffectDependsOnEnvironment: { status: { target: "target", id: "paralysis" } },
+  // plain damage in a 1v1 engine (combo/ally mechanics can't trigger)
+  DoublePowerAfterFusionFlare: {},
+  DoublePowerAfterFusionBolt: {},
+  UsedAfterAllyRoundWithDoublePower: {},
+  DamageTargetAlly: {},
+  FirePledge: {},
+  TypeDependsOnUserPlate: {},
+  // needs abilities or multiple allies, neither of which exists here
+  SetTargetAbilityToSimple: { failsAlways: true },
+  SetTargetAbilityToInsomnia: { failsAlways: true },
+  SetUserAbilityToTargetAbility: { failsAlways: true },
+  SetTargetAbilityToUserAbility: { failsAlways: true },
+  UserTargetSwapAbilities: { failsAlways: true },
+  NegateTargetAbility: { failsAlways: true },
+  BounceBackProblemCausingStatusMoves: { failsAlways: true },
+  StealAndUseBeneficialStatusMove: { failsAlways: true },
+  RaisePlusMinusUserAndAlliesDefSpDef1: { failsAlways: true },
+  PowerUpAllyMove: { failsAlways: true },
+  RedirectAllMovesToUser: { failsAlways: true },
+  UserSwapsPositionsWithAlly: { failsAlways: true },
+  TargetActsNext: { failsAlways: true },
+  TargetActsLast: { failsAlways: true }
 };
 
 function parseStatChangeSegments(name: string, spec: MoveEffectSpec) {
@@ -504,6 +899,13 @@ export type PowerModifierContext = {
   consecutiveUses: number;
   /** PP remaining after this use (Trump Card) */
   movePpLeft: number;
+  /** base happiness (Return/Frustration); Essentials default is 70 */
+  userHappiness: number;
+  userWeightKg: number;
+  targetWeightKg: number;
+  userHasItem: boolean;
+  /** a party member of the user's side fainted last turn (Retaliate) */
+  allyFaintedLastTurn: boolean;
 };
 
 /**
@@ -584,6 +986,27 @@ export function computeModifiedPower(
         ratio <= 1 ? 200 : ratio <= 4 ? 150 : ratio <= 9 ? 100 : ratio <= 16 ? 80 : ratio <= 32 ? 40 : 20;
       return { power, message: null };
     }
+    case "return":
+      return { power: Math.max(1, Math.floor(ctx.userHappiness / 2.5)), message: null };
+    case "frustration":
+      return { power: Math.max(1, Math.floor((255 - ctx.userHappiness) / 2.5)), message: null };
+    case "low-kick": {
+      const kg = ctx.targetWeightKg;
+      const power = kg <= 10 ? 20 : kg <= 25 ? 40 : kg <= 50 ? 60 : kg <= 100 ? 80 : kg <= 200 ? 100 : 120;
+      return { power, message: null };
+    }
+    case "heavy-slam": {
+      const ratio = ctx.userWeightKg / Math.max(0.1, ctx.targetWeightKg);
+      const power = ratio >= 5 ? 120 : ratio >= 4 ? 100 : ratio >= 3 ? 80 : ratio >= 2 ? 60 : 40;
+      return { power, message: null };
+    }
+    case "double-if-user-no-item":
+      return double(!ctx.userHasItem);
+    case "retaliate":
+      return double(ctx.allyFaintedLastTurn);
+    case "rollout":
+      // Rollout/Ice Ball: doubles with each successive successful use.
+      return { power: basePower * Math.pow(2, Math.min(4, ctx.consecutiveUses)), message: null };
     case "magnitude": {
       const roll = Math.random() * 100;
       const [magnitude, power] =
@@ -601,6 +1024,33 @@ export function computeModifiedPower(
     default:
       return { power: basePower, message: null };
   }
+}
+
+/**
+ * Hidden Power type and power from IVs, using the classic Gen III formulas
+ * (bit 0 of each IV selects the type; bit 1 scales power between 30 and 70).
+ * IV order: HP, Attack, Defense, Speed, Sp. Atk, Sp. Def.
+ */
+const HIDDEN_POWER_TYPES = [
+  "FIGHTING", "FLYING", "POISON", "GROUND", "ROCK", "BUG", "GHOST", "STEEL",
+  "FIRE", "WATER", "GRASS", "ELECTRIC", "PSYCHIC", "ICE", "DRAGON", "DARK"
+];
+
+export function computeHiddenPower(ivs: {
+  hp: number;
+  attack: number;
+  defense: number;
+  specialAttack: number;
+  specialDefense: number;
+  speed: number;
+}): { type: string; power: number } {
+  const order = [ivs.hp, ivs.attack, ivs.defense, ivs.speed, ivs.specialAttack, ivs.specialDefense];
+  const typeSum = order.reduce((sum, iv, index) => sum + (iv & 1) * Math.pow(2, index), 0);
+  const powerSum = order.reduce((sum, iv, index) => sum + ((iv >> 1) & 1) * Math.pow(2, index), 0);
+  return {
+    type: HIDDEN_POWER_TYPES[Math.floor((typeSum * 15) / 63)],
+    power: 30 + Math.floor((powerSum * 40) / 63)
+  };
 }
 
 export function rollMultiHitCount(multiHit: { min: number; max: number }): number {

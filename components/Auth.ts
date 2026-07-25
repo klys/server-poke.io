@@ -151,6 +151,20 @@ export interface AdminUserUpdatePayload {
     savedLocation?: SavedPlayerLocation | null;
 }
 
+/**
+ * Wire form of an admin savedLocation update: either concrete coordinates or
+ * an "automatic" request where the server picks a non-stuck spot on the map.
+ * The socket handler resolves the automatic form to concrete coordinates
+ * before it reaches updateUserByAdmin.
+ */
+export type AdminSavedLocationInput =
+    | { mapId: string; x: number; y: number; automatic?: false }
+    | { mapId: string; automatic: true };
+
+export interface AdminUserUpdateInput extends Omit<AdminUserUpdatePayload, "savedLocation"> {
+    savedLocation?: AdminSavedLocationInput | null;
+}
+
 export interface RoleDefinitionWithCount extends RoleDefinition {
     userCount: number;
 }
