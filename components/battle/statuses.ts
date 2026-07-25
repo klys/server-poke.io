@@ -136,8 +136,9 @@ export function applyStatusEndOfTurn(
   }
 
   if (status.id === "burn") {
+    // 1/8 max HP, matching the source game (pbEndOfRoundPhase: totalhp/8).
     return {
-      damage: Math.max(1, Math.floor(maxHp / 16)),
+      damage: Math.max(1, Math.floor(maxHp / 8)),
       message: `${displayName} is hurt by its burn!`
     };
   }

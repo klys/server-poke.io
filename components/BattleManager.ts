@@ -41,6 +41,7 @@ import {
 import { canSpeciesLearnMachineMove } from "./TmCompatibility";
 import { resolveHeldItemEffect, type HeldItemEffect } from "./battle/heldItems";
 import {
+  computeModifiedPower,
   parseMoveEffect,
   rollMultiHitCount,
   STAGE_DISPLAY_NAMES,
@@ -234,10 +235,33 @@ type BattleMove = BattlePublicMove & {
   effectChance: number;
 };
 
+type BattleSemiInvulnerableState = "sky" | "underground" | "underwater";
+
 type BattleVolatileState = {
   confusionTurns: number;
   flinched: boolean;
   protected: boolean;
+  /** Bind/Wrap/Fire Spin: chip damage each end of turn until freed. */
+  binding: { turnsLeft: number; moveName: string; byPokemonId: string } | null;
+  /** Mean Look/Block/Shadow Hold: can't flee or switch while trapper is active. */
+  trappedByPokemonId: string | null;
+  /** Leech Seed: seeded battler feeds the opposing active mon each turn. */
+  seededBySideId: BattleSideId | null;
+  /** Hyper Beam family: this turn is spent recharging. */
+  recharging: boolean;
+  /** Two-turn moves: set on the charge turn, released on the next. */
+  charging: { moveId: string; invulnerable: BattleSemiInvulnerableState | null } | null;
+  aquaRing: boolean;
+  ingrain: boolean;
+  nightmare: boolean;
+  /** Endure: survive fatal hits with 1 HP this turn. */
+  endure: boolean;
+  focusEnergy: boolean;
+  /** Damage received this turn, for Counter/Mirror Coat/Metal Burst and Revenge. */
+  damageTakenThisTurn: { physical: number; special: number; any: number };
+  /** Consecutive-use tracking (Fury Cutter). */
+  lastMoveId: string | null;
+  consecutiveMoveUses: number;
 };
 
 type BattlePokemon = {
@@ -287,6 +311,10 @@ type BattleSide = {
   activeIndex: number;
   action: BattleQueuedAction | null;
   escapeAttempts: number;
+  /** Reflect / Light Screen turns remaining (0 = down). */
+  screens?: { reflect: number; lightScreen: number };
+  /** Whether this side's fight action already executed this turn (Sucker Punch, Payback). */
+  hasActedThisTurn?: boolean;
 };
 
 type BattleQueuedAction =
@@ -319,6 +347,8 @@ type BattleSession = {
   summary: BattlePublicSummary | null;
   /** Essentials battleback name for the map the battle started on. */
   battleBack: string | null;
+  /** Active weather (Sunny Day/Rain Dance/Sandstorm/Hail/Shadow Sky). */
+  weather: { kind: "sun" | "rain" | "sandstorm" | "hail" | "shadowsky"; turns: number } | null;
   /** Set while a player must choose which mon replaces their fainted active one. */
   replacementRequest: {
     sideId: BattleSideId;
@@ -599,8 +629,29 @@ function createEmptyStages(): BattleStatStages {
   };
 }
 
+function countPositiveStages(stages: BattleStatStages): number {
+  return Object.values(stages).reduce((sum, stage) => sum + Math.max(0, stage), 0);
+}
+
 function createEmptyVolatile(): BattleVolatileState {
-  return { confusionTurns: 0, flinched: false, protected: false };
+  return {
+    confusionTurns: 0,
+    flinched: false,
+    protected: false,
+    binding: null,
+    trappedByPokemonId: null,
+    seededBySideId: null,
+    recharging: false,
+    charging: null,
+    aquaRing: false,
+    ingrain: false,
+    nightmare: false,
+    endure: false,
+    focusEnergy: false,
+    damageTakenThisTurn: { physical: 0, special: 0, any: 0 },
+    lastMoveId: null,
+    consecutiveMoveUses: 0
+  };
 }
 
 function rollIvs(): BattleStats {
@@ -3339,6 +3390,7 @@ export default class BattleManager {
       endedAt: null,
       summary: null,
       battleBack,
+      weather: null,
       replacementRequest: null
     };
 
@@ -3374,6 +3426,12 @@ export default class BattleManager {
   private startChoiceTurn(battle: BattleSession) {
     battle.sides.forEach((side) => {
       side.action = null;
+      // A mon mid two-turn move (Fly/Dig/Solar Beam...) is locked into
+      // releasing it — no new choice this turn.
+      const active = getActivePokemon(side);
+      if (active && !isFainted(active) && active.volatile.charging) {
+        side.action = { type: "fight", moveId: active.volatile.charging.moveId };
+      }
     });
 
     if (battle.kind === "trainer") {
@@ -3392,6 +3450,17 @@ export default class BattleManager {
 
     this.emitBattleState(battle);
     this.flushEvents(battle);
+
+    // Two-turn locks can cover every human side; nobody is left to submit an
+    // action, so the turn must kick itself off (AI picks, then resolve).
+    const humanSides = battle.sides.filter((side) => !side.isAi);
+    if (humanSides.length > 0 && humanSides.every((side) => side.action !== null)) {
+      const aiSide = battle.sides.find((side) => side.isAi);
+      if (aiSide && !aiSide.action) {
+        aiSide.action = this.chooseAiAction(aiSide, humanSides[0]);
+      }
+      setTimeout(() => void this.resolveTurn(battle), 600);
+    }
   }
 
   private clearBattleTimer(battle: BattleSession) {
@@ -3410,6 +3479,15 @@ export default class BattleManager {
     this.clearBattleTimer(battle);
     this.recordParticipation(battle);
     const [firstSide, secondSide] = battle.sides;
+
+    // Per-turn tracking for Counter/Revenge/Payback/Sucker Punch.
+    for (const side of battle.sides) {
+      side.hasActedThisTurn = false;
+      const active = getActivePokemon(side);
+      if (active) {
+        active.volatile.damageTakenThisTurn = { physical: 0, special: 0, any: 0 };
+      }
+    }
 
     for (const side of battle.sides) {
       if (side.action?.type === "surrender") {
@@ -3435,11 +3513,20 @@ export default class BattleManager {
         return;
       }
 
-      const escaped = this.tryEscape(runSide, this.getOpponentSide(battle, runSide));
+      const runner = getActivePokemon(runSide);
+      const heldInBattle =
+        runner.volatile.binding !== null || runner.volatile.trappedByPokemonId !== null;
+      const escaped = heldInBattle
+        ? false
+        : this.tryEscape(runSide, this.getOpponentSide(battle, runSide));
       this.pushEvent(
         battle,
         { kind: "escape", success: escaped },
-        escaped ? "You got away safely." : "You could not escape."
+        escaped
+          ? "You got away safely."
+          : heldInBattle
+            ? `${getPokemonDisplayName(runner)} is trapped and can't escape!`
+            : "You could not escape."
       );
       await this.emitBattleStep(battle, !escaped);
       if (escaped) {
@@ -3460,7 +3547,13 @@ export default class BattleManager {
 
     for (const side of battle.sides) {
       if (side.action?.type === "pokemon") {
-        const switched = this.switchPokemon(side, side.action.pokemonId);
+        const current = getActivePokemon(side);
+        if (current.volatile.binding !== null || current.volatile.trappedByPokemonId !== null) {
+          this.say(battle, `${getPokemonDisplayName(current)} is trapped and can't be switched out!`);
+          await this.emitBattleStep(battle);
+          continue;
+        }
+        const switched = this.switchPokemon(battle, side, side.action.pokemonId);
         if (switched) {
           const sentOut = getActivePokemon(side);
           this.pushEvent(
@@ -3502,6 +3595,7 @@ export default class BattleManager {
       }
 
       await this.executeMoveAction(battle, side, target, side.action.moveId);
+      side.hasActedThisTurn = true;
 
       if (await this.handleFaintChecks(battle)) {
         return;
@@ -3603,6 +3697,7 @@ export default class BattleManager {
         { kind: "faint", sideId: side.id, pokemonId: active.id, pokemonName: getPokemonDisplayName(active) },
         `${getPokemonDisplayName(active)} fainted.`
       );
+      this.clearBattlerLeaveEffects(battle, side);
       await this.emitBattleStep(battle);
       await this.awardExperienceForFaint(battle, side, active);
 
@@ -3647,6 +3742,106 @@ export default class BattleManager {
 
     let pushedAnyEvent = false;
 
+    const pushResidualDamage = (
+      side: BattleSide,
+      pokemon: BattlePokemon,
+      damage: number,
+      message: string | null
+    ) => {
+      const dealt = Math.min(pokemon.hp, Math.max(1, damage));
+      if (dealt <= 0) {
+        return 0;
+      }
+      pokemon.hp -= dealt;
+      this.pushEvent(
+        battle,
+        {
+          kind: "damage",
+          sideId: side.id,
+          pokemonId: pokemon.id,
+          amount: dealt,
+          hpAfter: pokemon.hp,
+          maxHp: pokemon.maxHp,
+          effectiveness: 1,
+          critical: false,
+          source: "status"
+        },
+        message
+      );
+      pushedAnyEvent = true;
+      return dealt;
+    };
+
+    const pushResidualHeal = (
+      side: BattleSide,
+      pokemon: BattlePokemon,
+      amount: number,
+      message: string | null
+    ) => {
+      const healed = Math.min(pokemon.maxHp - pokemon.hp, Math.max(1, amount));
+      if (healed <= 0) {
+        return;
+      }
+      pokemon.hp += healed;
+      this.pushEvent(
+        battle,
+        {
+          kind: "heal",
+          sideId: side.id,
+          pokemonId: pokemon.id,
+          amount: healed,
+          hpAfter: pokemon.hp,
+          maxHp: pokemon.maxHp,
+          source: "move"
+        },
+        message
+      );
+      pushedAnyEvent = true;
+    };
+
+    // Weather: count down, then chip the exposed battlers (original order:
+    // weather first, then residual effects).
+    if (battle.weather) {
+      battle.weather.turns -= 1;
+      if (battle.weather.turns <= 0) {
+        const endText: Record<NonNullable<BattleSession["weather"]>["kind"], string> = {
+          sun: "The sunlight faded.",
+          rain: "The rain stopped.",
+          sandstorm: "The sandstorm subsided.",
+          hail: "The hail stopped.",
+          shadowsky: "The shadow sky faded."
+        };
+        this.say(battle, endText[battle.weather.kind]);
+        battle.weather = null;
+        pushedAnyEvent = true;
+      } else {
+        const weatherKind = battle.weather.kind;
+        if (weatherKind === "sandstorm" || weatherKind === "hail" || weatherKind === "shadowsky") {
+          for (const side of battle.sides) {
+            const pokemon = getActivePokemon(side);
+            if (!pokemon || isFainted(pokemon)) {
+              continue;
+            }
+            const types = pokemon.types.map((type) => type.trim().toUpperCase());
+            const immune =
+              weatherKind === "sandstorm"
+                ? types.some((type) => ["ROCK", "GROUND", "STEEL"].includes(type))
+                : weatherKind === "hail"
+                  ? types.includes("ICE")
+                  : false;
+            if (!immune) {
+              pushResidualDamage(
+                side,
+                pokemon,
+                Math.floor(pokemon.maxHp / 16),
+                `${getPokemonDisplayName(pokemon)} is buffeted by the ${weatherKind === "shadowsky" ? "shadow sky" : weatherKind}!`
+              );
+            }
+          }
+        }
+      }
+    }
+
     for (const side of battle.sides) {
       const pokemon = getActivePokemon(side);
       if (!pokemon || isFainted(pokemon)) {
@@ -3654,25 +3849,73 @@ export default class BattleManager {
       }
 
       const displayName = getPokemonDisplayName(pokemon);
-      const residual = applyStatusEndOfTurn(pokemon.status, pokemon.maxHp, displayName);
-      if (residual.damage > 0) {
-        pokemon.hp = Math.max(0, pokemon.hp - residual.damage);
-        this.pushEvent(
-          battle,
-          {
-            kind: "damage",
-            sideId: side.id,
-            pokemonId: pokemon.id,
-            amount: residual.damage,
-            hpAfter: pokemon.hp,
-            maxHp: pokemon.maxHp,
-            effectiveness: 1,
-            critical: false,
-            source: "status"
-          },
-          residual.message
+
+      // Ingrain / Aqua Ring: 1/16 heal.
+      if ((pokemon.volatile.ingrain || pokemon.volatile.aquaRing) && pokemon.hp < pokemon.maxHp) {
+        pushResidualHeal(
+          side,
+          pokemon,
+          Math.floor(pokemon.maxHp / 16),
+          pokemon.volatile.ingrain
+            ? `${displayName} absorbed nutrients with its roots!`
+            : `${displayName} restored HP with its veil of water!`
         );
-        pushedAnyEvent = true;
+      }
+
+      // Leech Seed: 1/8 drained, healing the opposing active mon.
+      if (pokemon.volatile.seededBySideId && !isFainted(pokemon)) {
+        const drained = pushResidualDamage(
+          side,
+          pokemon,
+          Math.floor(pokemon.maxHp / 8),
+          `${displayName}'s health is sapped by Leech Seed!`
+        );
+        const recipientSide = battle.sides.find(
+          (candidate) => candidate.id === pokemon.volatile.seededBySideId
+        );
+        const recipient = recipientSide ? getActivePokemon(recipientSide) : null;
+        if (drained > 0 && recipientSide && recipient && !isFainted(recipient)) {
+          pushResidualHeal(recipientSide, recipient, drained, null);
+        }
+      }
+
+      const residual = applyStatusEndOfTurn(pokemon.status, pokemon.maxHp, displayName);
+      if (residual.damage > 0 && !isFainted(pokemon)) {
+        pushResidualDamage(side, pokemon, residual.damage, residual.message);
+      }
+
+      // Nightmare: 1/4 while the target stays asleep.
+      if (pokemon.volatile.nightmare) {
+        if (pokemon.status?.id === "sleep") {
+          if (!isFainted(pokemon)) {
+            pushResidualDamage(
+              side,
+              pokemon,
+              Math.floor(pokemon.maxHp / 4),
+              `${displayName} is locked in a nightmare!`
+            );
+          }
+        } else {
+          pokemon.volatile.nightmare = false;
+        }
+      }
+
+      // Bind / Wrap / Fire Spin: tick down, chip 1/16, free at zero.
+      const binding = pokemon.volatile.binding;
+      if (binding && !isFainted(pokemon)) {
+        binding.turnsLeft -= 1;
+        if (binding.turnsLeft <= 0) {
+          pokemon.volatile.binding = null;
+          this.say(battle, `${displayName} was freed from ${binding.moveName}!`);
+          pushedAnyEvent = true;
+        } else {
+          pushResidualDamage(
+            side,
+            pokemon,
+            Math.floor(pokemon.maxHp / 16),
+            `${displayName} is hurt by ${binding.moveName}!`
+          );
+        }
       }
 
       if (!isFainted(pokemon) && this.applyHeldItemTriggers(battle, side, pokemon)) {
@@ -3681,6 +3924,29 @@ export default class BattleManager {
 
       pokemon.volatile.flinched = false;
       pokemon.volatile.protected = false;
+      pokemon.volatile.endure = false;
+    }
+
+    // Screens wear off.
+    for (const side of battle.sides) {
+      const screens = side.screens;
+      if (!screens) {
+        continue;
+      }
+      if (screens.reflect > 0) {
+        screens.reflect -= 1;
+        if (screens.reflect === 0) {
+          this.say(battle, `${side.trainerName}'s Reflect wore off!`);
+          pushedAnyEvent = true;
+        }
+      }
+      if (screens.lightScreen > 0) {
+        screens.lightScreen -= 1;
+        if (screens.lightScreen === 0) {
+          this.say(battle, `${side.trainerName}'s Light Screen wore off!`);
+          pushedAnyEvent = true;
+        }
+      }
     }
 
     if (pushedAnyEvent) {
@@ -4870,14 +5136,40 @@ export default class BattleManager {
     return Math.max(0, Math.floor(perUnitBuyPrice / 2));
   }
 
-  private switchPokemon(side: BattleSide, pokemonId: string) {
+  private switchPokemon(battle: BattleSession, side: BattleSide, pokemonId: string) {
     const targetIndex = side.party.findIndex((pokemon) => pokemon.id === pokemonId);
     if (targetIndex < 0 || targetIndex === side.activeIndex || isFainted(side.party[targetIndex])) {
       return false;
     }
 
+    this.clearBattlerLeaveEffects(battle, side);
     side.activeIndex = targetIndex;
     return true;
+  }
+
+  /**
+   * Essentials clears a battler's effects when it leaves the field
+   * (pbInitEffects): its own volatile state resets, and whatever it was
+   * inflicting on the opponent — binding, trapping — ends with it. Runs on
+   * switch-out and on faint.
+   */
+  private clearBattlerLeaveEffects(battle: BattleSession, side: BattleSide) {
+    const leaving = getActivePokemon(side);
+    if (!leaving) {
+      return;
+    }
+
+    const opponent = getActivePokemon(this.getOpponentSide(battle, side));
+    if (opponent) {
+      if (opponent.volatile.binding?.byPokemonId === leaving.id) {
+        opponent.volatile.binding = null;
+      }
+      if (opponent.volatile.trappedByPokemonId === leaving.id) {
+        opponent.volatile.trappedByPokemonId = null;
+      }
+    }
+
+    leaving.volatile = createEmptyVolatile();
   }
 
   private async executeMoveAction(
@@ -4904,6 +5196,14 @@ export default class BattleManager {
         { kind: "flinch", sideId: side.id, pokemonId: attacker.id },
         `${attackerName} flinched and couldn't move!`
       );
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    // Hyper Beam family: the turn after a successful hit is spent recharging.
+    if (attacker.volatile.recharging) {
+      attacker.volatile.recharging = false;
+      this.say(battle, `${attackerName} must recharge!`);
       await this.emitBattleStep(battle);
       return;
     }
@@ -4958,8 +5258,23 @@ export default class BattleManager {
       }
     }
 
-    move.currentPp -= 1;
     const spec = parseMoveEffect(resolveFunctionCode(move.functionCode ?? ""));
+
+    // Two-turn moves: the charge turn locks the release (see startChoiceTurn);
+    // the release turn skips the PP cost (paid when charging).
+    const isReleaseTurn = attacker.volatile.charging?.moveId === move.id;
+    if (isReleaseTurn) {
+      attacker.volatile.charging = null;
+    } else {
+      move.currentPp -= 1;
+    }
+
+    // Fury Cutter-style ramping: uses of the same move in a row BEFORE this one.
+    const consecutiveUses =
+      attacker.volatile.lastMoveId === move.id ? attacker.volatile.consecutiveMoveUses : 0;
+    attacker.volatile.lastMoveId = move.id;
+    attacker.volatile.consecutiveMoveUses = consecutiveUses + 1;
+
     this.pushEvent(
       battle,
       {
@@ -4977,9 +5292,57 @@ export default class BattleManager {
       `${attackerName} used ${move.name}!`
     );
 
+    if (spec.twoTurn && !isReleaseTurn && !(spec.twoTurn.skipChargeInSun && battle.weather?.kind === "sun")) {
+      attacker.volatile.charging = { moveId: move.id, invulnerable: spec.twoTurn.invulnerable };
+      const chargeText =
+        spec.twoTurn.invulnerable === "sky"
+          ? `${attackerName} flew up high!`
+          : spec.twoTurn.invulnerable === "underground"
+            ? `${attackerName} burrowed its way under the ground!`
+            : spec.twoTurn.invulnerable === "underwater"
+              ? `${attackerName} hid underwater!`
+              : `${attackerName} began charging power!`;
+      this.say(battle, chargeText);
+      await this.emitBattleStep(battle);
+      return;
+    }
+
     if (spec.protectUser) {
       attacker.volatile.protected = true;
       this.say(battle, `${attackerName} protected itself!`);
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    // Sucker Punch: fails unless the target is still preparing a damaging move.
+    if (spec.failsUnlessTargetPreparingDamagingMove) {
+      const targetQueuedMove = this.getQueuedMove(target);
+      const targetPreparing =
+        target.action?.type === "fight" &&
+        targetQueuedMove !== null &&
+        targetQueuedMove.damageClass !== "status" &&
+        !target.hasActedThisTurn;
+      if (!targetPreparing) {
+        this.say(battle, "But it failed!");
+        await this.emitBattleStep(battle);
+        return;
+      }
+    }
+
+    // Counter / Mirror Coat / Metal Burst: throw back damage taken this turn.
+    if (spec.counter) {
+      const taken = attacker.volatile.damageTakenThisTurn;
+      const base =
+        spec.counter === "physical" ? taken.physical : spec.counter === "special" ? taken.special : taken.any;
+      if (base <= 0 || isFainted(defender)) {
+        this.say(battle, "But it failed!");
+        await this.emitBattleStep(battle);
+        return;
+      }
+
+      const counterDamage =
+        spec.counter === "any" ? Math.max(1, Math.floor(base * 1.5)) : base * 2;
+      this.applyDirectDamage(battle, target, defender, counterDamage, spec);
       await this.emitBattleStep(battle);
       return;
     }
@@ -4990,7 +5353,13 @@ export default class BattleManager {
       spec.statChanges.some((change) => change.target === "target") ||
       (spec.status !== null && spec.status.target === "target") ||
       spec.confuseTarget ||
-      spec.resetTargetStats;
+      spec.resetTargetStats ||
+      spec.bindTarget ||
+      spec.trapTarget ||
+      spec.leechSeedTarget ||
+      spec.setTargetTypesToWater ||
+      spec.addTypeToTarget !== null ||
+      spec.nightmareTarget;
 
     if (affectsTarget && defender.volatile.protected) {
       this.say(battle, `${defenderName} protected itself!`);
@@ -4998,26 +5367,108 @@ export default class BattleManager {
       return;
     }
 
-    if (affectsTarget && !this.rollAccuracy(attacker, defender, move, spec)) {
+    // A semi-invulnerable target (Fly/Dig/Dive) dodges everything except the
+    // moves that specifically reach it (Gust/Earthquake/Surf...).
+    const defenderInvulnerable = defender.volatile.charging?.invulnerable ?? null;
+    if (affectsTarget && defenderInvulnerable && spec.hitsInvulnerable !== defenderInvulnerable) {
+      this.say(battle, `${defenderName} avoided the attack!`);
+      await this.emitBattleStep(battle);
+      return;
+    }
+
+    if (affectsTarget && !spec.alwaysHits && !this.rollAccuracy(attacker, defender, move, spec)) {
       this.pushEvent(
         battle,
         { kind: "move-missed", sideId: side.id, pokemonId: attacker.id, moveName: move.name },
         `${attackerName}'s attack missed!`
       );
+      if (spec.crashDamageOnMiss) {
+        const crash = Math.max(1, Math.floor(attacker.maxHp / 2));
+        attacker.hp = Math.max(0, attacker.hp - crash);
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: crash,
+            hpAfter: attacker.hp,
+            maxHp: attacker.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "recoil"
+          },
+          `${attackerName} kept going and crashed!`
+        );
+      }
       await this.emitBattleStep(battle);
       return;
     }
 
+    // Weather Ball: type and power follow the weather.
+    let effectiveMoveType = move.type;
+    let powerOverride: number | null = null;
+    if (spec.weatherBall && battle.weather) {
+      effectiveMoveType =
+        battle.weather.kind === "rain"
+          ? "WATER"
+          : battle.weather.kind === "sun"
+            ? "FIRE"
+            : battle.weather.kind === "hail"
+              ? "ICE"
+              : battle.weather.kind === "sandstorm"
+                ? "ROCK"
+                : move.type;
+      powerOverride = move.power * 2;
+    }
+
+    // Conditional power formulas (Brine, Gyro Ball, Flail, Magnitude...).
+    if (spec.powerModifier) {
+      const modified = computeModifiedPower(powerOverride ?? move.power, spec.powerModifier, {
+        userHp: attacker.hp,
+        userMaxHp: attacker.maxHp,
+        targetHp: defender.hp,
+        targetMaxHp: defender.maxHp,
+        userStatusId: attacker.status?.id ?? null,
+        targetStatusId: defender.status?.id ?? null,
+        userSpeed: this.getModifiedStat(attacker, "speed"),
+        targetSpeed: this.getModifiedStat(defender, "speed"),
+        userPositiveStages: countPositiveStages(attacker.stages),
+        targetPositiveStages: countPositiveStages(defender.stages),
+        userLostHpThisTurn: attacker.volatile.damageTakenThisTurn.any > 0,
+        targetLostHpThisTurn: defender.volatile.damageTakenThisTurn.any > 0,
+        targetActedThisTurn: Boolean(target.hasActedThisTurn),
+        targetInvulnerable: defenderInvulnerable,
+        consecutiveUses,
+        movePpLeft: move.currentPp
+      });
+      powerOverride = modified.power;
+      if (modified.message) {
+        this.say(battle, modified.message);
+      }
+    }
+
     let totalDamage = 0;
     if (isDamaging) {
-      const effectiveness = this.getEffectiveness(move.type, defender.types);
+      const effectiveness = spec.struggleRecoil ? 1 : this.getEffectiveness(effectiveMoveType, defender.types);
       if (effectiveness === 0) {
         this.say(battle, `It doesn't affect ${defenderName}...`);
         await this.emitBattleStep(battle);
         return;
       }
 
-      const result = this.applyDamagePhase(battle, side, target, attacker, defender, move, spec, effectiveness);
+      const result = this.applyDamagePhase(
+        battle,
+        side,
+        target,
+        attacker,
+        defender,
+        move,
+        spec,
+        effectiveness,
+        effectiveMoveType,
+        powerOverride
+      );
       totalDamage = result.totalDamage;
 
       if (result.hits > 1) {
@@ -5069,6 +5520,119 @@ export default class BattleManager {
           `${attackerName} was damaged by the recoil!`
         );
       }
+
+      // Smelling Salts / Wake-Up Slap: the doubled hit cures the condition.
+      if (totalDamage > 0 && !isFainted(defender) && defender.status) {
+        if (
+          (spec.powerModifier === "double-if-target-paralyzed-cure" && defender.status.id === "paralysis") ||
+          (spec.powerModifier === "double-if-target-asleep-cure" && defender.status.id === "sleep")
+        ) {
+          this.pushEvent(
+            battle,
+            { kind: "status-cured", sideId: target.id, pokemonId: defender.id, status: defender.status.id },
+            `${defenderName} was cured of its ${STATUS_DISPLAY_NAMES[defender.status.id]} condition!`
+          );
+          defender.status = null;
+        }
+      }
+
+      // Struggle: recoil is a quarter of the user's own max HP.
+      if (spec.struggleRecoil && totalDamage > 0) {
+        const recoil = Math.max(1, Math.floor(attacker.maxHp / 4));
+        attacker.hp = Math.max(0, attacker.hp - recoil);
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: recoil,
+            hpAfter: attacker.hp,
+            maxHp: attacker.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "recoil"
+          },
+          `${attackerName} was damaged by the recoil!`
+        );
+      }
+
+      // Shadow End: user loses half its current HP after a successful hit.
+      if (spec.halveUserCurrentHpAfter && totalDamage > 0 && !isFainted(attacker)) {
+        const cost = Math.max(1, Math.round(attacker.hp / 2));
+        attacker.hp = Math.max(0, attacker.hp - cost);
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: cost,
+            hpAfter: attacker.hp,
+            maxHp: attacker.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "recoil"
+          },
+          `${attackerName} was hurt by the recoil!`
+        );
+      }
+
+      // Hyper Beam family recharge after a successful hit.
+      if (spec.rechargeNextTurn && totalDamage > 0) {
+        attacker.volatile.recharging = true;
+      }
+    }
+
+    // Shadow Half: every battler loses half of its current HP.
+    if (spec.halveAllBattlersHp) {
+      for (const anySide of battle.sides) {
+        const battler = getActivePokemon(anySide);
+        if (!battler || isFainted(battler)) {
+          continue;
+        }
+        const loss = Math.floor(battler.hp / 2);
+        if (loss <= 0) {
+          continue;
+        }
+        battler.hp -= loss;
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: anySide.id,
+            pokemonId: battler.id,
+            amount: loss,
+            hpAfter: battler.hp,
+            maxHp: battler.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "move"
+          },
+          `${getPokemonDisplayName(battler)}'s HP was halved!`
+        );
+      }
+      attacker.volatile.recharging = spec.rechargeNextTurn;
+    }
+
+    // Explosion / Self-Destruct / Final Gambit.
+    if (spec.userFaints && !isFainted(attacker)) {
+      attacker.hp = 0;
+      this.pushEvent(
+        battle,
+        {
+          kind: "damage",
+          sideId: side.id,
+          pokemonId: attacker.id,
+          amount: attacker.maxHp,
+          hpAfter: 0,
+          maxHp: attacker.maxHp,
+          effectiveness: 1,
+          critical: false,
+          source: "move"
+        },
+        `${attackerName} fainted from its own attack!`
+      );
     }
 
     const isPureStatusMove = !isDamaging;
@@ -5077,7 +5641,7 @@ export default class BattleManager {
       (isPureStatusMove || totalDamage > 0) && Math.random() * 100 < secondaryChance;
 
     if (applySecondary) {
-      this.applyMoveEffects(battle, side, target, attacker, defender, spec, isPureStatusMove);
+      this.applyMoveEffects(battle, side, target, attacker, defender, move, spec, isPureStatusMove);
     }
 
     if (isPureStatusMove && !spec.recognized) {
@@ -5095,7 +5659,9 @@ export default class BattleManager {
     defender: BattlePokemon,
     move: BattleMove,
     spec: MoveEffectSpec,
-    effectiveness: number
+    effectiveness: number,
+    effectiveMoveType?: string,
+    powerOverride?: number | null
   ) {
     let hits = 1;
     if (spec.multiHit) {
@@ -5117,22 +5683,67 @@ export default class BattleManager {
         }
         damage = defender.hp;
       } else if (spec.fixedDamage) {
-        damage =
-          spec.fixedDamage.kind === "amount"
-            ? spec.fixedDamage.amount
-            : spec.fixedDamage.kind === "user-level"
-              ? attacker.level
-              : Math.max(1, Math.floor(defender.hp / 2));
+        if (spec.fixedDamage.kind === "endeavor") {
+          if (defender.hp <= attacker.hp) {
+            this.say(battle, "But it failed!");
+            break;
+          }
+          damage = defender.hp - attacker.hp;
+        } else {
+          damage =
+            spec.fixedDamage.kind === "amount"
+              ? spec.fixedDamage.amount
+              : spec.fixedDamage.kind === "user-level"
+                ? attacker.level
+                : spec.fixedDamage.kind === "user-hp"
+                  ? Math.max(1, attacker.hp)
+                  : spec.fixedDamage.kind === "psywave"
+                    ? Math.max(1, Math.floor(attacker.level * (0.5 + Math.random())))
+                    : Math.max(1, Math.floor(defender.hp / 2));
+        }
       } else {
-        critical = this.rollCritical(move, spec);
-        damage = this.calculateDamage(attacker, defender, move, effectiveness, critical);
+        critical = this.rollCritical(move, spec, attacker);
+        // Triple Kick ramps: hit 1 = x1, hit 2 = x2, hit 3 = x3.
+        const hitPower = (powerOverride ?? move.power) * (spec.multiHitPowersUp ? hit + 1 : 1);
+        damage = this.calculateDamage(
+          battle,
+          attacker,
+          defender,
+          target,
+          move,
+          spec,
+          effectiveness,
+          critical,
+          effectiveMoveType ?? move.type,
+          hitPower
+        );
       }
 
       damage = Math.max(1, Math.floor(damage));
+
+      // False Swipe never KOs; Endure keeps the battler at 1 HP.
+      let enduredHit = false;
+      if (damage >= defender.hp) {
+        if (spec.neverFaintTarget) {
+          damage = Math.max(0, defender.hp - 1);
+        } else if (defender.volatile.endure) {
+          damage = Math.max(0, defender.hp - 1);
+          enduredHit = true;
+        }
+      }
+
       defender.hp = Math.max(0, defender.hp - damage);
       totalDamage += damage;
       landedHits += 1;
       anyCritical = anyCritical || critical;
+
+      const taken = defender.volatile.damageTakenThisTurn;
+      taken.any += damage;
+      if (move.damageClass === "physical") {
+        taken.physical += damage;
+      } else if (move.damageClass === "special") {
+        taken.special += damage;
+      }
 
       this.pushEvent(
         battle,
@@ -5149,9 +5760,52 @@ export default class BattleManager {
         },
         `${getPokemonDisplayName(defender)} took ${damage} damage.`
       );
+
+      if (enduredHit) {
+        this.say(battle, `${getPokemonDisplayName(defender)} endured the hit!`);
+      }
     }
 
     return { totalDamage, hits: landedHits, anyCritical };
+  }
+
+  /** Applies flat damage (Counter family) with the endure/never-faint clamps. */
+  private applyDirectDamage(
+    battle: BattleSession,
+    targetSide: BattleSide,
+    defender: BattlePokemon,
+    amount: number,
+    spec: MoveEffectSpec
+  ) {
+    let damage = Math.max(1, Math.floor(amount));
+    let enduredHit = false;
+    if (damage >= defender.hp && (spec.neverFaintTarget || defender.volatile.endure)) {
+      damage = Math.max(0, defender.hp - 1);
+      enduredHit = defender.volatile.endure && !spec.neverFaintTarget;
+    }
+
+    defender.hp = Math.max(0, defender.hp - damage);
+    defender.volatile.damageTakenThisTurn.any += damage;
+
+    this.pushEvent(
+      battle,
+      {
+        kind: "damage",
+        sideId: targetSide.id,
+        pokemonId: defender.id,
+        amount: damage,
+        hpAfter: defender.hp,
+        maxHp: defender.maxHp,
+        effectiveness: 1,
+        critical: false,
+        source: "move"
+      },
+      `${getPokemonDisplayName(defender)} took ${damage} damage.`
+    );
+
+    if (enduredHit) {
+      this.say(battle, `${getPokemonDisplayName(defender)} endured the hit!`);
+    }
   }
 
   private applyMoveEffects(
@@ -5160,6 +5814,7 @@ export default class BattleManager {
     target: BattleSide,
     attacker: BattlePokemon,
     defender: BattlePokemon,
+    move: BattleMove,
     spec: MoveEffectSpec,
     isPureStatusMove: boolean
   ) {
@@ -5244,6 +5899,266 @@ export default class BattleManager {
       attacker.stages = createEmptyStages();
       defender.stages = createEmptyStages();
       this.say(battle, "All stat changes were eliminated!");
+    }
+
+    const attackerName = getPokemonDisplayName(attacker);
+    const defenderName = getPokemonDisplayName(defender);
+
+    // Bind / Wrap / Fire Spin: 4-5 end-of-turn chip ticks, blocks escape.
+    // Original sets MultiTurn = 5+rand(2); the tick before reaching 0 is the
+    // "freed" turn, so the target takes 4-5 damage ticks.
+    if (spec.bindTarget && !isFainted(defender) && !defender.volatile.binding) {
+      defender.volatile.binding = {
+        turnsLeft: 5 + Math.floor(Math.random() * 2),
+        moveName: move.name,
+        byPokemonId: attacker.id
+      };
+      this.say(battle, `${defenderName} was trapped by ${move.name}!`);
+    }
+
+    if (spec.trapTarget && !isFainted(defender)) {
+      if (defender.volatile.trappedByPokemonId) {
+        if (!viaSecondary) {
+          this.say(battle, "But it failed!");
+        }
+      } else {
+        defender.volatile.trappedByPokemonId = attacker.id;
+        this.say(battle, `${defenderName} can no longer escape!`);
+      }
+    }
+
+    if (spec.leechSeedTarget && !isFainted(defender)) {
+      const defenderTypes = defender.types.map((type) => type.trim().toUpperCase());
+      if (defenderTypes.includes("GRASS")) {
+        this.say(battle, `It doesn't affect ${defenderName}...`);
+      } else if (defender.volatile.seededBySideId) {
+        this.say(battle, `${defenderName} is already seeded!`);
+      } else {
+        defender.volatile.seededBySideId = side.id;
+        this.say(battle, `${defenderName} was seeded!`);
+      }
+    }
+
+    // Reflect Type (Clonatipo): the user copies the target's types.
+    if (spec.copyTargetTypes) {
+      const sameTypes =
+        attacker.types.length === defender.types.length &&
+        attacker.types.every((type) =>
+          defender.types.some((other) => isSameType(this.typeChart, type, other))
+        );
+      if (sameTypes) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.types = [...defender.types];
+        this.say(battle, `${attackerName} became the same type as ${defenderName}!`);
+      }
+    }
+
+    // Conversion: the user takes the type of one of its own moves.
+    if (spec.userTypesToMoveType) {
+      const candidates = attacker.moves
+        .map((known) => known.type)
+        .filter((type) => type && !attacker.types.some((own) => isSameType(this.typeChart, own, type)));
+      if (candidates.length === 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        const chosen = candidates[Math.floor(Math.random() * candidates.length)];
+        attacker.types = [chosen];
+        this.say(battle, `${attackerName} transformed into the ${chosen} type!`);
+      }
+    }
+
+    if (spec.setTargetTypesToWater && !isFainted(defender)) {
+      defender.types = ["WATER"];
+      this.say(battle, `${defenderName} became the WATER type!`);
+    }
+
+    if (spec.addTypeToTarget && !isFainted(defender)) {
+      const already = defender.types.some((type) => isSameType(this.typeChart, type, spec.addTypeToTarget!));
+      if (already) {
+        this.say(battle, "But it failed!");
+      } else {
+        defender.types = [...defender.types, spec.addTypeToTarget];
+        this.say(battle, `${spec.addTypeToTarget} type was added to ${defenderName}!`);
+      }
+    }
+
+    if (spec.aquaRing) {
+      if (attacker.volatile.aquaRing) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.volatile.aquaRing = true;
+        this.say(battle, `${attackerName} surrounded itself with a veil of water!`);
+      }
+    }
+
+    if (spec.ingrain) {
+      if (attacker.volatile.ingrain) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.volatile.ingrain = true;
+        this.say(battle, `${attackerName} planted its roots!`);
+      }
+    }
+
+    if (spec.nightmareTarget && !isFainted(defender)) {
+      if (defender.status?.id === "sleep" && !defender.volatile.nightmare) {
+        defender.volatile.nightmare = true;
+        this.say(battle, `${defenderName} began having a nightmare!`);
+      } else if (isPureStatusMove) {
+        this.say(battle, "But it failed!");
+      }
+    }
+
+    if (spec.startWeather) {
+      if (battle.weather?.kind === spec.startWeather) {
+        this.say(battle, "But it failed!");
+      } else {
+        battle.weather = { kind: spec.startWeather, turns: 5 };
+        const weatherText: Record<NonNullable<BattleSession["weather"]>["kind"], string> = {
+          sun: "The sunlight turned harsh!",
+          rain: "It started to rain!",
+          sandstorm: "A sandstorm kicked up!",
+          hail: "It started to hail!",
+          shadowsky: "A shadow sky descended!"
+        };
+        this.say(battle, weatherText[spec.startWeather]);
+      }
+    }
+
+    if (spec.healUserByWeather) {
+      const fraction =
+        battle.weather?.kind === "sun" ? 2 / 3 : battle.weather ? 0.25 : 0.5;
+      if (attacker.hp >= attacker.maxHp) {
+        this.say(battle, `${attackerName}'s HP is already full!`);
+      } else {
+        const healed = Math.max(1, Math.floor(attacker.maxHp * fraction));
+        attacker.hp = Math.min(attacker.maxHp, attacker.hp + healed);
+        this.pushEvent(
+          battle,
+          {
+            kind: "heal",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: healed,
+            hpAfter: attacker.hp,
+            maxHp: attacker.maxHp,
+            source: "move"
+          },
+          `${attackerName} regained health!`
+        );
+      }
+    }
+
+    if (spec.startScreen) {
+      const screens = (side.screens ??= { reflect: 0, lightScreen: 0 });
+      const key = spec.startScreen === "reflect" ? "reflect" : "lightScreen";
+      if (screens[key] > 0) {
+        this.say(battle, "But it failed!");
+      } else {
+        screens[key] = 5;
+        this.say(
+          battle,
+          spec.startScreen === "reflect"
+            ? `Reflect raised ${side.trainerName}'s side's physical defense!`
+            : `Light Screen raised ${side.trainerName}'s side's special defense!`
+        );
+      }
+    }
+
+    if (spec.removeTargetScreens) {
+      const screens = target.screens;
+      if (screens && (screens.reflect > 0 || screens.lightScreen > 0)) {
+        screens.reflect = 0;
+        screens.lightScreen = 0;
+        this.say(battle, "The wall shattered!");
+      }
+    }
+
+    if (spec.removeAllScreens) {
+      let shattered = false;
+      for (const anySide of battle.sides) {
+        if (anySide.screens && (anySide.screens.reflect > 0 || anySide.screens.lightScreen > 0)) {
+          anySide.screens.reflect = 0;
+          anySide.screens.lightScreen = 0;
+          shattered = true;
+        }
+      }
+      this.say(battle, shattered ? "Every wall shattered!" : "But it failed!");
+    }
+
+    if (spec.bellyDrum) {
+      const cost = Math.floor(attacker.maxHp / 2);
+      if (attacker.hp <= cost || attacker.stages.attack >= 6) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.hp -= cost;
+        attacker.stages.attack = 6;
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: side.id,
+            pokemonId: attacker.id,
+            amount: cost,
+            hpAfter: attacker.hp,
+            maxHp: attacker.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "move"
+          },
+          `${attackerName} cut its own HP and maximized its Attack!`
+        );
+      }
+    }
+
+    if (spec.focusEnergy) {
+      if (attacker.volatile.focusEnergy) {
+        this.say(battle, "But it failed!");
+      } else {
+        attacker.volatile.focusEnergy = true;
+        this.say(battle, `${attackerName} is getting pumped!`);
+      }
+    }
+
+    if (spec.endureUser) {
+      attacker.volatile.endure = true;
+      this.say(battle, `${attackerName} braced itself!`);
+    }
+
+    if (spec.doesNothing) {
+      this.say(battle, "But nothing happened!");
+    }
+
+    if (spec.painSplit && !isFainted(defender)) {
+      const average = Math.max(1, Math.floor((attacker.hp + defender.hp) / 2));
+      for (const [battlerSide, battler] of [
+        [side, attacker],
+        [target, defender]
+      ] as Array<[BattleSide, BattlePokemon]>) {
+        const before = battler.hp;
+        battler.hp = Math.min(battler.maxHp, average);
+        if (battler.hp === before) {
+          continue;
+        }
+        const eventBase = {
+          sideId: battlerSide.id,
+          pokemonId: battler.id,
+          amount: Math.abs(battler.hp - before),
+          hpAfter: battler.hp,
+          maxHp: battler.maxHp
+        };
+        if (battler.hp > before) {
+          this.pushEvent(battle, { kind: "heal", ...eventBase, source: "move" }, null);
+        } else {
+          this.pushEvent(
+            battle,
+            { kind: "damage", ...eventBase, effectiveness: 1, critical: false, source: "move" },
+            null
+          );
+        }
+      }
+      this.say(battle, "The battlers shared their pain!");
     }
   }
 
@@ -5358,14 +6273,16 @@ export default class BattleManager {
     return Math.random() * 100 < chance;
   }
 
-  private rollCritical(move: BattleMove, spec: MoveEffectSpec): boolean {
+  private rollCritical(move: BattleMove, spec: MoveEffectSpec, attacker?: BattlePokemon): boolean {
     if (spec.alwaysCrit) {
       return true;
     }
 
     const flags = (move.flags ?? []).map((flag) => flag.toLowerCase());
     const highCritRate = flags.includes("h") || flags.includes("highcriticalhitrate");
-    return Math.random() < (highCritRate ? 1 / 8 : 1 / 16);
+    const focused = attacker?.volatile.focusEnergy ?? false;
+    const chance = focused ? (highCritRate ? 1 / 2 : 1 / 4) : highCritRate ? 1 / 8 : 1 / 16;
+    return Math.random() < chance;
   }
 
   private getEffectiveness(moveType: string, defenderTypes: string[]) {
@@ -5383,27 +6300,66 @@ export default class BattleManager {
   }
 
   private calculateDamage(
+    battle: BattleSession,
     attacker: BattlePokemon,
     defender: BattlePokemon,
+    defenderSide: BattleSide,
     move: BattleMove,
+    spec: MoveEffectSpec,
     effectiveness: number,
-    critical: boolean
+    critical: boolean,
+    effectiveMoveType?: string,
+    powerOverride?: number
   ) {
+    const moveType = effectiveMoveType ?? move.type;
+    const power = Math.max(1, powerOverride ?? move.power);
+
+    // Foul Play swings with the TARGET's Attack.
+    const attackSource = spec.foulPlay ? defender : attacker;
     const attackStat =
-      move.damageClass === "physical"
-        ? this.getModifiedStat(attacker, "attack")
+      move.damageClass === "physical" || spec.foulPlay
+        ? this.getModifiedStat(attackSource, "attack")
         : this.getModifiedStat(attacker, "specialAttack");
-    const defenseStat =
-      move.damageClass === "physical"
-        ? this.getModifiedStat(defender, "defense")
-        : this.getModifiedStat(defender, "specialDefense");
+    // Psyshock hits the physical Defense with a special move; Chip Away
+    // ignores the target's defensive stat stages.
+    const defenseStatKey: "defense" | "specialDefense" =
+      move.damageClass === "physical" || spec.psyshock ? "defense" : "specialDefense";
+    const defenseStat = spec.ignoreDefensiveStages
+      ? Math.max(1, defender.stats[defenseStatKey])
+      : this.getModifiedStat(defender, defenseStatKey);
+
     const baseDamage = Math.floor(
-      Math.floor((Math.floor((2 * attacker.level) / 5 + 2) * move.power * attackStat) / Math.max(1, defenseStat)) / 50
+      Math.floor((Math.floor((2 * attacker.level) / 5 + 2) * power * attackStat) / Math.max(1, defenseStat)) / 50
     ) + 2;
-    const stab = attacker.types.some((type) => isSameType(this.typeChart, type, move.type)) ? 1.5 : 1;
+    const stab =
+      !spec.struggleRecoil && attacker.types.some((type) => isSameType(this.typeChart, type, moveType))
+        ? 1.5
+        : 1;
     const criticalMultiplier = critical ? 1.5 : 1;
     const randomFactor = 0.85 + Math.random() * 0.15;
-    const modifier = stab * effectiveness * criticalMultiplier * randomFactor;
+
+    // Weather: sun boosts Fire and dampens Water; rain does the reverse.
+    let weatherMultiplier = 1;
+    const weather = battle.weather?.kind ?? null;
+    const upperType = moveType.trim().toUpperCase();
+    if (weather === "sun") {
+      weatherMultiplier = upperType === "FIRE" ? 1.5 : upperType === "WATER" ? 0.5 : 1;
+    } else if (weather === "rain") {
+      weatherMultiplier = upperType === "WATER" ? 1.5 : upperType === "FIRE" ? 0.5 : 1;
+    }
+
+    // Reflect / Light Screen halve the matching damage class (crits pierce).
+    const screens = defenderSide.screens;
+    const screenMultiplier =
+      !critical &&
+      screens &&
+      ((move.damageClass === "physical" && screens.reflect > 0) ||
+        (move.damageClass === "special" && screens.lightScreen > 0))
+        ? 0.5
+        : 1;
+
+    const modifier =
+      stab * effectiveness * criticalMultiplier * randomFactor * weatherMultiplier * screenMultiplier;
 
     if (effectiveness === 0) {
       return 0;
@@ -5471,7 +6427,7 @@ export default class BattleManager {
       return true;
     }
 
-    if (chosenId && this.switchPokemon(side, chosenId)) {
+    if (chosenId && this.switchPokemon(battle, side, chosenId)) {
       return true;
     }
 

@@ -3,6 +3,8 @@
 // and the Pokemon Essentials v21.1 reference moves.txt (616 shared moves).
 export const LEGACY_FUNCTION_CODE_MAP: Record<string, string> = {
   "001": "DoesNothingUnusableInGravity",
+  // Struggle (Combate) — typeless hit with 1/4-max-HP recoil.
+  "002": "Struggle",
   "003": "SleepTarget",
   "004": "SleepTargetNextTurn",
   "005": "PoisonTarget",
@@ -122,6 +124,8 @@ export const LEGACY_FUNCTION_CODE_MAP: Record<string, string> = {
   "079": "DoublePowerAfterFusionFlare",
   "07A": "DoublePowerAfterFusionBolt",
   "07B": "DoublePowerIfTargetPoisoned",
+  // Smelling Salts (Estímulo): double power vs paralysis, then cures it.
+  "07C": "DoublePowerIfTargetParalyzedCureTarget",
   "07D": "DoublePowerIfTargetAsleepCureTarget",
   "07E": "DoublePowerIfUserPoisonedBurnedParalyzed",
   "07F": "DoublePowerIfTargetStatusProblem",
@@ -162,6 +166,8 @@ export const LEGACY_FUNCTION_CODE_MAP: Record<string, string> = {
   "0A2": "StartWeakenPhysicalDamageAgainstUserSide",
   "0A3": "StartWeakenSpecialDamageAgainstUserSide",
   "0A4": "EffectDependsOnEnvironment",
+  // Aerial Ace family (Golpe Aéreo, Esfera Aural...): pbAccuracyCheck -> true.
+  "0A5": "AlwaysHitsTarget",
   "0A6": "EnsureNextMoveAlwaysHits",
   "0A7": "StartNegateTargetEvasionStatStageAndGhostImmunity",
   "0A8": "StartNegateTargetEvasionStatStageAndDarkImmunity",
@@ -287,6 +293,22 @@ export const LEGACY_FUNCTION_CODE_MAP: Record<string, string> = {
   "123": "FailsUnlessTargetSharesTypeWithUser",
   "124": "StartSwapAllBattlersBaseDefensiveStats",
   "125": "FailsIfUserHasUnusedMove",
+  // Venova shadow ("oscuro") moves, defined in the game's Shadow Pokemon
+  // script (classes 126-132). Hyper-mode side effects don't apply here; the
+  // battle-relevant behavior maps onto the standard effect families.
+  "126": "None",
+  "127": "ParalyzeTarget",
+  "128": "BurnTarget",
+  "129": "FreezeTarget",
+  "12A": "ConfuseTarget",
+  "12B": "LowerTargetDefense2",
+  "12C": "LowerTargetEvasion2",
+  "12D": "DoublePowerIfTargetUnderwater",
+  "12E": "HalveHPOfAllBattlersAndRecharge",
+  "12F": "TrapTargetInBattle",
+  "130": "RecoilHalfOfUserCurrentHP",
+  "131": "StartShadowSkyWeather",
+  "132": "RemoveAllScreens",
   "133": "ProtectUserFromDamagingMovesKingsShield",
   "134": "LowerTargetEvasion2",
   "135": "RaiseTargetSpDef1",
