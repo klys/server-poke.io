@@ -99,6 +99,18 @@ async function bootstrap() {
     "types",
     "battleInterface"
   ]);
+  // Heavy media catalogs (tilesets ~36MB, assets ~134MB) are art data, not
+  // secrets — the same graphics are already public on the asset-storage
+  // origin. They are served here instead of the websocket because emitting
+  // them through Socket.IO stalls the event loop and starves heartbeats for
+  // every connected player; the socket only ever announces version stubs and
+  // clients (including designers) download the state from this endpoint,
+  // where ETag/304 plus the browser HTTP cache absorb repeat loads.
+  const HEAVY_SECTION_KEYS = new Set([
+    "assets",
+    "tilesets",
+    "battleBackgrounds"
+  ]);
   const sectionHttpCache = new Map<string, { etag:string; body:string }>();
   const serveDesignerSection = async (
     sectionKey:string,
@@ -130,9 +142,13 @@ async function bootstrap() {
         sectionHttpCache.set(sectionKey, { etag, body: JSON.stringify(payload) });
       }
 
+      const body = sectionHttpCache.get(sectionKey)!.body;
       headers["Content-Type"] = "application/json";
+      // Explicit length (instead of chunked transfer) so the designer's
+      // download progress bar has a total to report against.
+      headers["Content-Length"] = String(Buffer.byteLength(body));
       response.writeHead(200, headers);
-      response.end(sectionHttpCache.get(sectionKey)!.body);
+      response.end(body);
     } catch (error) {
       console.error(`Unable to serve designer section ${sectionKey} over HTTP:`, error);
       response.writeHead(500);
@@ -200,7 +216,10 @@ async function bootstrap() {
     }
 
     const sectionMatch = request.url?.match(/^\/designer-sections\/([a-zA-Z]+)\.json$/);
-    if (sectionMatch && PUBLIC_SECTION_KEYS.has(sectionMatch[1])) {
+    if (
+      sectionMatch &&
+      (PUBLIC_SECTION_KEYS.has(sectionMatch[1]) || HEAVY_SECTION_KEYS.has(sectionMatch[1]))
+    ) {
       void serveDesignerSection(sectionMatch[1], request, response);
       return;
     }
@@ -224,8 +243,11 @@ async function bootstrap() {
       origin: CLIENT_ORIGIN,
       credentials: true
     },
-    // Baked map surface uploads (designer:mapAssets:update) exceed the 1MB default.
-    maxHttpBufferSize: 32 * 1024 * 1024,
+    // Baked map surface uploads (designer:mapAssets:update) exceed the 1MB
+    // default, and designer:section:update for the tilesets catalog currently
+    // ships the full ~36MB state — Socket.IO hard-disconnects any client whose
+    // packet exceeds this cap, so keep headroom above the largest saved blob.
+    maxHttpBufferSize: 64 * 1024 * 1024,
     // Heartbeat tuning: the defaults (20s timeout) drop connections whenever a
     // large designer upload or a burst of admin queries delays a pong, which
     // showed up as constant "ping timeout" disconnects in the admin panel.

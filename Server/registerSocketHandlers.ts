@@ -235,6 +235,18 @@ function getDesignerSectionRoom(sectionKey:DesignerSectionKey) {
   return `designer:section:${sectionKey}`;
 }
 
+// Media catalogs whose payloads run to tens of MB (tilesets alone is ~36MB of
+// inline base64 images). Emitting them through Socket.IO stalls the event loop
+// on the stringify/framing and queues enough traffic to starve heartbeats for
+// every connected player, so these sections NEVER travel the websocket — even
+// designers only ever receive version stubs and fetch the state over the
+// cacheable /designer-sections/<key>.json HTTP endpoint.
+const HEAVY_SECTION_KEYS = new Set<DesignerSectionKey>([
+  "assets",
+  "tilesets",
+  "battleBackgrounds"
+]);
+
 // Game clients (no designer access) subscribe here instead of the state room:
 // designer saves push them a tiny version stub and they refresh the section
 // over the cacheable /designer-sections/<key>.json HTTP endpoint, so full
@@ -873,8 +885,8 @@ function createConnectionHandler(
 
       // Designers join the state room (live full-state broadcasts keep their
       // tooling in sync); game clients join the versions room and pull state
-      // over HTTP instead.
-      if (hasDesignerAccess(socket)) {
+      // over HTTP instead. Heavy sections are versions-room-only for everyone.
+      if (hasDesignerAccess(socket) && !HEAVY_SECTION_KEYS.has(sectionKey)) {
         socket.join(getDesignerSectionRoom(sectionKey));
       } else {
         socket.join(getDesignerSectionVersionsRoom(sectionKey));
@@ -890,7 +902,8 @@ function createConnectionHandler(
 
         // Game clients never receive the full catalog over the socket — they
         // refresh via the cacheable /designer-sections/<key>.json endpoint.
-        if (!hasDesignerAccess(socket)) {
+        // Heavy sections take that HTTP path for designers too.
+        if (!hasDesignerAccess(socket) || HEAVY_SECTION_KEYS.has(sectionKey)) {
           emitDesignerSectionVersion(socket, payload, sectionKey);
           return;
         }
@@ -941,7 +954,10 @@ function createConnectionHandler(
 
       const sectionKey = data.sectionKey;
       const room = getDesignerSectionRoom(sectionKey);
-      socket.join(room);
+
+      if (!HEAVY_SECTION_KEYS.has(sectionKey)) {
+        socket.join(room);
+      }
 
       try {
         const payload = await designerSectionStore.save(
@@ -951,8 +967,14 @@ function createConnectionHandler(
           socket.data.username ?? null
         );
 
-        socket.emit("designer:section:state", payload);
-        socket.broadcast.to(room).emit("designer:section:state", payload);
+        // Heavy sections never travel the socket: the saver and every
+        // subscriber get a version stub and refetch over HTTP.
+        if (HEAVY_SECTION_KEYS.has(sectionKey)) {
+          emitDesignerSectionVersion(socket, payload, sectionKey);
+        } else {
+          socket.emit("designer:section:state", payload);
+          socket.broadcast.to(room).emit("designer:section:state", payload);
+        }
         // Game clients get a version stub and refetch over HTTP.
         io.to(getDesignerSectionVersionsRoom(sectionKey)).emit("designer:section:version", {
           sectionKey,

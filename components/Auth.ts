@@ -3212,9 +3212,20 @@ export default class Auth {
         if (typeof boxId === "string" && boxId.length > 0) {
             target = boxes.find((box) => box.id === boxId);
             if (!target) {
-                return { ok: false, message: "That storage box does not exist." };
-            }
-            if (target.pokemon.length >= target.capacity) {
+                // The client can page into one not-yet-created box (`box-<n+1>`)
+                // and deposit there; materialize it so storage stays endless.
+                if (boxId === `box-${boxes.length + 1}`) {
+                    target = {
+                        id: boxId,
+                        name: `Box ${boxes.length + 1}`,
+                        capacity: POKEMON_BOX_CAPACITY,
+                        pokemon: []
+                    };
+                    boxes.push(target);
+                } else {
+                    return { ok: false, message: "That storage box does not exist." };
+                }
+            } else if (target.pokemon.length >= target.capacity) {
                 return { ok: false, message: `${target.name} is full.` };
             }
         } else {
