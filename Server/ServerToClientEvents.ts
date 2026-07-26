@@ -3,8 +3,14 @@ import type {
   AdminUserDetails,
   AdminUserListPayload,
   PokemonSummary,
-  RoleDefinitionWithCount
+  RoleDefinitionWithCount,
+  SocialUserSummary
 } from "../components/Auth";
+import type {
+  ChatMessagePayload,
+  FriendsStatePayload,
+  PrivateChatStatePayload
+} from "../components/SocialManager";
 import type {
   BattlePublicState
 } from "../components/BattleManager";
@@ -176,6 +182,8 @@ interface AuthUserData {
 /** Public trainer card for another player (never carries money/email). */
 interface TrainerCardData {
   playerId: string;
+  /** Account id when the trainer is logged in — used for friend actions. */
+  userId: number | null;
   name: string;
   username: string;
   description: string;
@@ -392,6 +400,63 @@ export default interface ServerToClientEvents {
     fetchedAt: string;
   }) => void;
   "moderation:error": (data: { message: string }) => void;
+
+  /** Full friends snapshot: list (with presence), pending requests, prefs. */
+  "friends:state": (data: FriendsStatePayload) => void;
+  "friends:error": (data: { message: string }) => void;
+  /** Presence tick about one friend (connect/disconnect/map change). */
+  "friends:presence": (data: {
+    userId: number;
+    online: boolean;
+    mapId?: string;
+    playerId?: string;
+  }) => void;
+  /** Someone sent you a friend request — feeds the notification center. */
+  "friends:request-received": (data: { from: SocialUserSummary }) => void;
+  /** A request you sent was accepted. */
+  "friends:request-accepted": (data: { by: SocialUserSummary }) => void;
+  /** A friend removed you from their list. */
+  "friends:removed": (data: { userId: number }) => void;
+  /** A friend wants to teleport to you — approve/decline via notification. */
+  "friends:teleport-request": (data: { requestId: string; from: SocialUserSummary }) => void;
+  /** Outcome of your teleport request (accepted/declined/expired). */
+  "friends:teleport-response": (data: {
+    requestId: string;
+    accepted: boolean;
+    byUsername: string;
+    expired: boolean;
+  }) => void;
+
+  /** Map / whisper / global / system chat traffic for the chat bar. */
+  "chat:message": (data: ChatMessagePayload) => void;
+  "chat:error": (data: { message: string }) => void;
+  /** You were invited to a private chat — accept/decline via notification. */
+  "chat:invite-received": (data: {
+    inviteId: string;
+    chatId: string;
+    from: SocialUserSummary;
+    memberCount: number;
+  }) => void;
+  /** Outcome of an invitation you sent (declined/expired => accepted:false). */
+  "chat:invite-response": (data: {
+    inviteId: string;
+    chatId: string;
+    accepted: boolean;
+    byUsername: string;
+  }) => void;
+  /** Membership snapshot of a private chat you belong to. */
+  "chat:private-state": (data: PrivateChatStatePayload) => void;
+  "chat:private-message": (data: {
+    chatId: string;
+    id: string;
+    fromUserId: number;
+    fromUsername: string;
+    fromName: string;
+    text: string;
+    at: string;
+  }) => void;
+  /** You left (or the chat was disposed) — close its window. */
+  "chat:private-closed": (data: { chatId: string }) => void;
 
   // Dynamic events using template literal types
   [event: `move${string}`]: (data: {

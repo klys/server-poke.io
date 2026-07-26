@@ -1,6 +1,7 @@
 import type {
   AdminUserUpdateInput,
   RolePermission,
+  SocialPrefs,
   UserRoleKey
 } from "../components/Auth";
 import type {
@@ -336,4 +337,52 @@ export default interface ClientToServerEvents {
   }) => void;
   "admin:apikeys:revoke": (data: { id: number }) => void;
   "moderation:maps:list": () => void;
+
+  /** Requests a fresh friends:state snapshot (list + pending requests + prefs). */
+  "friends:list": () => void;
+
+  /** Sends (or auto-accepts a mutual) friend request by exact username. */
+  "friends:request": (data: { username: string }) => void;
+
+  /** Accepts/declines a pending incoming friend request from `userId`. */
+  "friends:respond": (data: { userId: number; accepted: boolean }) => void;
+
+  /** Cancels a friend request previously sent to `userId`. */
+  "friends:cancel-request": (data: { userId: number }) => void;
+
+  /** Removes an existing friend (both directions). */
+  "friends:remove": (data: { userId: number }) => void;
+
+  /** Updates the social config toggles shown in the Friends window. */
+  "friends:set-prefs": (data: Partial<SocialPrefs>) => void;
+
+  /** Asks a friend for permission to teleport to their current location. */
+  "friends:teleport-request": (data: { userId: number }) => void;
+
+  /** Answers a pending teleport request received via friends:teleport-request. */
+  "friends:teleport-respond": (data: { requestId: string; accepted: boolean }) => void;
+
+  /**
+   * Sends a message to the sender's current map. Messages starting with "/"
+   * are commands resolved server-side:
+   * - `/w <user_name> <message>` whispers an online player
+   * - `/global <message>` broadcasts to everyone (moderator/admin only)
+   * - `/help` or `/ayuda` returns the player to their last Venomon Center
+   */
+  "chat:map-message": (data: { text: string }) => void;
+
+  /** Opens a private chat and invites the given users (they must accept). */
+  "chat:private-create": (data: { userIds: number[] }) => void;
+
+  /** Invites one more user into an existing private chat. */
+  "chat:private-invite": (data: { chatId: string; userId: number }) => void;
+
+  /** Accepts/declines a chat invitation received via chat:invite-received. */
+  "chat:invite-respond": (data: { inviteId: string; accepted: boolean }) => void;
+
+  /** Sends a message to a private chat the sender belongs to. */
+  "chat:private-message": (data: { chatId: string; text: string }) => void;
+
+  /** Leaves a private chat (empty chats are disposed). */
+  "chat:private-leave": (data: { chatId: string }) => void;
 }

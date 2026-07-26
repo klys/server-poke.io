@@ -22,6 +22,7 @@ import {
   resolveInitialSpawnFromPlayableMapsState,
   resolvePlayableMapPortalDestination,
 } from "../components/PlayableMapsState";
+import SocialManager from "../components/SocialManager";
 import World from "../components/world";
 import PokecraftApiClient, {
   PokecraftApiError,
@@ -468,6 +469,7 @@ function createConnectionHandler(
   playableMapsStore:PlayableMapsStore,
   battleManager:BattleManager,
   eventRuntime:EventRuntime,
+  socialManager:SocialManager,
   mapAssetStore?:MapAssetStore,
   pokecraftApi?:PokecraftApiClient
 ) {
@@ -1953,6 +1955,8 @@ function createConnectionHandler(
           void eventRuntime.resumeEventsOnJoin(socket.data.userId);
           // A newly-authenticated player changed the online population.
           broadcastAdminPresence(io, world);
+          // Push their friends snapshot and tell online friends they arrived.
+          void socialManager.handlePlayerJoined(socket.data.userId);
         }
       }
     });
@@ -2268,6 +2272,7 @@ function createConnectionHandler(
 
         socket.emit("trainer:card-data", {
           playerId: targetPlayerId,
+          userId: typeof player.userId === "number" ? player.userId : null,
           name: player.name,
           username: player.username,
           description: player.description,
@@ -2676,6 +2681,116 @@ function createConnectionHandler(
       socket.emit("auth:info", { message: result.message });
     });
 
+    // ---- Friends & chat (SocialManager) ----
+    // Every handler resolves the acting user from socket.data.userId; guests
+    // get a friendly error instead of silent drops.
+
+    const requireSocialUserId = (errorEvent: "friends:error" | "chat:error") => {
+      if (typeof socket.data.userId === "number") {
+        return socket.data.userId;
+      }
+      socket.emit(errorEvent, { message: "Log in to use this feature." });
+      return null;
+    };
+
+    socket.on("friends:list", async () => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.sendFriendsState(userId);
+    });
+
+    socket.on("friends:request", async (data) => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.requestFriend(userId, String(data?.username ?? ""));
+    });
+
+    socket.on("friends:respond", async (data) => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.respondToFriendRequest(
+        userId,
+        Number(data?.userId),
+        data?.accepted === true
+      );
+    });
+
+    socket.on("friends:cancel-request", async (data) => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.cancelFriendRequest(userId, Number(data?.userId));
+    });
+
+    socket.on("friends:remove", async (data) => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.removeFriend(userId, Number(data?.userId));
+    });
+
+    socket.on("friends:set-prefs", async (data) => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.updateSocialPrefs(userId, data ?? {});
+    });
+
+    socket.on("friends:teleport-request", async (data) => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.requestTeleport(userId, Number(data?.userId));
+    });
+
+    socket.on("friends:teleport-respond", async (data) => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.respondToTeleport(
+        userId,
+        String(data?.requestId ?? ""),
+        data?.accepted === true
+      );
+    });
+
+    socket.on("chat:map-message", async (data) => {
+      await socialManager.handleMapMessage(socket, String(data?.text ?? ""));
+    });
+
+    socket.on("chat:private-create", async (data) => {
+      const userId = requireSocialUserId("chat:error");
+      if (userId === null) return;
+      await socialManager.createPrivateChat(userId, Array.isArray(data?.userIds) ? data.userIds : []);
+    });
+
+    socket.on("chat:private-invite", async (data) => {
+      const userId = requireSocialUserId("chat:error");
+      if (userId === null) return;
+      await socialManager.inviteToPrivateChat(userId, String(data?.chatId ?? ""), Number(data?.userId));
+    });
+
+    socket.on("chat:invite-respond", async (data) => {
+      const userId = requireSocialUserId("chat:error");
+      if (userId === null) return;
+      await socialManager.respondToChatInvite(
+        userId,
+        String(data?.inviteId ?? ""),
+        data?.accepted === true
+      );
+    });
+
+    socket.on("chat:private-message", async (data) => {
+      const userId = requireSocialUserId("chat:error");
+      if (userId === null) return;
+      await socialManager.sendPrivateChatMessage(
+        userId,
+        String(data?.chatId ?? ""),
+        String(data?.text ?? "")
+      );
+    });
+
+    socket.on("chat:private-leave", async (data) => {
+      const userId = requireSocialUserId("chat:error");
+      if (userId === null) return;
+      await socialManager.leavePrivateChat(userId, String(data?.chatId ?? ""));
+    });
+
     socket.on("disconnect", async (reason) => {
       const player = world.getPlayerBySocket(socket.id);
       const shouldPersistLocation =
@@ -2715,6 +2830,13 @@ function createConnectionHandler(
       // A player leaving may drop them out of the online set — refresh admins.
       if (wasAuthenticated) {
         broadcastAdminPresence(io, world);
+        // Only the user's LAST tab going away counts as leaving for friends.
+        if (
+          typeof socket.data.userId === "number" &&
+          !world.getPlayerByUserId(socket.data.userId)
+        ) {
+          void socialManager.handlePlayerLeft(socket.data.userId);
+        }
       }
     });
   };
@@ -2733,6 +2855,7 @@ export default function registerSocketHandlers(
   const battleManager = new BattleManager(io, world, auth, designerSectionStore);
   world.setBattleManager(battleManager);
   const eventRuntime = new EventRuntime(io, world, auth);
+  const socialManager = new SocialManager(io, world, auth, battleManager, eventRuntime);
   // Event scripts can start real trainer battles (pbTrainerBattle).
   eventRuntime.setBattleManager(battleManager);
   // pbPokemonMart events open the regular store overlay; buy/sell requests
@@ -2782,6 +2905,8 @@ export default function registerSocketHandlers(
       .catch((error) => {
         console.error("Unable to save player location on transfer:", error);
       });
+    // Map transfers also feed friends presence (same-map action gating).
+    socialManager.handlePlayerMapChanged(player);
   });
   world.setEventTouchHandler((player, placementId) => {
     const userId = player.userId;
@@ -2796,5 +2921,5 @@ export default function registerSocketHandlers(
     touchCooldowns.set(userId, { placementId, at: now });
     void eventRuntime.startEvent(userId, placementId, { touch: true });
   });
-  io.on("connection", createConnectionHandler(io, world, auth, designerSectionStore, playableMapsStore, battleManager, eventRuntime, mapAssetStore, pokecraftApi));
+  io.on("connection", createConnectionHandler(io, world, auth, designerSectionStore, playableMapsStore, battleManager, eventRuntime, socialManager, mapAssetStore, pokecraftApi));
 }

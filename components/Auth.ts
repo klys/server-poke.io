@@ -70,6 +70,32 @@ export interface SavedPlayerLocation {
     y:number;
 }
 
+/** Minimal public projection of a user for friends/chat features. */
+export interface SocialUserSummary {
+    userId:number;
+    username:string;
+    name:string;
+    characterSkinId:string;
+}
+
+/** A pending friend request as stored on both sides (incoming/outgoing). */
+export interface FriendRequestRecord extends SocialUserSummary {
+    createdAt:string;
+}
+
+/** Per-user social configuration (Friends window config tab). */
+export interface SocialPrefs {
+    allowFriendRequests:boolean;
+    allowTeleportRequests:boolean;
+    allowChatInvites:boolean;
+}
+
+export const DEFAULT_SOCIAL_PREFS:SocialPrefs = {
+    allowFriendRequests: true,
+    allowTeleportRequests: true,
+    allowChatInvites: true
+};
+
 interface AuthSuccessResult {
     session: AuthSessionState & {
         authenticated:true;
@@ -1713,6 +1739,223 @@ export default class Auth {
             // Treat unreadable respawn data as unset.
         }
         return null;
+    }
+
+    // ---- Friends & social ----
+    // Friends are stored as a JSON array of user ids in the `friends` hash
+    // field; pending requests live on both sides (`friend_requests_in` on the
+    // receiver, `friend_requests_out` on the sender) so they survive logouts
+    // and both users can see them. Mutual approval turns a request into a
+    // symmetric friends-pair entry.
+
+    /** Reads the small public fields used by friends lists and chat. */
+    public async getSocialUserSummary(userId:number):Promise<SocialUserSummary | null> {
+        const [id, username, name, characterSkinId] = await this.redis.hmGet(
+            this.userKey(userId),
+            ["id", "username", "name", "character_skin_id"]
+        );
+        if (!id) {
+            return null;
+        }
+        return {
+            userId: Number(id),
+            username: username ?? "",
+            name: name ?? username ?? "",
+            characterSkinId: characterSkinId ?? ""
+        };
+    }
+
+    public async findSocialUserByUsername(username:string):Promise<SocialUserSummary | null> {
+        const normalized = String(username ?? "").trim().toLowerCase();
+        if (!normalized) {
+            return null;
+        }
+        const userId = await this.redis.get(this.usernameIndexKey(normalized));
+        if (!userId) {
+            return null;
+        }
+        return this.getSocialUserSummary(Number(userId));
+    }
+
+    public async getFriendIds(userId:number):Promise<number[]> {
+        const raw = await this.redis.hGet(this.userKey(userId), "friends");
+        return this.parseUserIdArray(raw);
+    }
+
+    public async areFriends(userIdA:number, userIdB:number):Promise<boolean> {
+        const friends = await this.getFriendIds(userIdA);
+        return friends.includes(userIdB);
+    }
+
+    /** Makes both users friends of each other (idempotent). */
+    public async addFriendPair(userIdA:number, userIdB:number) {
+        await Promise.all([
+            this.addToFriendList(userIdA, userIdB),
+            this.addToFriendList(userIdB, userIdA)
+        ]);
+    }
+
+    public async removeFriendPair(userIdA:number, userIdB:number) {
+        await Promise.all([
+            this.removeFromFriendList(userIdA, userIdB),
+            this.removeFromFriendList(userIdB, userIdA)
+        ]);
+    }
+
+    public async getIncomingFriendRequests(userId:number):Promise<FriendRequestRecord[]> {
+        return this.readFriendRequests(userId, "friend_requests_in");
+    }
+
+    public async getOutgoingFriendRequests(userId:number):Promise<FriendRequestRecord[]> {
+        return this.readFriendRequests(userId, "friend_requests_out");
+    }
+
+    /**
+     * Records a pending request on both sides. Returns false when an identical
+     * request is already pending (dedupe by sender id).
+     */
+    public async addFriendRequest(from:SocialUserSummary, to:SocialUserSummary):Promise<boolean> {
+        const createdAt = new Date().toISOString();
+        const incoming = await this.getIncomingFriendRequests(to.userId);
+        if (incoming.some((request) => request.userId === from.userId)) {
+            return false;
+        }
+        const outgoing = await this.getOutgoingFriendRequests(from.userId);
+        incoming.push({ ...from, createdAt });
+        outgoing.push({ ...to, createdAt });
+        await Promise.all([
+            this.writeFriendRequests(to.userId, "friend_requests_in", incoming),
+            this.writeFriendRequests(from.userId, "friend_requests_out", outgoing)
+        ]);
+        return true;
+    }
+
+    /** Clears a pending request (accept/decline/cancel) from both sides. */
+    public async removeFriendRequest(fromUserId:number, toUserId:number) {
+        const [incoming, outgoing] = await Promise.all([
+            this.getIncomingFriendRequests(toUserId),
+            this.getOutgoingFriendRequests(fromUserId)
+        ]);
+        await Promise.all([
+            this.writeFriendRequests(
+                toUserId,
+                "friend_requests_in",
+                incoming.filter((request) => request.userId !== fromUserId)
+            ),
+            this.writeFriendRequests(
+                fromUserId,
+                "friend_requests_out",
+                outgoing.filter((request) => request.userId !== toUserId)
+            )
+        ]);
+    }
+
+    public async getSocialPrefs(userId:number):Promise<SocialPrefs> {
+        const raw = await this.redis.hGet(this.userKey(userId), "social_prefs");
+        if (!raw) {
+            return { ...DEFAULT_SOCIAL_PREFS };
+        }
+        try {
+            const parsed = JSON.parse(raw);
+            return {
+                allowFriendRequests: parsed?.allowFriendRequests !== false,
+                allowTeleportRequests: parsed?.allowTeleportRequests !== false,
+                allowChatInvites: parsed?.allowChatInvites !== false
+            };
+        } catch {
+            return { ...DEFAULT_SOCIAL_PREFS };
+        }
+    }
+
+    public async setSocialPrefs(userId:number, updates:Partial<SocialPrefs>):Promise<SocialPrefs> {
+        const current = await this.getSocialPrefs(userId);
+        const next:SocialPrefs = {
+            allowFriendRequests:
+                typeof updates.allowFriendRequests === "boolean"
+                    ? updates.allowFriendRequests
+                    : current.allowFriendRequests,
+            allowTeleportRequests:
+                typeof updates.allowTeleportRequests === "boolean"
+                    ? updates.allowTeleportRequests
+                    : current.allowTeleportRequests,
+            allowChatInvites:
+                typeof updates.allowChatInvites === "boolean"
+                    ? updates.allowChatInvites
+                    : current.allowChatInvites
+        };
+        await this.redis.hSet(this.userKey(userId), { social_prefs: JSON.stringify(next) });
+        return next;
+    }
+
+    private async addToFriendList(userId:number, friendUserId:number) {
+        const friends = await this.getFriendIds(userId);
+        if (!friends.includes(friendUserId)) {
+            friends.push(friendUserId);
+            await this.redis.hSet(this.userKey(userId), { friends: JSON.stringify(friends) });
+        }
+    }
+
+    private async removeFromFriendList(userId:number, friendUserId:number) {
+        const friends = await this.getFriendIds(userId);
+        const next = friends.filter((id) => id !== friendUserId);
+        if (next.length !== friends.length) {
+            await this.redis.hSet(this.userKey(userId), { friends: JSON.stringify(next) });
+        }
+    }
+
+    private async readFriendRequests(
+        userId:number,
+        field:"friend_requests_in" | "friend_requests_out"
+    ):Promise<FriendRequestRecord[]> {
+        const raw = await this.redis.hGet(this.userKey(userId), field);
+        if (!raw) {
+            return [];
+        }
+        try {
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) {
+                return [];
+            }
+            return parsed
+                .filter((entry) => entry && Number.isFinite(Number(entry.userId)))
+                .map((entry) => ({
+                    userId: Number(entry.userId),
+                    username: String(entry.username ?? ""),
+                    name: String(entry.name ?? entry.username ?? ""),
+                    characterSkinId: String(entry.characterSkinId ?? ""),
+                    createdAt: String(entry.createdAt ?? "")
+                }));
+        } catch {
+            return [];
+        }
+    }
+
+    private async writeFriendRequests(
+        userId:number,
+        field:"friend_requests_in" | "friend_requests_out",
+        requests:FriendRequestRecord[]
+    ) {
+        // Cap the pending list so a spammed account's hash cannot grow unbounded.
+        await this.redis.hSet(this.userKey(userId), {
+            [field]: JSON.stringify(requests.slice(-50))
+        });
+    }
+
+    private parseUserIdArray(raw:string | null | undefined):number[] {
+        if (!raw) {
+            return [];
+        }
+        try {
+            const parsed = JSON.parse(raw);
+            if (!Array.isArray(parsed)) {
+                return [];
+            }
+            return parsed
+                .map((value) => Number(value))
+                .filter((value) => Number.isInteger(value) && value > 0);
+        } catch {
+            return [];
+        }
     }
 
     private async readPokemonProfileById(pokemonId:string) {
