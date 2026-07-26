@@ -155,6 +155,13 @@ export default class PlayableMapsStore {
       throw new Error("Playable maps state is invalid.");
     }
 
+    // The imported System script-switch table is server-side data the map
+    // designer never edits; carry it forward when a designer save omits it so
+    // page-condition evaluation doesn't silently lose its switch table.
+    if (!sanitizedState.essentialsSystem && existing?.state.essentialsSystem) {
+      sanitizedState.essentialsSystem = existing.state.essentialsSystem;
+    }
+
     const payload: PlayableMapsSyncPayload = {
       state: sanitizedState,
       version: (existing?.version ?? 0) + 1,

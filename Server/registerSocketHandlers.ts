@@ -188,6 +188,95 @@ function requireDesignerMapsAccess(socket:ServerSocket) {
   );
 }
 
+type ClientTeleportRequest = { mapId:string; x:number; y:number };
+
+function oppositeConnectionDirection(direction:"north" | "south" | "east" | "west") {
+  switch (direction) {
+    case "north": return "south" as const;
+    case "south": return "north" as const;
+    case "east": return "west" as const;
+    case "west": return "east" as const;
+  }
+}
+
+/**
+ * The only client-initiated teleports the server honors:
+ *
+ * 1. Same-map nudges (the boundary guard freeing itself from a bad spot).
+ * 2. Edge crossings between maps CONNECTED in the imported world, landing
+ *    inside the entry strip of the correct edge — so a "crossing" cannot be
+ *    forged into a jump past mid-route blockers or into unrelated maps.
+ * 3. Event-script portals the player is actually standing next to.
+ *
+ * Everything else (story doors, gated buildings, gyms) transfers exclusively
+ * through server-side event execution and designer portals.
+ */
+export function isAllowedClientTeleport(
+  world:World,
+  player:import("../components/player").default,
+  data:ClientTeleportRequest
+):boolean {
+  const snapshot = world.getPlayableMapsState();
+  if (!snapshot) {
+    return false;
+  }
+  if (
+    !snapshot.items.some((item) => item.id === data.mapId) &&
+    !snapshot.editorDataByMapId[data.mapId]
+  ) {
+    return false;
+  }
+
+  // 1) Same-map correction nudge.
+  if (data.mapId === player.currentMapId) {
+    return Math.hypot(data.x - player.x, data.y - player.y) <= 320;
+  }
+
+  // 2) Edge crossing along an imported map connection.
+  const configOf = (mapId:string) =>
+    snapshot.items.find((item) => item.id === mapId)?.playableMapConfig;
+  const fromConfig = configOf(player.currentMapId);
+  const toConfig = configOf(data.mapId);
+  const crossingDirections = [
+    ...(fromConfig?.connections ?? [])
+      .filter((connection) => connection.targetMapId === data.mapId)
+      .map((connection) => connection.direction),
+    ...(toConfig?.connections ?? [])
+      .filter((connection) => connection.targetMapId === player.currentMapId)
+      .map((connection) => oppositeConnectionDirection(connection.direction))
+  ];
+  if (crossingDirections.length > 0 && toConfig) {
+    const cellSize = toConfig.cellSize || 32;
+    const band = 3 * cellSize;
+    const width = (toConfig.width || 1) * cellSize;
+    const height = (toConfig.height || 1) * cellSize;
+    const validCrossing = crossingDirections.some((direction) => {
+      switch (direction) {
+        case "north": return data.y >= height - band - cellSize; // arrive at target's south edge
+        case "south": return data.y <= band;
+        case "east": return data.x <= band;
+        case "west": return data.x >= width - band - cellSize;
+        default: return false;
+      }
+    });
+    if (validCrossing) {
+      return true;
+    }
+    // Not a plausible edge arrival — fall through: an event-script portal on
+    // the current map may still legitimately target this connected map.
+  }
+
+  // 3) Standing next to an event-script portal on the current map.
+  const portals = snapshot.editorDataByMapId[player.currentMapId]?.portals ?? [];
+  const centerX = player.x + player.width / 2;
+  const centerY = player.y + player.height / 2;
+  return portals.some(
+    (portal) =>
+      portal.destinationType === "event-script" &&
+      Math.hypot(portal.x * 32 + 16 - centerX, portal.y * 32 + 16 - centerY) <= 96
+  );
+}
+
 function requireAdminAccess(socket:ServerSocket) {
   return requirePermission(
     socket,
@@ -2012,6 +2101,36 @@ function createConnectionHandler(
         typeof data?.y !== "number" ||
         !Number.isFinite(data.y)
       ) {
+        return;
+      }
+
+      // player:teleport is a client REQUEST (edge crossings, out-of-bounds
+      // self-correction, event-script portals) — not an entitlement. Without
+      // validation it is an arbitrary-teleport primitive that skips every
+      // story gate, so only the legitimate shapes are honored; anything else
+      // is answered with the authoritative current position.
+      const privileged =
+        socket.data.authenticated === true &&
+        (socket.data.permissions?.includes("admin.access") === true ||
+          socket.data.permissions?.includes("designer.access") === true);
+
+      if (!privileged && !isAllowedClientTeleport(world, player, data)) {
+        console.warn(
+          `Rejected player:teleport for user:${socket.data.userId ?? "?"} ` +
+            `${player.currentMapId}(${Math.round(player.x)},${Math.round(player.y)}) -> ` +
+            `${data.mapId}(${Math.round(data.x)},${Math.round(data.y)})`
+        );
+        // Snap the requesting client back to the server's truth (same
+        // dynamic move channel the relocation path uses).
+        world.emitToMap(player.currentMapId, "move" + player.socketId, {
+          x: player.x,
+          y: player.y,
+          angle: player.angle,
+          playerId: player.socketId,
+          id: player.id,
+          currentMapId: player.currentMapId,
+          teleported: true
+        });
         return;
       }
 

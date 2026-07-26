@@ -29,6 +29,12 @@ export type EventStatePayload = {
   switches: Record<string, boolean>;
   variables: Record<string, number>;
   selfSwitches: Record<string, boolean>;
+  /** Essentials session temp switches (tsOn?/setTempSwitchOn), keyed like
+   * self switches; reset server-side whenever the player changes map. */
+  tempSwitches?: Record<string, boolean>;
+  /** Server clock for script-switch page conditions (day/night, weekday), so
+   * the client's page-selection mirror agrees with the server. */
+  env?: { hour: number; weekday: number };
 };
 
 export type EventStepPayload =

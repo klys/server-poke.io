@@ -15,9 +15,13 @@ import type BattleManager from "./BattleManager";
 import GroundItemStore, { type GroundItem } from "./GroundItemStore";
 import {
     EMPTY_EVENT_PLAYER_STATE,
+    currentEventEnv,
     selectConditionMetPage,
-    type EssentialsEventRecord
+    type EssentialsEventRecord,
+    type EventPlayerState,
+    type PageSelectionOptions
 } from "./eventPageSelection";
+import { logUnsupportedScript } from "./essentialsScriptAdapters";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -590,7 +594,8 @@ export default class World {
             }
             const page = selectConditionMetPage(
                 blocker.essentials,
-                player.eventState ?? EMPTY_EVENT_PLAYER_STATE
+                this.eventStateFor(player),
+                this.pageSelectionOptions()
             );
             if (page && page.graphic?.characterName && !page.move?.through) {
                 return true;
@@ -598,6 +603,29 @@ export default class World {
         }
 
         return false;
+    }
+
+    /**
+     * Options for RMXP page selection: the imported System script-switch
+     * table ("s:" switches: day/night, temp switches...) plus the server
+     * clock. Shared by collision, touch detection and the event runtime so
+     * every layer agrees on which page an event shows for a player.
+     */
+    pageSelectionOptions(): PageSelectionOptions {
+        return {
+            scriptSwitches: this.playableMapsState?.essentialsSystem?.scriptSwitches,
+            env: currentEventEnv(),
+            onUnknownScriptSwitch: (switchId, expression) => {
+                logUnsupportedScript("condition", `s:${expression}`, `script switch ${switchId}`);
+            }
+        };
+    }
+
+    /** Player state for page selection, including session temp switches. */
+    private eventStateFor(player:Player): EventPlayerState {
+        return player.eventState
+            ? { ...player.eventState, tempSwitches: player.tempSwitches }
+            : { ...EMPTY_EVENT_PLAYER_STATE, tempSwitches: player.tempSwitches };
     }
 
     setEventTouchHandler(handler:(player:Player, placementId:string) => void) {
@@ -613,6 +641,29 @@ export default class World {
     }
 
     /**
+     * True when this portal was extracted from an imported Essentials event
+     * whose full page data is available as a placement on the same cell. Such
+     * portals must NOT blind-teleport: the source event decides (page
+     * conditions, dialogue, conditional branches) through the regular event
+     * flow, exactly like RPG Maker. Extracted portals without recovered event
+     * data keep the legacy blind behavior so un-repaired maps stay traversable.
+     */
+    private portalDeferredToEvent(mapId:string, portal:MapEditorPortalPlacement): boolean {
+        if (!portal.essentialsConnection) {
+            return false; // designer-authored portal: fires as configured
+        }
+        return this.getNpcBlockers(mapId).some(
+            (blocker) =>
+                blocker.essentials !== null &&
+                blocker.x === portal.x * 32 &&
+                blocker.y === portal.y * 32 &&
+                blocker.essentials.pages?.some((page) =>
+                    (page.commands ?? []).some((command) => command.code === 201)
+                )
+        );
+    }
+
+    /**
      * Designer portals are SERVER-triggered (the client only renders them).
      * `eventScript` portals stay client-side — their sandboxed script API
      * (messages, toasts) only exists in the browser.
@@ -625,6 +676,9 @@ export default class World {
 
         if (!portal) {
             return false;
+        }
+        if (this.portalDeferredToEvent(player.currentMapId, portal)) {
+            return false; // the essentials event on this cell owns the transfer
         }
         if (portal.destinationType !== "event-script" && this.portalHandler) {
             this.portalHandler(player, portal);
@@ -667,6 +721,9 @@ export default class World {
             if (overlapX <= 0 || overlapY <= 0 || Math.max(overlapX, overlapY) < 16) {
                 continue;
             }
+            if (this.portalDeferredToEvent(player.currentMapId, portal)) {
+                continue; // the event's own touch page decides (checked below)
+            }
             if (portal.destinationType !== "event-script" && this.portalHandler) {
                 this.portalHandler(player, portal);
             }
@@ -697,7 +754,8 @@ export default class World {
             }
             const page = selectConditionMetPage(
                 blocker.essentials,
-                player.eventState ?? EMPTY_EVENT_PLAYER_STATE
+                this.eventStateFor(player),
+                this.pageSelectionOptions()
             );
             if (page && (page.trigger === 1 || page.trigger === 2)) {
                 this.eventTouchHandler(player, blocker.id);
@@ -745,7 +803,8 @@ export default class World {
             }
             const page = selectConditionMetPage(
                 blocker.essentials,
-                player.eventState ?? EMPTY_EVENT_PLAYER_STATE
+                this.eventStateFor(player),
+                this.pageSelectionOptions()
             );
             if (
                 page &&

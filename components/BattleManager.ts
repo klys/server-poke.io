@@ -2726,6 +2726,33 @@ export default class BattleManager {
    * (:POTION / PBItems::POTION) or by a legacy numeric id read from an event
    * variable (apricorn trees do `pbItemBall(pbGet(1))`).
    */
+  /**
+   * Quantity of an Essentials-referenced item (`:OLDSEAMAP` / `PBItems::X`)
+   * in the player's bag. Key-item route gates ($PokemonBag.pbQuantity(...)>0
+   * conditions) resolve through this; an item the catalogs don't know counts
+   * as 0 so the gate fails closed instead of silently opening.
+   */
+  public async getEventItemQuantity(userId: number, symbol: string): Promise<number> {
+    await this.loadCatalogs();
+
+    const lowered = symbol.trim().toLowerCase();
+    if (!lowered) {
+      return 0;
+    }
+
+    const definition = this.cachedItemDefinitions.find(
+      (candidate) =>
+        candidate.essentialsId.toLowerCase() === lowered ||
+        candidate.id === `item-${lowered}`
+    );
+    if (!definition) {
+      return 0;
+    }
+
+    const user = await this.auth.getUserForBattle(userId);
+    return user?.inventory.find((item) => item.id === definition.id)?.quantity ?? 0;
+  }
+
   public async grantEventItem(
     userId: number,
     ref: { symbol?: string; legacyNumber?: number },

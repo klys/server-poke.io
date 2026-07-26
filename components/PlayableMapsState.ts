@@ -260,10 +260,24 @@ export type PlayableMapEditorData = {
   };
 };
 
+/**
+ * Imported System.rxdata data the runtime needs beyond per-map events:
+ * Essentials "script switches" (switch names starting with `s:`, evaluated as
+ * expressions during page selection) plus the plain switch/variable names for
+ * diagnostics and admin tooling.
+ */
+export type EssentialsSystemData = {
+  /** Switch id -> the expression after the `s:` prefix. */
+  scriptSwitches: Record<string, string>;
+  switchNames?: Record<string, string>;
+  variableNames?: Record<string, string>;
+};
+
 export type PlayableMapsStateSnapshot = {
   categories: string[];
   items: PlayableMapItem[];
   editorDataByMapId: Record<string, PlayableMapEditorData>;
+  essentialsSystem?: EssentialsSystemData;
 };
 
 export type PlayableMapDefinition = {
@@ -798,6 +812,33 @@ export function sanitizePlayableMapsStateSnapshot(value: unknown): PlayableMapsS
       accumulator[mapId] = sanitizePlayableMapEditorData(editorData);
       return accumulator;
     }, {}),
+    essentialsSystem: sanitizeEssentialsSystemData(candidate.essentialsSystem),
+  };
+}
+
+function sanitizeStringRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const entries = Object.entries(value as Record<string, unknown>).filter(
+    (entry): entry is [string, string] => typeof entry[1] === "string"
+  );
+  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
+}
+
+function sanitizeEssentialsSystemData(value: unknown): EssentialsSystemData | undefined {
+  if (!value || typeof value !== "object") {
+    return undefined;
+  }
+  const candidate = value as Partial<EssentialsSystemData>;
+  const scriptSwitches = sanitizeStringRecord(candidate.scriptSwitches);
+  if (!scriptSwitches) {
+    return undefined;
+  }
+  return {
+    scriptSwitches,
+    switchNames: sanitizeStringRecord(candidate.switchNames),
+    variableNames: sanitizeStringRecord(candidate.variableNames),
   };
 }
 

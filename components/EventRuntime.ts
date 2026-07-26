@@ -11,7 +11,53 @@ import {
   resolveInitialSpawnFromPlayableMapsState,
   sanitizeNpcStoreItems,
 } from "./PlayableMapsState";
-import { ERASED_SELF_SWITCH } from "./eventPageSelection";
+import {
+  ERASED_SELF_SWITCH,
+  currentEventEnv,
+  selectActiveEventPage as selectActiveEventPageShared,
+  type EssentialsEventRecord,
+  type EventPlayerState
+} from "./eventPageSelection";
+import {
+  RE_ADD_POKEMON,
+  RE_GENERATE_EGG,
+  RE_EGG_GENERATED,
+  RE_DAYCARE_GENERATE_EGG,
+  RE_PARTY_LENGTH,
+  RE_POKEMON_COUNT,
+  RE_RECEIVE_ITEM,
+  RE_ITEM_BALL,
+  RE_ITEM_BALL_VAR,
+  RE_STORE_ITEM,
+  RE_POKEDEX,
+  RE_AWARD_BADGE,
+  RE_RECEIVE_BADGE,
+  RE_NUMBADGES,
+  RE_HAS_BADGE,
+  RE_HEAL,
+  RE_CHANGE_PLAYER,
+  RE_WILD_BATTLE,
+  RE_TRAINER_NAME,
+  RE_TONE_CHANGE,
+  RE_SET_POKECENTER,
+  RE_POKEMON_MART,
+  RE_POKEMON_PC,
+  RE_SE_PLAY,
+  RE_PB_WAIT,
+  RE_BUTTON_SCREEN,
+  RE_CUT,
+  RE_ROCKSMASH_COND,
+  RE_ERASE_EVENT,
+  RE_ROCKSMASH_ENCOUNTER,
+  RE_SET_TEMP_SWITCH,
+  RE_SET_SELF_SWITCH_OTHER,
+  matchTrainerBattle,
+  recognizeScriptCondition,
+  classifyIgnorableCommand,
+  logUnsupportedScript,
+  compareNumbers
+} from "./essentialsScriptAdapters";
+import LEGACY_ITEM_INTERNAL_BY_NUMBER from "./legacyItemNumbers";
 
 type TypedSocketServer = Server<
   ClientToServerEvents,
@@ -48,7 +94,9 @@ type ConditionTest =
   | { kind: "selfSwitch"; ch: string; on: boolean }
   | { kind: "variable"; id: number; op: number; constant: boolean; value: number }
   | { kind: "gold"; amount: number; gte: boolean }
+  | { kind: "item"; legacyId: number }
   | { kind: "script"; text: string }
+  | { kind: "unsupported"; branchType: number }
   | { kind: "always"; value: boolean };
 
 // Control Variables (122) / Change Gold (125) operands.
@@ -81,75 +129,11 @@ class JumpToLabel {
   constructor(public readonly name: string) {}
 }
 
-// RMXP script effects the runtime understands (pbAddPokemon etc.).
-// Accepts both the legacy `PBSpecies::NAME` and the modern `:NAME` symbol
-// forms, with an optional `Kernel.` prefix (gift events are often authored as
-// `Kernel.pbAddPokemon(:ARIADOS,35)`) — mirrors RE_WILD_BATTLE below.
-const RE_ADD_POKEMON = /(?:Kernel\.)?pbAddPokemon\(\s*(?:PBSpecies::|:)(\w+)\s*,\s*(\d+)/i;
-// pbGenerateEgg(:EEVEE, _I("Encargada")) — the "REGALA HUEVO" day-care NPC and
-// any egg-giving item. Like pbAddPokemon it is authored as a conditional-branch
-// script whose then-branch sets the Self Switch, but it hands over an EGG that
-// hatches after walking. Only the species matters here; the obtain text arg is
-// flavour and ignored.
-const RE_GENERATE_EGG = /(?:Kernel\.)?pbGenerateEgg\(\s*(?:PBSpecies::|:)(\w+)/i;
-// Day Care egg pickup ("Criador"): `Kernel.pbEggGenerated?` gates whether an
-// egg is waiting, and `pbDayCareGenerateEgg` hands it over. We model these with
-// the same weekly egg cooldown as pbGenerateEgg; the handed-over egg is bred
-// from the player's lead species (the full breeding sim is not modelled).
-const RE_EGG_GENERATED = /pbEggGenerated\??/i;
-const RE_DAYCARE_GENERATE_EGG = /pbDayCareGenerateEgg/i;
-// Day-care party-space gates. `$Trainer.party.length` counts every slot (eggs
-// included, since an egg occupies a slot); `$Trainer.pokemonCount` counts only
-// battle-ready (non-egg) members. Previously these unknown script conditions
-// hit the permissive `return true`, so the Day Care always thought the party
-// was full ("no space") regardless of the real party.
-const RE_PARTY_LENGTH = /\$Trainer\.party\.length\s*(>=|<=|==|!=|>|<)\s*(\d+)/i;
-const RE_POKEMON_COUNT = /\$Trainer\.(?:pokemonCount|partyCount)\s*(>=|<=|==|!=|>|<)\s*(\d+)/i;
+// Script recognition (RE_* patterns, per-Essentials-version adapters, and the
+// unsupported-script log) lives in essentialsScriptAdapters.ts.
+
 // A player can receive a fresh egg from the same egg NPC once per week.
 const EGG_COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000;
-const RE_RECEIVE_ITEM = /pbReceive(?:Item)?\(\s*(?:PBItems::|:)(\w+)/i;
-// pbItemBall(:POTION) — visible item balls; also used by hidden items.
-const RE_ITEM_BALL = /pbItemBall\(\s*(?:PBItems::|:)(\w+)/i;
-// pbItemBall(pbGet(1)) — the item's legacy numeric id sits in an event
-// variable (apricorn trees roll 21+rand(7) into variable 1 first).
-const RE_ITEM_BALL_VAR = /pbItemBall\(\s*pbGet\(\s*(\d+)\s*\)/i;
-// $PokemonBag.pbStoreItem(PBItems::X) — silent grants (vending machines);
-// the event's own Show Text announces the item, so no info step here.
-const RE_STORE_ITEM = /pbStoreItem\(\s*(?:PBItems::|:)(\w+)/i;
-const RE_POKEDEX = /\$Trainer\.pokedex\s*=\s*true/i;
-// Gym badges. Award forms (RPG-Maker Script cmd 355): `$Trainer.badges[N]=true`
-// or `pbReceiveBadge(N)`. Condition forms (Script conditional branch): the
-// badge count `$Trainer.numbadges >=|>|... N`, or a plain `$Trainer.badges[N]`
-// truthy test. Awarding is honoured in applyScript; conditions in evaluate().
-const RE_AWARD_BADGE = /\$Trainer\.badges\[\s*(\d+)\s*\]\s*=\s*true/i;
-const RE_RECEIVE_BADGE = /pbReceiveBadge\(\s*(\d+)\s*\)/i;
-const RE_NUMBADGES = /\$Trainer\.numbadges\s*(>=|<=|==|!=|>|<)\s*(\d+)/i;
-const RE_HAS_BADGE = /\$Trainer\.badges\[\s*(\d+)\s*\]/i;
-const RE_HEAL = /pbHealAll|pbHealParty|Recover All/i;
-const RE_CHANGE_PLAYER = /pbChangePlayer\(\s*(\d)\s*\)/i;
-const RE_TRAINER_BATTLE = /pbTrainerBattle\(\s*PBTrainers::(\w+)\s*,\s*"([^"]+)"/i;
-// pbWildBattle(:CYNDAQUIL,30) / pbWildBattle(PBSpecies::MUK,25,1,false,true) —
-// hidden/static overworld venomons the player battles (and can catch) by
-// talking to them.
-const RE_WILD_BATTLE = /pbWildBattle\(\s*(?:PBSpecies::|:)(\w+)\s*,\s*(\d+)/i;
-const RE_TRAINER_NAME = /pbTrainerName/i;
-const RE_TONE_CHANGE = /pbToneChangeAll\(\s*Tone\.new\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)[^)]*\)\s*,\s*(\d+)/i;
-const RE_SET_POKECENTER = /pbSetPokemonCenter/i;
-const RE_POKEMON_MART = /pbPokemonMart\(\s*\[([^\]]*)\]/i;
-// Pokemon Center / bedroom computers: both Essentials entry points open the
-// same server-authoritative PC box storage overlay on the client.
-const RE_POKEMON_PC = /pbPokeCenterPC|pbTrainerPC/i;
-const RE_SE_PLAY = /pbSEPlay\(\s*"([^"]+)"/i;
-const RE_PB_WAIT = /pbWait\(\s*(\d+)\s*\)/i;
-const RE_BUTTON_SCREEN = /pbEventScreen\(\s*ButtonEventScene\s*\)/i;
-
-// Field-skill (MO/HM) obstacle events. Cut trees + Rock Smash rocks are authored
-// as a conditional branch gated by pbCut / pbRockSmash whose body erases the
-// event (pbEraseThisEvent) and, for rocks, rolls a wild encounter.
-const RE_CUT = /pbCut\b/i;
-const RE_ROCKSMASH_COND = /pbRockSmash(?!Random)/i;
-const RE_ERASE_EVENT = /pbEraseThisEvent/i;
-const RE_ROCKSMASH_ENCOUNTER = /pbRockSmashRandomEncounter/i;
 
 // Venova gender pick (pbChangePlayer 0/1) -> migrated protagonist skins.
 const PLAYER_SKIN_BY_INDEX: Record<string, string> = {
@@ -224,6 +208,8 @@ type Session = {
   npcName: string;
   npcPortraitSrc: string; // the speaking NPC's trimmed sprite, shown in the box
   selfSwitchPrefix: string; // `${essMapId}:${eventId}:`
+  essentials: EssentialsEvent; // the running event (for script conditions with event context)
+  eventCell: { x: number; y: number } | null; // event cell coords (get_character(0).onEvent?)
   placementId: string; // map placement that hosts this event ("" for resumes)
   isTouch: boolean; // started by walking into/onto the event (doors, mats)
   nodesRun: number; // hang guard against mis-authored label loops
@@ -295,10 +281,27 @@ export default class EventRuntime {
     const snapshot = this.world.getPlayableMapsState();
     const placement = snapshot?.editorDataByMapId[player.currentMapId]?.npcs.find(
       (candidate) => candidate.id === npcPlacementId
-    ) as (Record<string, unknown> & { name?: string; previewImageSrc?: string; essentialsEvent?: EssentialsEvent }) | undefined;
+    ) as (Record<string, unknown> & { name?: string; previewImageSrc?: string; x?: number; y?: number; interactionDistanceSquares?: number; essentialsEvent?: EssentialsEvent }) | undefined;
 
     if (!placement || !placement.essentialsEvent) {
       return { ok: false as const, message: "There is nothing to interact with here." };
+    }
+
+    // The client already range-checks before emitting event:interact, but the
+    // server must not trust it: a forged interact against a distant event
+    // (a gym leader, a story NPC) would run its commands from anywhere.
+    if (options?.touch !== true && typeof placement.x === "number" && typeof placement.y === "number") {
+      const playerCellX = Math.floor((player.x + player.width / 2) / 32);
+      const playerCellY = Math.floor((player.y + player.height / 2) / 32);
+      const reach = (typeof placement.interactionDistanceSquares === "number"
+        ? placement.interactionDistanceSquares
+        : 2) + 1;
+      if (
+        Math.abs(playerCellX - placement.x) > reach ||
+        Math.abs(playerCellY - placement.y) > reach
+      ) {
+        return { ok: true as const, empty: true };
+      }
     }
 
     const essentials = placement.essentialsEvent;
@@ -327,7 +330,7 @@ export default class EventRuntime {
         }
       }
     }
-    const page = this.selectActivePage(essentials.pages, state, essentials);
+    const page = this.selectActivePage(essentials, player, state);
     // Only action/touch pages respond to a click; autorun/parallel pages are
     // driven by runAutorunForMap, not by talking.
     if (!page || (page.trigger !== 0 && page.trigger !== 1 && page.trigger !== 2)) {
@@ -346,7 +349,10 @@ export default class EventRuntime {
       page,
       false,
       options?.touch === true,
-      npcPlacementId
+      npcPlacementId,
+      typeof placement.x === "number" && typeof placement.y === "number"
+        ? { x: placement.x, y: placement.y }
+        : null
     );
     return { ok: true as const };
   }
@@ -369,18 +375,6 @@ export default class EventRuntime {
       return;
     }
     await this.auth.setEggGrantTimestamp(session.userId, session.placementId, Date.now());
-  }
-
-  private compareNumbers(op: string, left: number, right: number): boolean {
-    switch (op) {
-      case ">=": return left >= right;
-      case "<=": return left <= right;
-      case ">": return left > right;
-      case "<": return left < right;
-      case "==": return left === right;
-      case "!=": return left !== right;
-      default: return false;
-    }
   }
 
   /**
@@ -425,7 +419,10 @@ export default class EventRuntime {
       return { ready: false, ran: false };
     }
     let ranAny = false;
-    for (let guard = 0; guard < 16; guard += 1) {
+    // Guard cap: Venova's door template gives every doorway an autorun page
+    // that self-disables via a temp switch, so a hub map can legitimately
+    // chain a dozen autoruns on entry before settling.
+    for (let guard = 0; guard < 64; guard += 1) {
       // A disconnect aborts the running session, but this loop would then
       // re-select the same (rolled-back) autorun page and restart it for a
       // player who is no longer there — a zombie session that blocks every
@@ -443,14 +440,14 @@ export default class EventRuntime {
         return { ready: false, ran: ranAny };
       }
       const placements = (snapshot.editorDataByMapId[player.currentMapId]?.npcs ?? []) as Array<
-        Record<string, unknown> & { name?: string; previewImageSrc?: string; essentialsEvent?: EssentialsEvent }
+        Record<string, unknown> & { name?: string; previewImageSrc?: string; x?: number; y?: number; essentialsEvent?: EssentialsEvent }
       >;
       const eventPlacements = placements.filter((placement) => placement.essentialsEvent);
       const state = await this.auth.getEventState(userId);
       let ran = false;
       for (const placement of eventPlacements) {
         const essentials = placement.essentialsEvent as EssentialsEvent;
-        const page = this.selectActivePage(essentials.pages, state, essentials);
+        const page = this.selectActivePage(essentials, player, state);
         if (page && page.trigger === 3) {
           const outcome = await this.executeSession(
             userId,
@@ -461,7 +458,10 @@ export default class EventRuntime {
             page,
             true,
             false,
-            typeof placement.id === "string" ? placement.id : ""
+            typeof placement.id === "string" ? placement.id : "",
+            typeof placement.x === "number" && typeof placement.y === "number"
+              ? { x: placement.x, y: placement.y }
+              : null
           );
           if (outcome === "aborted") {
             // Disconnected (or superseded) mid-event: stop chaining; the
@@ -553,7 +553,7 @@ export default class EventRuntime {
         continue;
       }
       const prefix = `${essentials.essentialsMapId}:${essentials.eventId}:`;
-      const activePage = this.selectActivePage(essentials.pages, state, essentials);
+      const activePage = this.selectActivePage(essentials, player, state);
       if (activePage && activePage.trigger === 3) {
         continue; // this autorun would already run — nothing to recover
       }
@@ -565,7 +565,7 @@ export default class EventRuntime {
           Object.entries(state.selfSwitches).filter(([key]) => !key.startsWith(prefix))
         )
       };
-      const strippedPage = this.selectActivePage(essentials.pages, strippedState, essentials);
+      const strippedPage = this.selectActivePage(essentials, player, strippedState);
       if (strippedPage && strippedPage.trigger === 3) {
         if (await this.auth.clearEventSelfSwitchesByPrefix(userId, prefix)) {
           cleared = true;
@@ -590,7 +590,8 @@ export default class EventRuntime {
     page: EventPage,
     isAutorun: boolean,
     isTouch = false,
-    placementId = ""
+    placementId = "",
+    eventCell: { x: number; y: number } | null = null
   ) {
     const token = ++this.tokenCounter;
     const session: Session = {
@@ -600,6 +601,8 @@ export default class EventRuntime {
       npcName: this.resolveSpeaker(page, placementName),
       npcPortraitSrc: portraitSrc,
       selfSwitchPrefix: `${essentials.essentialsMapId}:${essentials.eventId}:`,
+      essentials,
+      eventCell,
       placementId,
       isTouch,
       nodesRun: 0,
@@ -694,8 +697,16 @@ export default class EventRuntime {
     // Cache on the player so the world can resolve conditional NPC collision
     // synchronously during movement ticks.
     player.eventState = state;
+    // Clients additionally receive the session temp switches and the server's
+    // script-switch environment (clock) so their page-selection mirror agrees
+    // with the server about which page each event shows.
+    const payload = {
+      ...state,
+      tempSwitches: { ...player.tempSwitches },
+      env: currentEventEnv()
+    };
     player.socketConnections.forEach((socketId) => {
-      this.io.to(socketId).emit("event:state", state);
+      this.io.to(socketId).emit("event:state", payload);
     });
   }
 
@@ -1039,7 +1050,11 @@ export default class EventRuntime {
         return Boolean(state.selfSwitches[`${session.selfSwitchPrefix}${test.ch}`]) === test.on;
       case "variable": {
         const left = Number(state.variables[String(test.id)] ?? 0);
-        const right = test.value;
+        // RMXP operand: constant, or ANOTHER variable's value (quest counters
+        // are sometimes compared variable-to-variable).
+        const right = test.constant
+          ? test.value
+          : Number(state.variables[String(test.value)] ?? 0);
         switch (test.op) {
           case 0: return left === right;
           case 1: return left >= right;
@@ -1050,17 +1065,44 @@ export default class EventRuntime {
           default: return false;
         }
       }
+      case "item": {
+        // Conditional Branch: [Item] in Inventory — the RMXP id maps to an
+        // Essentials internal name via the legacy item table. An item the
+        // catalogs don't know stays "not owned" (fails closed) and is surfaced
+        // by the migration report.
+        const symbol = LEGACY_ITEM_INTERNAL_BY_NUMBER[test.legacyId];
+        if (!symbol || !this.battleManager) {
+          logUnsupportedScript(
+            "condition",
+            `Conditional Branch item ${test.legacyId} (no legacy mapping)`,
+            this.sessionContext(session)
+          );
+          return false;
+        }
+        return (await this.battleManager.getEventItemQuantity(session.userId, symbol)) > 0;
+      }
+      case "unsupported":
+        logUnsupportedScript(
+          "condition",
+          `Conditional Branch type ${test.branchType}`,
+          this.sessionContext(session)
+        );
+        return false;
       case "gold": {
         const user = await this.auth.getUserForBattle(session.userId);
         const money = user?.money ?? 0;
         return test.gte ? money >= test.amount : money <= test.amount;
       }
       case "script": {
-        const trainerBattle = test.text.match(RE_TRAINER_BATTLE);
+        const trainerBattle = matchTrainerBattle(test.text);
         if (trainerBattle) {
           // The battle IS the condition: its outcome selects the branch
           // (win -> self switch A = trainer defeated, like Essentials).
-          return this.runScriptedTrainerBattle(session, trainerBattle[1], trainerBattle[2]);
+          return this.runScriptedTrainerBattle(
+            session,
+            trainerBattle.trainerType,
+            trainerBattle.trainerName
+          );
         }
         const wildBattle = test.text.match(RE_WILD_BATTLE);
         if (wildBattle) {
@@ -1146,13 +1188,13 @@ export default class EventRuntime {
         if (partyLength) {
           const user = await this.auth.getUserForBattle(session.userId);
           const count = user?.pokemonParty?.length ?? 0;
-          return this.compareNumbers(partyLength[1], count, Number(partyLength[2]));
+          return compareNumbers(partyLength[1], count, Number(partyLength[2]));
         }
         const pokemonCount = test.text.match(RE_POKEMON_COUNT);
         if (pokemonCount) {
           const user = await this.auth.getUserForBattle(session.userId);
           const count = (user?.pokemonParty ?? []).filter((pokemon) => !pokemon.isEgg).length;
-          return this.compareNumbers(pokemonCount[1], count, Number(pokemonCount[2]));
+          return compareNumbers(pokemonCount[1], count, Number(pokemonCount[2]));
         }
         // Item balls are usually authored as script conditions whose branch
         // body sets Self Switch A. Granting here (and failing the test when
@@ -1205,12 +1247,79 @@ export default class EventRuntime {
           }
           return knows;
         }
-        // Unknown script tests keep the old permissive behavior.
-        return true;
+        // Version-adapter recognizers (item quantities, temp switches,
+        // game switches, feature checks...). These are the conditions that
+        // gate key-item routes and story doors, so they must be real.
+        const recognized = recognizeScriptCondition(test.text);
+        if (recognized) {
+          switch (recognized.kind) {
+            case "itemQuantity": {
+              const quantity = this.battleManager
+                ? await this.battleManager.getEventItemQuantity(session.userId, recognized.itemSymbol)
+                : 0;
+              return compareNumbers(recognized.op, quantity, recognized.value);
+            }
+            case "hasItem": {
+              const quantity = this.battleManager
+                ? await this.battleManager.getEventItemQuantity(session.userId, recognized.itemSymbol)
+                : 0;
+              return recognized.negated ? quantity <= 0 : quantity > 0;
+            }
+            case "canStoreItem":
+              return true; // the online bag has no capacity limit
+            case "boxesFull":
+              // PC boxes are endless online, so they are never full.
+              return recognized.negated;
+            case "daycareDeposited":
+              // The original day-care deposit system is not simulated.
+              return compareNumbers(recognized.op, 0, recognized.value);
+            case "tempSwitch": {
+              const key = `${session.selfSwitchPrefix}${recognized.channel}`;
+              const on = session.player.tempSwitches[key] === true;
+              return recognized.on ? on : !on;
+            }
+            case "onEvent": {
+              // get_character(0).onEvent?: the player stands exactly on this
+              // event's tile (door/line-of-sight templates). Touch sessions
+              // fired by standing on the event qualify by construction.
+              if (!session.eventCell) {
+                return session.isTouch;
+              }
+              const cellX = Math.floor((session.player.x + session.player.width / 2) / 32);
+              const cellY = Math.floor((session.player.y + session.player.height / 2) / 32);
+              return cellX === session.eventCell.x && cellY === session.eventCell.y;
+            }
+            case "gameSwitch": {
+              const on = Boolean(state.switches[String(recognized.id)]);
+              return recognized.negated ? !on : on;
+            }
+            case "variableCompare":
+              return compareNumbers(
+                recognized.op,
+                Number(state.variables[String(recognized.id)] ?? 0),
+                recognized.value
+              );
+            case "alwaysFalse":
+              return false;
+            case "alwaysTrue":
+              return true;
+          }
+        }
+        // Unknown script tests FAIL CLOSED: story gates live in script
+        // conditions, and silently passing them is how sequence breaks
+        // happened. The else-branch (usually a refusal line) runs instead,
+        // and the script is logged for the migration report.
+        logUnsupportedScript("condition", test.text, this.sessionContext(session));
+        return false;
       }
       case "always":
         return test.value;
     }
+  }
+
+  /** map/event context string for the unsupported-script log. */
+  private sessionContext(session: Session): string {
+    return `map ${session.essentials.essentialsMapId} event ${session.essentials.eventId}`;
   }
 
   /** Runs a real trainer battle for a pbTrainerBattle script and reports the result. */
@@ -1300,6 +1409,31 @@ export default class EventRuntime {
   /** Returns "exit" when the rest of the event must not run (e.g. an
    *  unresolved wild encounter whose later commands would consume it). */
   private async applyScript(session: Session, text: string): Promise<"exit" | undefined> {
+    // Essentials temp switches: per-event, session-scoped state (the door and
+    // daily-event templates). They refresh page selection immediately but are
+    // never persisted — leaving the map resets them, like the original.
+    const tempSwitch = text.match(RE_SET_TEMP_SWITCH);
+    if (tempSwitch) {
+      const key = `${session.selfSwitchPrefix}${tempSwitch[2]}`;
+      if (tempSwitch[1].toLowerCase() === "on") {
+        session.player.tempSwitches[key] = true;
+      } else {
+        delete session.player.tempSwitches[key];
+      }
+      await this.emitEventState(session.userId);
+      return;
+    }
+
+    // pbSetSelfSwitch(20,"A",true): sets ANOTHER event's (persistent) self
+    // switch on the same map — cutscenes use it to unlock doors / clear
+    // blockers. Buffered like the event's own self-switch writes.
+    const otherSelfSwitch = text.match(RE_SET_SELF_SWITCH_OTHER);
+    if (otherSelfSwitch) {
+      const key = `${session.essentials.essentialsMapId}:${Number(otherSelfSwitch[1])}:${otherSelfSwitch[2]}`;
+      session.pendingWrites.selfSwitches[key] = otherSelfSwitch[3].toLowerCase() === "true";
+      return;
+    }
+
     // Cut / Rock Smash body: remove the obstacle (persist + push immediately so
     // it vanishes for this player even if a rock-smash encounter starts next),
     // then optionally roll a wild encounter for rocks.
@@ -1493,10 +1627,14 @@ export default class EventRuntime {
       return;
     }
 
-    const trainerBattle = text.match(RE_TRAINER_BATTLE);
+    const trainerBattle = matchTrainerBattle(text);
     if (trainerBattle) {
       // Some events call pbTrainerBattle as a plain script (no branch).
-      await this.runScriptedTrainerBattle(session, trainerBattle[1], trainerBattle[2]);
+      await this.runScriptedTrainerBattle(
+        session,
+        trainerBattle.trainerType,
+        trainerBattle.trainerName
+      );
       return;
     }
 
@@ -1598,49 +1736,32 @@ export default class EventRuntime {
       await this.waitAdvance(session.userId);
       return;
     }
+
+    // Anything else: cosmetic calls are silently skipped; genuinely unknown
+    // scripts are skipped too but recorded so the migration report can list
+    // them (a skipped command must never unlock progression by itself).
+    if (classifyIgnorableCommand(text) === null) {
+      logUnsupportedScript("command", text, this.sessionContext(session));
+    }
   }
 
   // -- page selection ------------------------------------------------------
+  /**
+   * RMXP-compatible page selection (shared with the world's collision/touch
+   * checks): highest-index page whose conditions hold for THIS player,
+   * including Essentials script switches and session temp switches.
+   */
   private selectActivePage(
-    pages: EventPage[],
-    state: { switches: Record<string, boolean>; variables: Record<string, number>; selfSwitches: Record<string, boolean> },
-    essentials: EssentialsEvent
+    essentials: EssentialsEvent,
+    player: Player,
+    state: { switches: Record<string, boolean>; variables: Record<string, number>; selfSwitches: Record<string, boolean> }
   ): EventPage | null {
-    // RMXP uses the highest-index page whose conditions are all satisfied.
-    for (let index = pages.length - 1; index >= 0; index -= 1) {
-      if (this.pageConditionsMet(pages[index].conditions, state, essentials)) {
-        const page = pages[index];
-        // A page with no runnable commands (an emptied one-off) shows nothing.
-        return page.commands.some((command) => command.code !== 0) ? page : null;
-      }
-    }
-    return null;
-  }
-
-  private pageConditionsMet(
-    conditions: PageConditions,
-    state: { switches: Record<string, boolean>; variables: Record<string, number>; selfSwitches: Record<string, boolean> },
-    essentials: EssentialsEvent
-  ): boolean {
-    if (conditions.switch1 && !state.switches[String(conditions.switch1)]) {
-      return false;
-    }
-    if (conditions.switch2 && !state.switches[String(conditions.switch2)]) {
-      return false;
-    }
-    if (conditions.selfSwitch) {
-      const key = `${essentials.essentialsMapId}:${essentials.eventId}:${conditions.selfSwitch}`;
-      if (!state.selfSwitches[key]) {
-        return false;
-      }
-    }
-    if (conditions.variable) {
-      const current = Number(state.variables[String(conditions.variable.id)] ?? 0);
-      if (current < conditions.variable.value) {
-        return false;
-      }
-    }
-    return true;
+    const playerState: EventPlayerState = { ...state, tempSwitches: player.tempSwitches };
+    return selectActiveEventPageShared(
+      essentials as EssentialsEventRecord,
+      playerState,
+      this.world.pageSelectionOptions()
+    ) as EventPage | null;
   }
 
   private resolveSpeaker(page: EventPage, fallback: string): string {
@@ -2064,9 +2185,17 @@ function parseCondition(parameters: unknown[]): ConditionTest {
         ch: typeof parameters[1] === "string" ? parameters[1] : "A",
         on: parameters[2] === 0
       };
+    case 6:
+      // Character facing check: cosmetic (turn-to-face puzzles); allowing the
+      // branch cannot skip progression, so it passes.
+      return { kind: "always", value: true };
     case 7:
       // Gold check (vending machines): [7, amount, operator(0 >=, 1 <=)].
       return { kind: "gold", amount: Number(parameters[1] ?? 0), gte: parameters[2] === 0 };
+    case 8:
+      // Item in inventory: [8, rmxpItemId]. Key-item gates use this in some
+      // Essentials projects; resolved against the bag at evaluation time.
+      return { kind: "item", legacyId: Number(parameters[1] ?? 0) };
     case 12: {
       // Script condition — trainer battles live here in Essentials events:
       // `pbTrainerBattle(PBTrainers::TYPE, "Name", ...)` is the test itself.
@@ -2074,7 +2203,8 @@ function parseCondition(parameters: unknown[]): ConditionTest {
       return text ? { kind: "script", text } : { kind: "always", value: true };
     }
     default:
-      // Unsupported condition types (item/etc.): let the dialog proceed.
-      return { kind: "always", value: true };
+      // Unsupported condition types (actor/timer/enemy/...): FAIL CLOSED and
+      // log — passing an unknown gate is how sequence breaks slip in.
+      return { kind: "unsupported", branchType: type };
   }
 }

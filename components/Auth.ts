@@ -1391,9 +1391,14 @@ export default class Auth {
             // starter) can be replayed from the beginning after a reset.
             event_switches: JSON.stringify({}),
             event_variables: JSON.stringify({}),
-            event_self_switches: JSON.stringify({})
+            event_self_switches: JSON.stringify({}),
+            // Badges are progression too: a reset player replaying the story
+            // must not sail through numbadges gates with pre-reset medals.
+            badges: JSON.stringify([])
         });
-        await this.redis.hDel(this.userKey(userId), ["last_map_id", "last_x", "last_y", "respawn_point", "pokemon_box"]);
+        await this.redis.hDel(this.userKey(userId), [
+            "last_map_id", "last_x", "last_y", "respawn_point", "pokemon_box", "egg_cooldowns"
+        ]);
 
         const updatedUser = await this.getUserAdminDetails(userId);
         if (!updatedUser) {
@@ -1457,6 +1462,57 @@ export default class Auth {
     // ---- RPG Maker event state: switches / variables / self-switches ----
     // Persisted per user so multi-page events (page conditions) and progression
     // gating (e.g. "professor gave permission") survive across sessions.
+    // ------------------------------------------------------------------
+    // World-shared event switches (opt-in). Imported story progression is
+    // per-player by design; a switch becomes world-wide ONLY when its id is
+    // listed in the `world:event-switch-globals` JSON array (curated by the
+    // operators for genuinely shared world state, e.g. a server-wide event).
+    // Values live in `world:event-switches` and override the player's copy.
+    // ------------------------------------------------------------------
+    private static GLOBAL_SWITCH_IDS_KEY = "world:event-switch-globals";
+    private static GLOBAL_SWITCH_VALUES_KEY = "world:event-switches";
+    private globalSwitchIdCache:{ ids:Set<string>; fetchedAt:number } | null = null;
+
+    private async getGlobalSwitchIds():Promise<Set<string>> {
+        if (this.globalSwitchIdCache && Date.now() - this.globalSwitchIdCache.fetchedAt < 30_000) {
+            return this.globalSwitchIdCache.ids;
+        }
+        let ids = new Set<string>();
+        try {
+            const raw = await this.redis.get(Auth.GLOBAL_SWITCH_IDS_KEY);
+            const parsed = raw ? JSON.parse(raw) : [];
+            if (Array.isArray(parsed)) {
+                ids = new Set(parsed.map((id) => String(id)));
+            }
+        } catch {
+            // Malformed config: treat as "nothing shared".
+        }
+        this.globalSwitchIdCache = { ids, fetchedAt: Date.now() };
+        return ids;
+    }
+
+    private async readWorldSwitchValues():Promise<Record<string, boolean>> {
+        try {
+            const raw = await this.redis.get(Auth.GLOBAL_SWITCH_VALUES_KEY);
+            const parsed = raw ? JSON.parse(raw) : {};
+            return parsed && typeof parsed === "object" ? parsed as Record<string, boolean> : {};
+        } catch {
+            return {};
+        }
+    }
+
+    private async applyWorldSwitchWrites(writes:Record<string, boolean>) {
+        const values = await this.readWorldSwitchValues();
+        for (const [id, on] of Object.entries(writes)) {
+            if (on) {
+                values[id] = true;
+            } else {
+                delete values[id];
+            }
+        }
+        await this.redis.set(Auth.GLOBAL_SWITCH_VALUES_KEY, JSON.stringify(values));
+    }
+
     public async getEventState(userId:number):Promise<{
         switches:Record<string, boolean>;
         variables:Record<string, number>;
@@ -1473,27 +1529,36 @@ export default class Auth {
                 return {} as Record<string, unknown>;
             }
         };
+        const switches = parse(raw[0]) as Record<string, boolean>;
+
+        // Overlay explicitly-shared world switches (see getGlobalSwitchIds).
+        const globalIds = await this.getGlobalSwitchIds();
+        if (globalIds.size > 0) {
+            const worldValues = await this.readWorldSwitchValues();
+            for (const id of globalIds) {
+                if (worldValues[id]) {
+                    switches[id] = true;
+                } else {
+                    delete switches[id];
+                }
+            }
+        }
+
         return {
-            switches: parse(raw[0]) as Record<string, boolean>,
+            switches,
             variables: parse(raw[1]) as Record<string, number>,
             selfSwitches: parse(raw[2]) as Record<string, boolean>
         };
     }
 
     public async setEventSwitches(userId:number, startId:number, endId:number, on:boolean) {
-        const state = await this.getEventState(userId);
         const lo = Math.min(startId, endId);
         const hi = Math.max(startId, endId);
+        const switches:Record<string, boolean> = {};
         for (let id = lo; id <= hi; id += 1) {
-            if (on) {
-                state.switches[String(id)] = true;
-            } else {
-                delete state.switches[String(id)];
-            }
+            switches[String(id)] = on;
         }
-        await this.redis.hSet(this.userKey(userId), {
-            event_switches: JSON.stringify(state.switches)
-        });
+        await this.applyEventStateWrites(userId, { switches, variables: {}, selfSwitches: {} });
     }
 
     public async setEventVariable(userId:number, id:number, value:number) {
@@ -1574,13 +1639,34 @@ export default class Auth {
             return;
         }
 
-        const state = await this.getEventState(userId);
+        // Switch writes whose id is in the shared allowlist go to the world
+        // store; everything else stays per-player (the default for imported
+        // single-player progression).
+        const globalIds = await this.getGlobalSwitchIds();
+        const worldWrites:Record<string, boolean> = {};
+        const playerSwitchWrites:Record<string, boolean> = {};
         for (const [id, on] of Object.entries(writes.switches)) {
+            if (globalIds.has(id)) {
+                worldWrites[id] = on;
+            } else {
+                playerSwitchWrites[id] = on;
+            }
+        }
+        if (Object.keys(worldWrites).length > 0) {
+            await this.applyWorldSwitchWrites(worldWrites);
+        }
+
+        const state = await this.getEventState(userId);
+        for (const [id, on] of Object.entries(playerSwitchWrites)) {
             if (on) {
                 state.switches[id] = true;
             } else {
                 delete state.switches[id];
             }
+        }
+        // Never persist overlayed world values into the per-player copy.
+        for (const id of globalIds) {
+            delete state.switches[id];
         }
         for (const [id, value] of Object.entries(writes.variables)) {
             state.variables[id] = value;

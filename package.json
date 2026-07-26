@@ -1,30 +1,32 @@
 {
-    "name": "server-poke.io",
-    "version": "0.0.1",
-    "description": "server for a",
-    "dependencies": {
-        "@dotenvx/dotenvx": "^1.55.1",
-        "@types/socket.io": "^3.0.2",
-        "jsonwebtoken": "^9.0.3",
-        "nodemailer": "^8.0.2",
-        "pathfinding": "^0.4.18",
-        "redis": "^5.11.0",
-        "socket.io": "^4.4.1"
-    },
-    "scripts": {
-        "build": "tsc",
-        "prestart": "npm run build",
-        "start": "node dist/index.js",
-        "dev": "ts-node index.ts",
-        "postinstall": "npm run build"
-    },
-    "devDependencies": {
-        "@types/jsonwebtoken": "^9.0.10",
-        "@types/node": "^25.5.0",
-        "@types/nodemailer": "^7.0.11",
-        "@types/pathfinding": "^0.0.5",
-        "socket.io-client": "^4.8.3",
-        "ts-node": "^10.7.0",
-        "typescript": "^5.9.3"
-    }
+  "name": "server-poke.io",
+  "version": "0.0.1",
+  "description": "server for a",
+  "dependencies": {
+    "@dotenvx/dotenvx": "^1.55.1",
+    "@types/socket.io": "^3.0.2",
+    "jsonwebtoken": "^9.0.3",
+    "nodemailer": "^8.0.2",
+    "pathfinding": "^0.4.18",
+    "redis": "^5.11.0",
+    "socket.io": "^4.4.1"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prestart": "npm run build",
+    "start": "node dist/index.js",
+    "dev": "ts-node index.ts",
+    "postinstall": "npm run build",
+    "test:progression": "ts-node tools/testEssentialsProgression.ts",
+    "report:migration": "ts-node tools/essentialsMigrationReport.ts"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^25.5.0",
+    "@types/nodemailer": "^7.0.11",
+    "@types/pathfinding": "^0.0.5",
+    "socket.io-client": "^4.8.3",
+    "ts-node": "^10.7.0",
+    "typescript": "^5.9.3"
+  }
 }

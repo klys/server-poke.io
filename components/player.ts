@@ -38,6 +38,11 @@ export default class Player {
         variables:Record<string, number>;
         selfSwitches:Record<string, boolean>;
     } | null = null;
+    /** Essentials temp switches (tsOn?/setTempSwitchOn door and daily-event
+     * templates): per-event flags keyed `essMapId:eventId:CH`. Session-scoped
+     * like the original engine's Game_Event instance state — never persisted,
+     * cleared whenever the player changes map. */
+    tempSwitches:Record<string, boolean> = {};
     /** Last cell a standing-touch check ran for (touch events fire on cell
      * entry, and teleports seed this so arrivals don't instantly re-fire). */
     lastTouchCellKey:string = "";
@@ -423,6 +428,12 @@ export default class Player {
 
         // Landing anywhere via teleport/Fly ends surfing (destinations are land).
         this.isSurfing = false;
+        // Leaving a map discards Essentials temp switches, like the original
+        // engine discarding its Game_Event instances (doors re-arm, daily
+        // events refresh their per-visit availability).
+        if (mapId !== this.currentMapId) {
+            this.tempSwitches = {};
+        }
         this.currentMapId = mapId;
         this.x = nextPosition.x;
         this.y = nextPosition.y;
