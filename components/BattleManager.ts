@@ -39,7 +39,12 @@ import {
   type FishingRodTier
 } from "./battle/fieldItemEffects";
 import { canSpeciesLearnMachineMove } from "./TmCompatibility";
-import { resolveHeldItemEffect, type HeldItemEffect } from "./battle/heldItems";
+import {
+  resolveHeldBonus,
+  resolveHeldItemEffect,
+  type HeldBonusEffect,
+  type HeldItemEffect
+} from "./battle/heldItems";
 import {
   computeHiddenPower,
   computeModifiedPower,
@@ -268,6 +273,8 @@ type BattleVolatileState = {
   /** Encore: locked into repeating this move. */
   encore: { moveId: string; turns: number } | null;
   tauntTurns: number;
+  /** Choice item lock: the first move used while holding one seals the rest. */
+  choiceLockMoveId: string | null;
   torment: boolean;
   healBlockTurns: number;
   embargoTurns: number;
@@ -509,6 +516,7 @@ type ItemDefinition = {
   curesStatuses: BattleStatusId[] | "any" | null;
   curesConfusion: boolean;
   heldEffect: HeldItemEffect | null;
+  heldBonus: HeldBonusEffect | null;
   statModifiers: {
     hp: number;
     attack: number;
@@ -738,6 +746,7 @@ function createEmptyVolatile(): BattleVolatileState {
     disable: null,
     encore: null,
     tauntTurns: 0,
+    choiceLockMoveId: null,
     torment: false,
     healBlockTurns: 0,
     embargoTurns: 0,
@@ -3826,6 +3835,14 @@ export default class BattleManager {
       }
       return speed;
     };
+    // Quick Claw: one roll per holder per turn; a proc wins the speed race
+    // within the same priority bracket.
+    const quickClawProcs = new Map<BattleSideId, boolean>();
+    for (const side of [firstSide, secondSide]) {
+      const chance = this.getHeldBonus(getActivePokemon(side), battle)?.quickClawChance ?? 0;
+      quickClawProcs.set(side.id, chance > 0 && Math.random() < chance);
+    }
+
     const attackOrder = [firstSide, secondSide]
       .filter((side) => side.action?.type === "fight" && !isFainted(getActivePokemon(side)))
       .sort((left, right) => {
@@ -3836,6 +3853,12 @@ export default class BattleManager {
           return priorityDiff;
         }
 
+        const leftClaw = quickClawProcs.get(left.id) ?? false;
+        const rightClaw = quickClawProcs.get(right.id) ?? false;
+        if (leftClaw !== rightClaw) {
+          return leftClaw ? -1 : 1;
+        }
+
         const leftSpeed = sideSpeed(left);
         const rightSpeed = sideSpeed(right);
         // Trick Room: the slower battler moves first (priority unaffected).
@@ -3843,6 +3866,24 @@ export default class BattleManager {
           battle.trickRoomTurns > 0 ? leftSpeed - rightSpeed : rightSpeed - leftSpeed;
         return speedDiff || (Math.random() > 0.5 ? 1 : -1);
       });
+
+    // Announce the claw only when it actually stole the lead.
+    if (attackOrder.length === 2) {
+      const [first, second] = attackOrder;
+      const firstMove = this.getQueuedMove(first);
+      const secondMove = this.getQueuedMove(second);
+      const samePriority = (firstMove?.priority ?? 0) === (secondMove?.priority ?? 0);
+      const wasSlower =
+        battle.trickRoomTurns > 0
+          ? sideSpeed(first) > sideSpeed(second)
+          : sideSpeed(first) < sideSpeed(second);
+      if (samePriority && wasSlower && quickClawProcs.get(first.id) && !quickClawProcs.get(second.id)) {
+        this.say(
+          battle,
+          `${getPokemonDisplayName(getActivePokemon(first))}'s Quick Claw let it move first!`
+        );
+      }
+    }
 
     for (const side of attackOrder) {
       if ((battle.status as BattleStatus) !== "active") {
@@ -4609,7 +4650,7 @@ export default class BattleManager {
     for (const participant of participants) {
       this.applyEvYield(participant, faintedPokemon);
 
-      const gained =
+      let gained =
         faintedPokemon.baseExp > 0
           ? computeFoeExperience({
               baseExp: faintedPokemon.baseExp,
@@ -4618,6 +4659,12 @@ export default class BattleManager {
               participantCount: participants.length
             })
           : computeBattleExperience(catalogs.levelingCurveConfig, participant.level, faintedPokemon.level);
+
+      // Lucky Egg: the holder earns boosted EXP.
+      const expMultiplier = this.getHeldBonus(participant, battle)?.expMultiplier ?? 1;
+      if (expMultiplier > 1) {
+        gained = Math.floor(gained * expMultiplier);
+      }
 
       if (gained <= 0) {
         continue;
@@ -4845,8 +4892,13 @@ export default class BattleManager {
         `${winner.trainerName} received $${transferAmount}.`
       ];
     } else if (battle.kind === "trainer" && winner?.userId && loser?.isAi && loser.money > 0) {
-      // Happy Hour doubles the prize money.
-      const prize = loser.money * Math.max(1, battle.moneyMultiplier);
+      // Happy Hour doubles the prize money; an Amulet Coin in the winning
+      // party stacks on top.
+      const amuletMultiplier = winner.party.reduce(
+        (best, pokemon) => Math.max(best, this.getHeldBonus(pokemon, battle)?.moneyMultiplier ?? 1),
+        1
+      );
+      const prize = Math.floor(loser.money * Math.max(1, battle.moneyMultiplier) * amuletMultiplier);
       loser.money = 0;
       winner.money += prize;
       this.pushEvent(
@@ -5151,6 +5203,18 @@ export default class BattleManager {
       if (move.currentPp <= 0) {
         return "That skill has no PP left.";
       }
+
+      // Choice items seal every move except the first one used while holding.
+      const lockedMoveId = activePokemon.volatile.choiceLockMoveId;
+      if (
+        lockedMoveId &&
+        lockedMoveId !== move.id &&
+        this.getHeldBonus(activePokemon, battle)?.choiceLock &&
+        activePokemon.moves.some((candidate) => candidate.id === lockedMoveId && candidate.currentPp > 0)
+      ) {
+        const lockedMove = activePokemon.moves.find((candidate) => candidate.id === lockedMoveId);
+        return `${getPokemonDisplayName(activePokemon)} is locked into ${lockedMove?.name ?? "its move"} by its ${activePokemon.heldItemName ?? "held item"}!`;
+      }
     }
 
     if (action.type === "pokemon") {
@@ -5208,6 +5272,13 @@ export default class BattleManager {
     const opponentActive = getActivePokemon(opponent);
     let moves = getUsableMoves(activePokemon).filter((move) => {
       if (volatile.disable?.moveId === move.id) {
+        return false;
+      }
+      if (
+        volatile.choiceLockMoveId &&
+        move.id !== volatile.choiceLockMoveId &&
+        this.getHeldBonus(activePokemon)?.choiceLock
+      ) {
         return false;
       }
       if (volatile.encore && move.id !== volatile.encore.moveId) {
@@ -6386,6 +6457,12 @@ export default class BattleManager {
       attacker.volatile.lastMoveId === move.id ? attacker.volatile.consecutiveMoveUses : 0;
     attacker.volatile.lastMoveId = move.id;
     attacker.volatile.consecutiveMoveUses = consecutiveUses + 1;
+
+    // Choice items lock the holder into its first move (cleared on switch or
+    // when the item leaves).
+    if (!opts.calledMove && this.getHeldBonus(attacker, battle)?.choiceLock) {
+      attacker.volatile.choiceLockMoveId = move.id;
+    }
     if (!attacker.volatile.usedMoveIds.includes(move.id)) {
       attacker.volatile.usedMoveIds.push(move.id);
     }
@@ -6853,6 +6930,41 @@ export default class BattleManager {
         );
       }
 
+      // Equip items on the attacker that ride on a landed damaging move:
+      // King's Rock may flinch the target, Life Orb bites its holder.
+      const attackerHitBonus = totalDamage > 0 ? this.getHeldBonus(attacker, battle) : null;
+      if (attackerHitBonus) {
+        if (
+          attackerHitBonus.flinchChance &&
+          !spec.flinchTarget &&
+          !hitSubstitute &&
+          !isFainted(defender) &&
+          Math.random() < attackerHitBonus.flinchChance
+        ) {
+          defender.volatile.flinched = true;
+        }
+
+        if (attackerHitBonus.selfDamageFraction && attacker.hp > 0) {
+          const selfDamage = Math.max(1, Math.floor(attacker.maxHp * attackerHitBonus.selfDamageFraction));
+          attacker.hp = Math.max(0, attacker.hp - selfDamage);
+          this.pushEvent(
+            battle,
+            {
+              kind: "damage",
+              sideId: side.id,
+              pokemonId: attacker.id,
+              amount: selfDamage,
+              hpAfter: attacker.hp,
+              maxHp: attacker.maxHp,
+              effectiveness: 1,
+              critical: false,
+              source: "recoil"
+            },
+            `${attackerName} lost some of its HP to its ${attacker.heldItemName ?? "held item"}!`
+          );
+        }
+      }
+
       // Smelling Salts / Wake-Up Slap: the doubled hit cures the condition.
       if (totalDamage > 0 && !isFainted(defender) && defender.status) {
         if (
@@ -7178,14 +7290,22 @@ export default class BattleManager {
         continue;
       }
 
-      // False Swipe never KOs; Endure keeps the battler at 1 HP.
+      // False Swipe never KOs; Endure keeps the battler at 1 HP; a held
+      // Focus Band sometimes does the same.
       let enduredHit = false;
+      let focusBandSave = false;
       if (damage >= defender.hp) {
         if (spec.neverFaintTarget) {
           damage = Math.max(0, defender.hp - 1);
         } else if (defender.volatile.endure) {
           damage = Math.max(0, defender.hp - 1);
           enduredHit = true;
+        } else {
+          const focusBandChance = this.getHeldBonus(defender, battle)?.focusBandChance ?? 0;
+          if (defender.hp > 1 && focusBandChance > 0 && Math.random() < focusBandChance) {
+            damage = Math.max(0, defender.hp - 1);
+            focusBandSave = true;
+          }
         }
       }
 
@@ -7226,6 +7346,12 @@ export default class BattleManager {
       if (enduredHit) {
         this.say(battle, `${getPokemonDisplayName(defender)} endured the hit!`);
       }
+      if (focusBandSave) {
+        this.say(
+          battle,
+          `${getPokemonDisplayName(defender)} hung on using its ${defender.heldItemName ?? "Focus Band"}!`
+        );
+      }
     }
 
     return { totalDamage, hits: landedHits, anyCritical, hitSubstitute };
@@ -7257,6 +7383,16 @@ export default class BattleManager {
     if (damage >= defender.hp && (spec.neverFaintTarget || defender.volatile.endure)) {
       damage = Math.max(0, defender.hp - 1);
       enduredHit = defender.volatile.endure && !spec.neverFaintTarget;
+    } else if (damage >= defender.hp && defender.hp > 1) {
+      // A held Focus Band can save the target from flat damage too.
+      const focusBandChance = this.getHeldBonus(defender, battle)?.focusBandChance ?? 0;
+      if (focusBandChance > 0 && Math.random() < focusBandChance) {
+        damage = Math.max(0, defender.hp - 1);
+        this.say(
+          battle,
+          `${getPokemonDisplayName(defender)} hung on using its ${defender.heldItemName ?? "Focus Band"}!`
+        );
+      }
     }
 
     defender.hp = Math.max(0, defender.hp - damage);
@@ -8692,7 +8828,9 @@ export default class BattleManager {
     const identified = defender.volatile.foresight || defender.volatile.miracleEye;
     const evasion = identified ? Math.min(0, defender.stages.evasion) : defender.stages.evasion;
     const stageDelta = clamp(attacker.stages.accuracy - evasion, -6, 6);
-    const chance = move.accuracy * getAccuracyStageMultiplier(stageDelta);
+    // BrightPowder on the target throws off incoming moves.
+    const brightPowder = this.getHeldBonus(defender)?.incomingAccuracyMultiplier ?? 1;
+    const chance = move.accuracy * getAccuracyStageMultiplier(stageDelta) * brightPowder;
     return Math.random() * 100 < chance;
   }
 
@@ -8714,7 +8852,12 @@ export default class BattleManager {
     const flags = (move.flags ?? []).map((flag) => flag.toLowerCase());
     const highCritRate = flags.includes("h") || flags.includes("highcriticalhitrate");
     const focused = attacker?.volatile.focusEnergy ?? false;
-    const chance = focused ? (highCritRate ? 1 / 2 : 1 / 4) : highCritRate ? 1 / 8 : 1 / 16;
+    // Stage ladder (matches the old focused/high-crit table exactly):
+    // 0 -> 1/16, 1 -> 1/8, 2 -> 1/4, 3+ -> 1/2. Focus Energy counts double;
+    // a held Scope Lens adds a stage.
+    const scopeLens = attacker ? (this.getHeldBonus(attacker)?.critStageBonus ?? 0) : 0;
+    const stage = (highCritRate ? 1 : 0) + (focused ? 2 : 0) + scopeLens;
+    const chance = [1 / 16, 1 / 8, 1 / 4][stage] ?? 1 / 2;
     return Math.random() < chance;
   }
 
@@ -8822,6 +8965,28 @@ export default class BattleManager {
         ? 0.5
         : 1;
 
+    // Equip items on the attacker: type boosters (Charcoal...), damage-class
+    // bands (Muscle Band / Wise Glasses) and Life Orb.
+    let itemMultiplier = 1;
+    const attackerBonus = this.getHeldBonus(attacker, battle);
+    if (attackerBonus) {
+      if (
+        attackerBonus.boostType &&
+        upperType === attackerBonus.boostType.trim().toUpperCase()
+      ) {
+        itemMultiplier *= attackerBonus.boostTypeMultiplier ?? 1.2;
+      }
+      if (move.damageClass === "physical" && attackerBonus.physicalPowerMultiplier) {
+        itemMultiplier *= attackerBonus.physicalPowerMultiplier;
+      }
+      if (move.damageClass === "special" && attackerBonus.specialPowerMultiplier) {
+        itemMultiplier *= attackerBonus.specialPowerMultiplier;
+      }
+      if (attackerBonus.allPowerMultiplier) {
+        itemMultiplier *= attackerBonus.allPowerMultiplier;
+      }
+    }
+
     const modifier =
       stab *
       effectiveness *
@@ -8830,7 +8995,8 @@ export default class BattleManager {
       weatherMultiplier *
       screenMultiplier *
       terrainMultiplier *
-      sportMultiplier;
+      sportMultiplier *
+      itemMultiplier;
 
     if (effectiveness === 0) {
       return 0;
@@ -8839,11 +9005,77 @@ export default class BattleManager {
     return Math.max(1, Math.floor(baseDamage * modifier));
   }
 
+  /**
+   * The equip bonus of the item a battler is holding, or null when it has
+   * none or its items are suspended (Embargo; pass `battle` for Magic Room
+   * awareness where it is in scope). Species/evolution-conditioned bonuses
+   * (Thick Club, Eviolite) resolve against the holder here.
+   */
+  private getHeldBonus(pokemon: BattlePokemon, battle?: BattleSession | null): HeldBonusEffect | null {
+    if (!pokemon.heldItemId) {
+      return null;
+    }
+    if (battle && battle.magicRoomTurns > 0) {
+      return null;
+    }
+    if (pokemon.volatile.embargoTurns > 0) {
+      return null;
+    }
+
+    const definition = this.getCachedItemDefinition(pokemon.heldItemId, pokemon.heldItemName ?? "");
+    const bonus = definition?.heldBonus ?? null;
+    if (!bonus) {
+      return null;
+    }
+
+    if (bonus.onlySpecies) {
+      const species = (pokemon.sourcePokemonId ?? "")
+        .replace(/^pokemon-/i, "")
+        .trim()
+        .toUpperCase() || pokemon.name.trim().toUpperCase();
+      if (!bonus.onlySpecies.includes(species)) {
+        return null;
+      }
+    }
+
+    if (bonus.onlyIfCanEvolve && pokemon.evolutions.length === 0) {
+      return null;
+    }
+
+    return bonus;
+  }
+
+  private getHeldStatMultiplier(
+    pokemon: BattlePokemon,
+    stat: Exclude<BattleStageKey, "accuracy" | "evasion">
+  ) {
+    const bonus = this.getHeldBonus(pokemon);
+    if (!bonus) {
+      return 1;
+    }
+
+    switch (stat) {
+      case "attack":
+        return bonus.attackMultiplier ?? 1;
+      case "specialAttack":
+        return bonus.specialAttackMultiplier ?? 1;
+      case "defense":
+        return bonus.defenseMultiplier ?? 1;
+      case "specialDefense":
+        return bonus.specialDefenseMultiplier ?? 1;
+      case "speed":
+        return bonus.speedMultiplier ?? 1;
+      default:
+        return 1;
+    }
+  }
+
   private getModifiedStat(pokemon: BattlePokemon, stat: Exclude<BattleStageKey, "accuracy" | "evasion">) {
     const stageValue = Math.floor(pokemon.stats[stat] * getStageMultiplier(pokemon.stages[stat]));
     const statusMultiplier =
       stat === "attack" || stat === "speed" ? getStatusStatMultiplier(pokemon.status, stat) : 1;
-    return Math.max(1, Math.floor(stageValue * statusMultiplier));
+    const itemMultiplier = this.getHeldStatMultiplier(pokemon, stat);
+    return Math.max(1, Math.floor(stageValue * statusMultiplier * itemMultiplier));
   }
 
   private tryEscape(side: BattleSide, opponent: BattleSide) {
@@ -9265,6 +9497,7 @@ export default class BattleManager {
         useCondition,
         healAmount: statModifiers.hp
       }),
+      heldBonus: resolveHeldBonus(essentialsId),
       statModifiers
     };
   }
