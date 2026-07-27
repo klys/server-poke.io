@@ -1,8 +1,10 @@
 node_modules
 *.js
+# Self-contained one-off ops bundles (built with `npx esbuild`, run with plain node/docker)
+!dist-tools/*.bundle.js
 yarn.lock
 *.env
 prompt
-dist
+/dist/
 data
 contracts.json
