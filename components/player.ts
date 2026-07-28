@@ -291,13 +291,10 @@ export default class Player {
     }
 
     private relocateInsideMapIfNeeded() {
-        if (this.world.isOpenPlayerPosition(
-            this.currentMapId,
-            this.x,
-            this.y,
-            this.width,
-            this.height
-        )) {
+        // Surf-aware static check: a surfing player standing on (solid) water
+        // is exactly where they should be — relocating them would snap the
+        // mount back to shore every tick.
+        if (this.world.isOpenPositionForPlayer(this, this.x, this.y)) {
             return false;
         }
 
@@ -419,7 +416,8 @@ export default class Player {
             name:this.name,
             profileImage:this.profileImage,
             description:this.description,
-            characterSkinId:this.characterSkinId
+            characterSkinId:this.characterSkinId,
+            isSurfing:this.isSurfing
         }
     }
 
@@ -427,6 +425,7 @@ export default class Player {
         const nextPosition = this.world.resolveOpenPlayerPosition(mapId, x, y, this.width, this.height);
 
         // Landing anywhere via teleport/Fly ends surfing (destinations are land).
+        const wasSurfing = this.isSurfing;
         this.isSurfing = false;
         // Leaving a map discards Essentials temp switches, like the original
         // engine discarding its Game_Event instances (doors re-arm, daily
@@ -457,6 +456,10 @@ export default class Player {
             currentMapId:this.currentMapId,
             teleported:true
         })
+
+        if (wasSurfing) {
+            this.world.broadcastSurfState(this);
+        }
     }
 
     public stopMovement() {

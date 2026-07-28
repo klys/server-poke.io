@@ -68,6 +68,9 @@ export interface SavedPlayerLocation {
     mapId:string;
     x:number;
     y:number;
+    /** True when the player was surfing at this location (restored on join
+     * only when the saved cell is still surfable water). */
+    surfing?:boolean;
 }
 
 /** Minimal public projection of a user for friends/chat features. */
@@ -567,9 +570,10 @@ export default class Auth {
         const storedLocation = await this.redis.hmGet(this.userKey(userId), [
             "last_map_id",
             "last_x",
-            "last_y"
+            "last_y",
+            "last_surfing"
         ]);
-        const [mapId, x, y] = storedLocation;
+        const [mapId, x, y, surfing] = storedLocation;
         const parsedX = x === null ? Number.NaN : Number.parseInt(x, 10);
         const parsedY = y === null ? Number.NaN : Number.parseInt(y, 10);
 
@@ -585,7 +589,8 @@ export default class Auth {
         return {
             mapId,
             x: Math.round(parsedX),
-            y: Math.round(parsedY)
+            y: Math.round(parsedY),
+            surfing: surfing === "1"
         } satisfies SavedPlayerLocation;
     }
 
@@ -593,7 +598,8 @@ export default class Auth {
         await this.redis.hSet(this.userKey(userId), {
             last_map_id: location.mapId,
             last_x: String(Math.round(location.x)),
-            last_y: String(Math.round(location.y))
+            last_y: String(Math.round(location.y)),
+            last_surfing: location.surfing ? "1" : "0"
         });
     }
 

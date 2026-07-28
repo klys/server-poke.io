@@ -80,6 +80,8 @@ import {
 import type Player from "./player";
 import type World from "./world";
 import { resolveInitialSpawnFromPlayableMapsState } from "./PlayableMapsState";
+import { resolveDivePair } from "./diveMaps";
+import { isDeepWaterTag, isSurfableWaterTag } from "./terrainTags";
 import type ClientToServerEvents from "../Server/ClientToServerEvents";
 import type InterServerEvents from "../Server/InterServerEvents";
 import type { SocketData } from "../Server/registerSocketHandlers";
@@ -962,6 +964,21 @@ export default class BattleManager {
   private readonly pendingStepChecks = new Set<string>();
   /** Remaining Repel steps per player (in-grass encounters skipped while >0). */
   private readonly repelStepsByPlayerId = new Map<string, number>();
+  /** Players with a cast in flight — blocks duplicate/spammed fishing casts. */
+  private readonly activeFishingSocketIds = new Set<string>();
+  /** Per-map encounter tables (designer:section:encounters), keyed by the
+   * numeric Essentials map id as a string ("60"); refreshed by loadCatalogs. */
+  private cachedEncounterProfiles: Map<
+    string,
+    {
+      densities: { land?: number; cave?: number; water?: number };
+      tables: Array<{
+        method: string;
+        density?: number;
+        rows: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }>;
+      }>;
+    }
+  > | null = null;
   private readonly challenges = new Map<string, ChallengeRequest>();
   private readonly tradeRequests = new Map<string, TradeRequest>();
   private typeChart: TypeChart = buildTypeChart([]);
@@ -1770,6 +1787,120 @@ export default class BattleManager {
     };
   }
 
+  /** Normalizes designer:section:encounters items into the per-map cache.
+   * Malformed tables are logged instead of silently dropped. */
+  private buildEncounterProfileCache(items: DesignerSectionItem[]) {
+    const cache = new Map<
+      string,
+      {
+        densities: { land?: number; cave?: number; water?: number };
+        tables: Array<{
+          method: string;
+          density?: number;
+          rows: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }>;
+        }>;
+      }
+    >();
+    for (const item of items) {
+      const profile = (item as { encounterProfile?: unknown }).encounterProfile as
+        | {
+            mapId?: unknown;
+            tables?: unknown;
+            densities?: { land?: unknown; cave?: unknown; water?: unknown };
+          }
+        | undefined;
+      if (!profile || typeof profile.mapId !== "string" || !Array.isArray(profile.tables)) {
+        continue;
+      }
+      const numericId = Number.parseInt(profile.mapId, 10);
+      const key = Number.isFinite(numericId) ? String(numericId) : profile.mapId;
+      const tables: Array<{
+        method: string;
+        density?: number;
+        rows: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }>;
+      }> = [];
+      for (const table of profile.tables as Array<{
+        method?: unknown;
+        density?: unknown;
+        rows?: unknown;
+      }>) {
+        if (!table || typeof table.method !== "string" || !Array.isArray(table.rows)) {
+          console.warn(`Encounter table without method/rows on map ${profile.mapId} — skipped.`);
+          continue;
+        }
+        const rows = table.rows
+          .filter((row): row is { weight: number; pokemonId: string; minLevel: number; maxLevel: number } => {
+            const valid =
+              row &&
+              typeof (row as { pokemonId?: unknown }).pokemonId === "string" &&
+              Number.isFinite((row as { weight?: unknown }).weight) &&
+              ((row as { weight: number }).weight) > 0 &&
+              Number.isFinite((row as { minLevel?: unknown }).minLevel) &&
+              Number.isFinite((row as { maxLevel?: unknown }).maxLevel);
+            if (!valid) {
+              console.warn(
+                `Malformed ${table.method} encounter row on map ${profile.mapId} — skipped:`,
+                row
+              );
+            }
+            return Boolean(valid);
+          });
+        tables.push({
+          method: table.method,
+          density: typeof table.density === "number" ? table.density : undefined,
+          rows
+        });
+      }
+      const densities = profile.densities ?? {};
+      cache.set(key, {
+        densities: {
+          land: typeof densities.land === "number" ? densities.land : undefined,
+          cave: typeof densities.cave === "number" ? densities.cave : undefined,
+          water: typeof densities.water === "number" ? densities.water : undefined
+        },
+        tables
+      });
+    }
+    return cache;
+  }
+
+  /** "map-essentials-060" -> "60" (the encounter cache key); null for
+   * non-imported maps, which have no Essentials encounter data. */
+  private encounterKeyForMapId(mapId: string): string | null {
+    const match = /^map-essentials-0*(\d+)$/.exec(mapId);
+    return match ? String(Number.parseInt(match[1], 10)) : null;
+  }
+
+  /** The map's encounter table for a specific Essentials method ("Water",
+   * "OldRod", ...). Rate falls back to the matching PBS density column. */
+  private getEncounterTableForMap(
+    mapId: string,
+    method: string
+  ): { encounterRate: number; rows: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }> } | null {
+    if (!this.cachedEncounterProfiles) {
+      // Warm the cache for the next step; this one just misses.
+      void this.loadCatalogs().catch(() => undefined);
+      return null;
+    }
+    const key = this.encounterKeyForMapId(mapId);
+    const profile = key ? this.cachedEncounterProfiles.get(key) : undefined;
+    if (!profile) {
+      return null;
+    }
+    const wanted = method.toLowerCase();
+    const table = profile.tables.find((candidate) => candidate.method.toLowerCase() === wanted);
+    if (!table || table.rows.length === 0) {
+      return null;
+    }
+    const densityFallback =
+      wanted === "land"
+        ? profile.densities.land
+        : wanted === "cave"
+          ? profile.densities.cave
+          : profile.densities.water;
+    return { encounterRate: table.density ?? densityFallback ?? 10, rows: table.rows };
+  }
+
   private isCellBlockedForPlayer(player: Player, cell: { x: number; y: number }, cellSize: number) {
     return this.world.isRectBlockedForPlayer(
       player,
@@ -1782,8 +1913,9 @@ export default class BattleManager {
 
   /**
    * Fishing: casts at the water tile the player faces. Uses a fishing-spot
-   * placement when one is in front (rod-tier gated), otherwise falls back to
-   * the map's grass encounter table when facing a blocked/water tile.
+   * placement when one is in front (rod-tier gated), otherwise the map's
+   * per-rod Essentials encounter table (OldRod/GoodRod/SuperRod). Tables stay
+   * strictly per-method — there is no fallback into the Land pool.
    */
   private async useFishingRod(
     player: Player,
@@ -1792,41 +1924,65 @@ export default class BattleManager {
     item: InventoryItem
   ): Promise<UseInventoryItemResult> {
     if (!this.partyCanBattle(user)) {
-      return { ok: false, message: "Your Venomon are in no condition to battle." };
+      return { ok: false, message: "Tus Venomon no están en condiciones de luchar." };
     }
+    if (this.isPlayerBattling(player.socketId)) {
+      return { ok: false, message: "No puedes pescar ahora." };
+    }
+    // Acquire the cast lock SYNCHRONOUSLY (before any await) so two rapid
+    // casts can never both pass the guard and open two encounters.
+    if (this.activeFishingSocketIds.has(player.socketId)) {
+      return { ok: false, message: "Ya estás pescando." };
+    }
+    this.activeFishingSocketIds.add(player.socketId);
+    try {
+      await this.loadCatalogs();
 
-    const snapshot = this.world.getPlayableMapsState();
-    const map = snapshot?.items.find((candidate) => candidate.id === player.currentMapId);
-    const editorData = snapshot?.editorDataByMapId[player.currentMapId];
-    const cellSize = map?.playableMapConfig?.cellSize ?? 32;
-    const facing = player.getFacingCell(cellSize);
-    const rodOrder: Record<FishingRodTier, number> = { old: 0, good: 1, super: 2 };
+      const snapshot = this.world.getPlayableMapsState();
+      const map = snapshot?.items.find((candidate) => candidate.id === player.currentMapId);
+      const editorData = snapshot?.editorDataByMapId[player.currentMapId];
+      const cellSize = map?.playableMapConfig?.cellSize ?? 32;
+      const facing = player.getFacingCell(cellSize);
+      const rodOrder: Record<FishingRodTier, number> = { old: 0, good: 1, super: 2 };
 
-    const spot = (editorData?.fishingSpots ?? []).find(
-      (candidate) => candidate.x === facing.x && candidate.y === facing.y
-    );
-    if (spot) {
-      if (spot.rod && rodOrder[tier] < rodOrder[spot.rod]) {
-        return { ok: false, message: `The ${item.name} isn't strong enough to fish here.` };
+      const spot = (editorData?.fishingSpots ?? []).find(
+        (candidate) => candidate.x === facing.x && candidate.y === facing.y
+      );
+      const facingTag = this.world.getTerrainTagAtCell(player.currentMapId, facing.x, facing.y);
+      if (!spot && !isSurfableWaterTag(facingTag)) {
+        // Decorative/edge water carries no water terrain tag — not fishable.
+        return { ok: false, message: "Aquí no se puede pescar. Mira hacia el agua." };
       }
-      return this.castFishing(
+      if (spot) {
+        if (spot.rod && rodOrder[tier] < rodOrder[spot.rod]) {
+          return { ok: false, message: `La ${item.name} no es lo bastante buena para pescar aquí.` };
+        }
+        return await this.castFishing(
+          player,
+          { pokemonIds: spot.pokemonIds, minLevel: spot.minLevel, maxLevel: spot.maxLevel, encounterRows: spot.encounterRows },
+          tier,
+          item
+        );
+      }
+
+      const rodMethod: Record<FishingRodTier, string> = {
+        old: "OldRod",
+        good: "GoodRod",
+        super: "SuperRod"
+      };
+      const table = this.getEncounterTableForMap(player.currentMapId, rodMethod[tier]);
+      if (!table) {
+        return { ok: false, message: "No parece haber Venomon en estas aguas." };
+      }
+      return await this.castFishing(
         player,
-        { pokemonIds: spot.pokemonIds, minLevel: spot.minLevel, maxLevel: spot.maxLevel, encounterRows: spot.encounterRows },
+        { pokemonIds: [], minLevel: 1, maxLevel: 100, encounterRows: table.rows },
         tier,
         item
       );
+    } finally {
+      this.activeFishingSocketIds.delete(player.socketId);
     }
-
-    // No fishing spot: allow casting only when facing a blocked tile (water /
-    // map edge), drawing from the map's grass table as a fallback pool.
-    if (!this.isCellBlockedForPlayer(player, facing, cellSize)) {
-      return { ok: false, message: "You can't fish here. Face the water first." };
-    }
-    const table = this.getMapEncounterTable(editorData);
-    if (!table) {
-      return { ok: true, message: "Not even a nibble..." };
-    }
-    return this.castFishing(player, table, tier, item);
   }
 
   private async castFishing(
@@ -1835,19 +1991,41 @@ export default class BattleManager {
     tier: FishingRodTier,
     item: InventoryItem
   ): Promise<UseInventoryItemResult> {
-    const biteChance = tier === "super" ? 0.9 : tier === "good" ? 0.7 : 0.5;
-    if (Math.random() > biteChance) {
-      return { ok: true, message: "Not even a nibble..." };
+    // The cast lock is held by useFishingRod (acquired synchronously there).
+    const cellSize = this.world.getMapCellSize(player.currentMapId);
+    const startCell = player.getCurrentCell(cellSize);
+    player.stopMovement();
+    // Public cast pose so nearby players see the rod come out; the encounter
+    // itself (species, rarity) stays private to the fisher.
+    this.world.emitToMap(player.currentMapId, "player:pose", {
+      playerId: player.socketId,
+      pose: "fishing"
+    });
+    try {
+      // Suspense window before the bite roll; doubles as a rate limiter.
+      await new Promise((resolve) => setTimeout(resolve, 1200 + Math.random() * 800));
+
+      // Things can change while the line is out.
+      if (this.isPlayerBattling(player.socketId)) {
+        return { ok: false, message: "No puedes pescar ahora." };
+      }
+      const nowCell = player.getCurrentCell(cellSize);
+      if (nowCell.x !== startCell.x || nowCell.y !== startCell.y) {
+        return { ok: false, message: "La pesca se interrumpió al moverte." };
+      }
+
+      const biteChance = tier === "super" ? 0.9 : tier === "good" ? 0.7 : 0.5;
+      if (Math.random() > biteChance) {
+        return { ok: true, message: "No pica nada..." };
+      }
+      await this.startWildBattle(player, table);
+      return { ok: true, message: `¡Oh! ¡Algo ha picado en la ${item.name}!`, battleStarted: true };
+    } finally {
+      this.world.emitToMap(player.currentMapId, "player:pose", {
+        playerId: player.socketId,
+        pose: null
+      });
     }
-    const levelCap: Record<FishingRodTier, number> = { old: 15, good: 30, super: 60 };
-    const gated = {
-      pokemonIds: table.pokemonIds,
-      minLevel: table.minLevel,
-      maxLevel: Math.max(table.minLevel, Math.min(table.maxLevel, levelCap[tier])),
-      encounterRows: table.encounterRows
-    };
-    await this.startWildBattle(player, gated);
-    return { ok: true, message: `Oh! A bite! Something's on the ${item.name}!`, battleStarted: true };
   }
 
   /**
@@ -1856,20 +2034,9 @@ export default class BattleManager {
    * and reuses the standard fishing cast (spot lookup / grass fallback /
    * bite-chance). The wild battle, if any, arrives over `battle:state`.
    */
-  public async fishAtCell(
-    userId: number,
-    player: Player,
-    target: { x: number; y: number }
-  ): Promise<UseInventoryItemResult> {
-    const user = await this.auth.getUserForBattle(userId);
-    if (!user) {
-      return { ok: false, message: "You can't fish right now." };
-    }
-    // Ensure item definitions are cached so essentialsId lookups resolve.
-    await this.loadCatalogs();
-
-    const rodOrder: Record<FishingRodTier, number> = { old: 0, good: 1, super: 2 };
-    let bestRod: { item: InventoryItem; tier: FishingRodTier } | null = null;
+  /** Every fishing rod the user owns (validated against the item catalog). */
+  public listOwnedFishingRods(user: AuthenticatedUser) {
+    const rods: Array<{ item: InventoryItem; tier: FishingRodTier }> = [];
     for (const inv of user.inventory) {
       if (inv.quantity <= 0) {
         continue;
@@ -1878,27 +2045,157 @@ export default class BattleManager {
       const tier = definition
         ? FISHING_ROD_TIERS[(definition.essentialsId ?? "").toUpperCase()]
         : undefined;
-      if (!tier) {
-        continue;
-      }
-      if (!bestRod || rodOrder[tier] > rodOrder[bestRod.tier]) {
-        bestRod = { item: inv, tier };
+      if (tier) {
+        rods.push({ item: inv, tier });
       }
     }
-    if (!bestRod) {
-      return { ok: false, message: "You don't have a fishing rod." };
+    return rods;
+  }
+
+  public async fishAtCell(
+    userId: number,
+    player: Player,
+    target: { x: number; y: number },
+    rodItemId?: string
+  ): Promise<UseInventoryItemResult> {
+    const user = await this.auth.getUserForBattle(userId);
+    if (!user) {
+      return { ok: false, message: "No puedes pescar ahora." };
+    }
+    if (this.isPlayerBattling(player.socketId) || this.activeFishingSocketIds.has(player.socketId)) {
+      return { ok: false, message: "No puedes pescar ahora." };
+    }
+    // Ensure item definitions are cached so essentialsId lookups resolve.
+    await this.loadCatalogs();
+
+    const rodOrder: Record<FishingRodTier, number> = { old: 0, good: 1, super: 2 };
+    const ownedRods = this.listOwnedFishingRods(user);
+    if (ownedRods.length === 0) {
+      return { ok: false, message: "Necesitas una caña de pescar." };
+    }
+    let rod: { item: InventoryItem; tier: FishingRodTier } | null = null;
+    if (typeof rodItemId === "string" && rodItemId.length > 0) {
+      // Explicit rod choice: it must be one the user actually owns — a forged
+      // or stale item id is rejected instead of silently swapped.
+      rod = ownedRods.find((candidate) => candidate.item.id === rodItemId) ?? null;
+      if (!rod) {
+        return { ok: false, message: "No tienes esa caña de pescar." };
+      }
+    } else {
+      for (const candidate of ownedRods) {
+        if (!rod || rodOrder[candidate.tier] > rodOrder[rod.tier]) {
+          rod = candidate;
+        }
+      }
+    }
+    if (!rod) {
+      return { ok: false, message: "Necesitas una caña de pescar." };
     }
 
     const cellSize = this.world.getMapCellSize(player.currentMapId);
     const current = player.getCurrentCell(cellSize);
     const distance = Math.abs(current.x - target.x) + Math.abs(current.y - target.y);
     if (distance !== 1) {
-      return { ok: false, message: "Get closer to the water to fish." };
+      return { ok: false, message: "Acércate al agua para pescar." };
     }
 
     // Face the tapped tile, then run the standard facing-based cast.
     player.faceCell(target, cellSize);
-    return this.useFishingRod(player, user, bestRod.tier, bestRod.item);
+    return this.useFishingRod(player, user, rod.tier, rod.item);
+  }
+
+  /**
+   * Availability of the water context-menu actions for a targeted cell. This
+   * only drives which menu entries light up — every action re-validates on
+   * execution, so a stale/forged menu state can never grant anything.
+   */
+  public async getWaterActionsForCell(
+    userId: number,
+    player: Player,
+    target: { x: number; y: number }
+  ): Promise<{
+    fish: {
+      available: boolean;
+      reason?: string;
+      rods: Array<{ itemId: string; name: string; tier: FishingRodTier }>;
+    };
+    surf: { available: boolean; reason?: string };
+    dive: { available: boolean; reason?: string };
+  }> {
+    await this.loadCatalogs();
+    const user = await this.auth.getUserForBattle(userId);
+
+    const cellSize = this.world.getMapCellSize(player.currentMapId);
+    const current = player.getCurrentCell(cellSize);
+    const distance = Math.abs(current.x - target.x) + Math.abs(current.y - target.y);
+    const targetTag = this.world.getTerrainTagAtCell(player.currentMapId, target.x, target.y);
+    const targetIsWater = isSurfableWaterTag(targetTag);
+    const editorData = this.world.getPlayableMapsState()?.editorDataByMapId[player.currentMapId];
+    const spot = (editorData?.fishingSpots ?? []).find(
+      (candidate) => candidate.x === target.x && candidate.y === target.y
+    );
+
+    const rodMethod: Record<FishingRodTier, string> = {
+      old: "OldRod",
+      good: "GoodRod",
+      super: "SuperRod"
+    };
+    const ownedRods = user ? this.listOwnedFishingRods(user) : [];
+    const rods = ownedRods.map((rod) => ({
+      itemId: rod.item.id,
+      name: rod.item.name,
+      tier: rod.tier
+    }));
+
+    let fish: { available: boolean; reason?: string };
+    if (!targetIsWater && !spot) {
+      fish = { available: false, reason: "Aquí no se puede pescar." };
+    } else if (distance !== 1) {
+      fish = { available: false, reason: "Acércate al agua para pescar." };
+    } else if (rods.length === 0) {
+      fish = { available: false, reason: "Necesitas una caña de pescar." };
+    } else if (
+      !spot &&
+      !ownedRods.some((rod) => this.getEncounterTableForMap(player.currentMapId, rodMethod[rod.tier]))
+    ) {
+      fish = { available: false, reason: "No parece haber Venomon en estas aguas." };
+    } else {
+      fish = { available: true };
+    }
+
+    let surf: { available: boolean; reason?: string };
+    if (player.isSurfing) {
+      surf = { available: false, reason: "Ya estás surfeando." };
+    } else if (!targetIsWater) {
+      surf = { available: false, reason: "No hay agua por la que surfear." };
+    } else if (distance !== 1) {
+      surf = { available: false, reason: "No puedes surfear desde esta posición." };
+    } else if (!(await this.partyKnowsFieldSkill(userId, "surf"))) {
+      surf = { available: false, reason: "Ningún Venomon de tu equipo conoce Surf." };
+    } else {
+      surf = { available: true };
+    }
+
+    let dive: { available: boolean; reason?: string };
+    const pair = resolveDivePair(player.currentMapId);
+    if (!pair) {
+      dive = { available: false, reason: "No puedes bucear aquí." };
+    } else if (!(await this.partyKnowsFieldSkill(userId, "dive"))) {
+      dive = { available: false, reason: "Ningún Venomon de tu equipo conoce Buceo." };
+    } else if (pair.role === "surface") {
+      if (!player.isSurfing || !isDeepWaterTag(this.world.getPlayerTerrainTag(player))) {
+        dive = {
+          available: false,
+          reason: "Debes estar surfeando sobre aguas profundas para bucear."
+        };
+      } else {
+        dive = { available: true };
+      }
+    } else {
+      dive = { available: true }; // underwater: resurface
+    }
+
+    return { fish: { ...fish, rods }, surf, dive };
   }
 
   /**
@@ -2071,8 +2368,11 @@ export default class BattleManager {
       return false;
     }
     const target = moveName.trim().toLowerCase();
-    return user.pokemonParty.some((pokemon) =>
-      (pokemon.moves ?? []).some((move) => move.trim().toLowerCase() === target)
+    // Eggs can't use field moves even if the stored summary carries moves.
+    return user.pokemonParty.some(
+      (pokemon) =>
+        !pokemon.isEgg &&
+        (pokemon.moves ?? []).some((move) => move.trim().toLowerCase() === target)
     );
   }
 
@@ -2817,19 +3117,21 @@ export default class BattleManager {
     if (player.userId === null || this.isPlayerBattling(player.socketId)) {
       return;
     }
+    if (this.activeFishingSocketIds.has(player.socketId)) {
+      return; // a cast is in flight — no step encounters until it resolves
+    }
 
-    const grass = this.getGrassCellForPlayer(player);
-    if (!grass) {
+    const step = this.getStepEncounterForPlayer(player);
+    if (!step) {
       this.lastGrassCellByPlayerId.delete(player.socketId);
       return;
     }
 
-    const grassKey = `${player.currentMapId}:${grass.x}:${grass.y}`;
-    if (this.lastGrassCellByPlayerId.get(player.socketId) === grassKey) {
+    if (this.lastGrassCellByPlayerId.get(player.socketId) === step.key) {
       return;
     }
 
-    this.lastGrassCellByPlayerId.set(player.socketId, grassKey);
+    this.lastGrassCellByPlayerId.set(player.socketId, step.key);
 
     // Repel: each new grass tile spends one step; encounters are suppressed
     // until the charge runs out.
@@ -2845,7 +3147,7 @@ export default class BattleManager {
       return;
     }
 
-    if (Math.random() * 100 >= grass.encounterRate) {
+    if (Math.random() * 100 >= step.encounterRate) {
       return;
     }
 
@@ -2854,7 +3156,7 @@ export default class BattleManager {
     }
 
     this.pendingStepChecks.add(player.socketId);
-    void this.startWildBattle(player, grass)
+    void this.startWildBattle(player, step.table)
       .catch((error) => {
         console.error("Unable to start wild battle:", error);
         this.emitToPlayer(player, "battle:error", { message: "Unable to start a wild battle." });
@@ -2862,6 +3164,66 @@ export default class BattleManager {
       .finally(() => {
         this.pendingStepChecks.delete(player.socketId);
       });
+  }
+
+  /**
+   * Which encounter pool (if any) the player's current cell rolls against.
+   * Kept strictly per traversal mode so the pools never bleed into each other:
+   * - surfing        -> the map's Essentials "Water" table (water density)
+   * - walking (land) -> derived tall-grass cells (Land table)
+   * - underwater map -> the underwater map's own "Land" table, the old
+   *   Essentials convention for underwater encounters (their floors have no
+   *   grass terrain tag, so no grass cells were derived there)
+   */
+  private getStepEncounterForPlayer(player: Player): {
+    key: string;
+    encounterRate: number;
+    table: {
+      pokemonIds: string[];
+      minLevel: number;
+      maxLevel: number;
+      encounterRows?: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }>;
+    };
+  } | null {
+    const cellSize = this.world.getMapCellSize(player.currentMapId);
+    const cellX = Math.floor((player.x + player.width / 2) / cellSize);
+    const cellY = Math.floor((player.y + player.height / 2) / cellSize);
+
+    if (player.isSurfing) {
+      // world.handlePlayerStep dismounts before this runs, so a surfing
+      // player is always on a surfable water tag here.
+      const table = this.getEncounterTableForMap(player.currentMapId, "Water");
+      if (!table) {
+        return null;
+      }
+      return {
+        key: `water:${player.currentMapId}:${cellX}:${cellY}`,
+        encounterRate: table.encounterRate,
+        table: { pokemonIds: [], minLevel: 1, maxLevel: 100, encounterRows: table.rows }
+      };
+    }
+
+    const grass = this.getGrassCellForPlayer(player);
+    if (grass) {
+      return {
+        key: `grass:${player.currentMapId}:${grass.x}:${grass.y}`,
+        encounterRate: grass.encounterRate,
+        table: grass
+      };
+    }
+
+    if (resolveDivePair(player.currentMapId)?.role === "underwater") {
+      const table = this.getEncounterTableForMap(player.currentMapId, "Land");
+      if (table) {
+        return {
+          key: `underwater:${player.currentMapId}:${cellX}:${cellY}`,
+          encounterRate: table.encounterRate,
+          table: { pokemonIds: [], minLevel: 1, maxLevel: 100, encounterRows: table.rows }
+        };
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -9225,14 +9587,17 @@ export default class BattleManager {
   }
 
   private async loadCatalogs() {
-    const [pokemonPayload, skillsPayload, itemsPayload, levelingCurvePayload, npcsPayload, typesPayload] = await Promise.all([
+    const [pokemonPayload, skillsPayload, itemsPayload, levelingCurvePayload, npcsPayload, typesPayload, encountersPayload] = await Promise.all([
       this.designerSectionStore.read("pokemons"),
       this.designerSectionStore.read("skills"),
       this.designerSectionStore.read("items"),
       this.designerSectionStore.read("levelingCurve"),
       this.designerSectionStore.read("npcs"),
-      this.designerSectionStore.read("types")
+      this.designerSectionStore.read("types"),
+      this.designerSectionStore.read("encounters")
     ]);
+
+    this.cachedEncounterProfiles = this.buildEncounterProfileCache(encountersPayload?.state.items ?? []);
 
     this.typeChart = buildTypeChart(typesPayload?.state.items ?? []);
     const skillsById = new Map<string, SkillDefinition>();

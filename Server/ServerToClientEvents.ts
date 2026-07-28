@@ -94,6 +94,9 @@ interface PlayerData {
   profileImage?: string;
   description?: string;
   characterSkinId?: string;
+  /** True when the player is currently surfing (drives the mount sprite for
+   * every viewer, including reconnect/visibility snapshots). */
+  isSurfing?: boolean;
 }
 
 interface ProjectilData {
@@ -212,8 +215,27 @@ export default interface ServerToClientEvents {
   // A field skill (Surf/Dive/Strength/Waterfall/Cut/Rock Smash) could not be
   // used — the client shows the message near the player.
   "player:field-skill-error": (data: { skill: string; message: string }) => void;
-  // Surf started/ended for the local player (drives the surf sprite + prompt).
-  "player:surf-state": (data: { surfing: boolean }) => void;
+  // Surf started/ended. Sent to the surfer's own sockets AND broadcast to the
+  // map (playerId identifies whose mount sprite to toggle).
+  "player:surf-state": (data: { surfing: boolean; playerId?: string }) => void;
+  // Public overworld pose of a player on the map (fishing cast); carries no
+  // private data — just what nearby clients need to render the animation.
+  "player:pose": (data: { playerId: string; pose: "fishing" | null }) => void;
+  // Answer to field:actions — availability (+ reasons) of the water context
+  // menu entries for the queried cell. Advisory only; execution re-validates.
+  "field:actions-result": (data: {
+    x: number;
+    y: number;
+    actions: {
+      fish: {
+        available: boolean;
+        reason?: string;
+        rods: Array<{ itemId: string; name: string; tier: "old" | "good" | "super" }>;
+      };
+      surf: { available: boolean; reason?: string };
+      dive: { available: boolean; reason?: string };
+    };
+  }) => void;
   // A Strength boulder moved to a new cell (all clients on the map re-render it).
   "world:boulder-moved": (data: { mapId: string; boulderId: string; x: number; y: number }) => void;
   // Teaching an MO/MT to a Venomon that already knows four moves: the client

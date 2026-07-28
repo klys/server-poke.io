@@ -87,15 +87,21 @@ export default interface ClientToServerEvents {
   "player:teleport": (data: { mapId: string; x: number; y: number }) => void;
   "player:fly": (data: { mapId: string }) => void;
   // Field skills used out of battle by facing/standing on the relevant terrain.
-  "player:surf": () => void;
+  // player:surf optionally carries an adjacent water cell (from the water
+  // context menu) to face before mounting; the server re-validates everything.
+  "player:surf": (data?: { x?: number; y?: number }) => void;
   "player:dive": () => void;
   "player:waterfall": () => void;
   "player:strength-push": () => void;
   // Action button pressed with nothing to interact with: the server resolves
   // whichever field skill (Surf/Dive/Waterfall/Strength) the terrain allows.
   "player:field-interact": () => void;
-  // Click-to-fish: cast at an adjacent water tile (cell coords) the player tapped.
-  "fishing:cast": (data: { x: number; y: number }) => void;
+  // Water context menu: which actions (Fish/Surf/Dive) apply to this adjacent
+  // cell right now? Answered with field:actions-result; purely advisory.
+  "field:actions": (data: { x: number; y: number }) => void;
+  // Click-to-fish: cast at an adjacent water tile (cell coords) the player
+  // tapped. rodItemId (optional) picks a specific owned rod; default best.
+  "fishing:cast": (data: { x: number; y: number; rodItemId?: string }) => void;
   move: (data: { x: number; y: number }) => void;
   stopMove: () => void;
   shotProjectil: (data: { mouse_x: number; mouse_y: number }) => void;

@@ -2190,12 +2190,23 @@ function createConnectionHandler(
       void eventRuntime.runAutorunForMap(socket.data.userId);
     });
 
-    socket.on("player:surf", async () => {
+    socket.on("player:surf", async (data) => {
       const player = world.getPlayerBySocket(socket.id);
       if (!player || player.inBattle || typeof socket.data.userId !== "number") {
         return;
       }
-      const result = await world.beginSurf(player, socket.data.userId);
+      if (eventRuntime.isRunning(socket.data.userId)) {
+        return; // no field skills mid-dialogue/cutscene
+      }
+      const target =
+        data &&
+        typeof data.x === "number" &&
+        typeof data.y === "number" &&
+        Number.isFinite(data.x) &&
+        Number.isFinite(data.y)
+          ? { x: Math.floor(data.x), y: Math.floor(data.y) }
+          : undefined;
+      const result = await world.beginSurf(player, socket.data.userId, target);
       if (!result.ok) {
         socket.emit("player:field-skill-error", { skill: "surf", message: result.message ?? "" });
       }
@@ -2292,12 +2303,52 @@ function createConnectionHandler(
       ) {
         return;
       }
-      const result = await battleManager.fishAtCell(socket.data.userId, player, {
-        x: Math.floor(data.x),
-        y: Math.floor(data.y)
-      });
+      if (player.inBattle || eventRuntime.isRunning(socket.data.userId)) {
+        socket.emit("fishing:result", { status: "error", message: "No puedes pescar ahora." });
+        return;
+      }
+      const rodItemId = typeof data.rodItemId === "string" ? data.rodItemId : undefined;
+      const result = await battleManager.fishAtCell(
+        socket.data.userId,
+        player,
+        {
+          x: Math.floor(data.x),
+          y: Math.floor(data.y)
+        },
+        rodItemId
+      );
       const status = !result.ok ? "error" : result.battleStarted ? "bite" : "no-bite";
       socket.emit("fishing:result", { status, message: result.message });
+    });
+
+    // Water context menu: report which actions apply to the tapped cell.
+    socket.on("field:actions", async (data) => {
+      const player = world.getPlayerBySocket(socket.id);
+      if (
+        !player ||
+        typeof socket.data.userId !== "number" ||
+        !data ||
+        typeof data.x !== "number" ||
+        typeof data.y !== "number" ||
+        !Number.isFinite(data.x) ||
+        !Number.isFinite(data.y)
+      ) {
+        return;
+      }
+      if (player.inBattle || eventRuntime.isRunning(socket.data.userId)) {
+        return;
+      }
+      const target = { x: Math.floor(data.x), y: Math.floor(data.y) };
+      try {
+        const actions = await battleManager.getWaterActionsForCell(
+          socket.data.userId,
+          player,
+          target
+        );
+        socket.emit("field:actions-result", { x: target.x, y: target.y, actions });
+      } catch (error) {
+        console.error("Unable to resolve field actions:", error);
+      }
     });
 
     socket.on("shotProjectil", (data) => {
@@ -2945,7 +2996,8 @@ function createConnectionHandler(
           await auth.savePlayerLocation(socket.data.userId, {
             mapId: player.currentMapId,
             x: player.x,
-            y: player.y
+            y: player.y,
+            surfing: player.isSurfing
           });
         } catch (error) {
           console.error("Unable to save player location on disconnect:", error);
@@ -3041,7 +3093,8 @@ export default function registerSocketHandlers(
       .savePlayerLocation(player.userId, {
         mapId: player.currentMapId,
         x: player.x,
-        y: player.y
+        y: player.y,
+        surfing: player.isSurfing
       })
       .catch((error) => {
         console.error("Unable to save player location on transfer:", error);

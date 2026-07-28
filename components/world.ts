@@ -349,15 +349,43 @@ export default class World {
         });
     }
 
-    /** Tell the player's client whether Surf is active (sprite / prompt state). */
-    private emitSurfState(player: Player) {
+    /** Tell the player's own client AND everyone on their map whether Surf is
+     * active. The self emit keeps the legacy `{surfing}` shape; the map
+     * broadcast carries `playerId` so other clients can swap the mount sprite
+     * for remote players. */
+    broadcastSurfState(player: Player) {
         player.socketConnections.forEach((socketId) => {
-            World.socketServer.to(socketId).emit("player:surf-state", { surfing: player.isSurfing });
+            World.socketServer
+                .to(socketId)
+                .emit("player:surf-state", { surfing: player.isSurfing, playerId: player.socketId });
+        });
+        this.emitToMap(player.currentMapId, "player:surf-state", {
+            surfing: player.isSurfing,
+            playerId: player.socketId
         });
     }
 
-    /** Surf: from land facing water, mount the water and start surfing. */
-    async beginSurf(player: Player, userId: number): Promise<{ ok: boolean; message?: string }> {
+    /** Central surf-state transition: assign, persist, and notify all viewers.
+     * Every surf mount/dismount must go through here so reconnecting clients
+     * and nearby players always reconstruct the right traversal state. */
+    setSurfing(player: Player, surfing: boolean) {
+        if (player.isSurfing === surfing) {
+            return;
+        }
+        player.isSurfing = surfing;
+        this.persistPlayerLocation(player);
+        this.broadcastSurfState(player);
+    }
+
+    /** Surf: from land facing water, mount the water and start surfing.
+     * `target` (optional, from the water context menu) is an adjacent cell to
+     * face first — never trusted beyond "adjacent"; the terrain check still
+     * runs on whatever cell the player ends up facing. */
+    async beginSurf(
+        player: Player,
+        userId: number,
+        target?: { x: number; y: number }
+    ): Promise<{ ok: boolean; message?: string }> {
         if (player.isSurfing) {
             return { ok: false, message: "Ya estás surfeando." };
         }
@@ -368,13 +396,21 @@ export default class World {
             return { ok: false, message: "Ningún Venomon de tu equipo conoce Surf." };
         }
         const cellSize = this.getMapCellSize(player.currentMapId);
+        if (target) {
+            const current = player.getCurrentCell(cellSize);
+            const distance = Math.abs(current.x - target.x) + Math.abs(current.y - target.y);
+            if (distance !== 1) {
+                return { ok: false, message: "No puedes surfear desde esta posición." };
+            }
+            player.faceCell(target, cellSize);
+        }
         const facing = player.getFacingCell(cellSize);
         if (!isSurfableWaterTag(this.getTerrainTagAtCell(player.currentMapId, facing.x, facing.y))) {
             return { ok: false, message: "No hay agua por la que surfear." };
         }
         player.isSurfing = true;
         this.forcePlayerToCell(player, player.currentMapId, facing.x, facing.y);
-        this.emitSurfState(player);
+        this.broadcastSurfState(player);
         return { ok: true };
     }
 
@@ -401,7 +437,7 @@ export default class World {
             player.isSurfing = true; // resurface onto the water, surfing
         }
         this.forcePlayerToCell(player, pair.pairedMapId, cell.x, cell.y);
-        this.emitSurfState(player);
+        this.broadcastSurfState(player);
         return { ok: true, mapChanged: true };
     }
 
@@ -436,7 +472,7 @@ export default class World {
         }
         player.isSurfing = true;
         this.forcePlayerToCell(player, player.currentMapId, cx, cy);
-        this.emitSurfState(player);
+        this.broadcastSurfState(player);
         return { ok: true };
     }
 
@@ -870,8 +906,7 @@ export default class World {
     handlePlayerStep(player: Player) {
         // Surf ends the moment the player steps back onto dry land.
         if (player.isSurfing && !isSurfableWaterTag(this.getPlayerTerrainTag(player))) {
-            player.isSurfing = false;
-            this.emitSurfState(player);
+            this.setSurfing(player, false);
         }
         this.battleManager?.handlePlayerStep(player);
         this.battleManager?.handleEggStep(player);
@@ -932,6 +967,33 @@ export default class World {
             x <= maxX &&
             y <= maxY &&
             !this.isPlayerPositionBlocked(mapId, x, y, playerWidth, playerHeight)
+        );
+    }
+
+    /** Like isOpenPlayerPosition but STATIC geometry only and surf-aware:
+     * while surfing, water-tagged solid cells count as open. Used by the
+     * per-tick out-of-bounds relocation so it doesn't snap surfing players
+     * back to shore (water is collision-solid by design). */
+    isOpenPositionForPlayer(player:Player, x:number, y:number) {
+        const mapBounds = this.getMapBounds(player.currentMapId);
+        const maxX = Math.max(0, mapBounds.width - player.width);
+        const maxY = Math.max(0, mapBounds.height - player.height);
+
+        return (
+            Number.isFinite(x) &&
+            Number.isFinite(y) &&
+            x >= 0 &&
+            y >= 0 &&
+            x <= maxX &&
+            y <= maxY &&
+            !this.isRectBlockedByCollisionGrid(
+                player.currentMapId,
+                x,
+                y,
+                player.width,
+                player.height,
+                player.isSurfing
+            )
         );
     }
 
@@ -1119,7 +1181,7 @@ export default class World {
 
     addPlayer(
         socketId:string,
-        spawnState?: { mapId?: string; x?: number; y?: number },
+        spawnState?: { mapId?: string; x?: number; y?: number; surfing?: boolean },
         userId?: number | null,
         trainerProfile?: {
             username?: string;
@@ -1160,7 +1222,19 @@ export default class World {
             typeof spawnState?.y === "number" && Number.isFinite(spawnState.y)
                 ? spawnState.y
                 : DEFAULT_PLAYER_Y;
-        const spawnPosition = this.resolveOpenPlayerPosition(mapId, unclampedX, unclampedY, 32, 32);
+        // Reconnecting while surfing: the saved cell is water (collision-solid),
+        // so the open-position search would silently relocate the player onto
+        // land. When the saved surf flag checks out against the terrain, keep
+        // the exact water cell and restore the surfing traversal state.
+        const cellSize = this.getMapCellSize(mapId);
+        const savedCellX = Math.floor((unclampedX + 16) / cellSize);
+        const savedCellY = Math.floor((unclampedY + 16) / cellSize);
+        const restoreSurf =
+            spawnState?.surfing === true &&
+            isSurfableWaterTag(this.getTerrainTagAtCell(mapId, savedCellX, savedCellY));
+        const spawnPosition = restoreSurf
+            ? this.clampPlayerPosition(mapId, unclampedX, unclampedY, 32, 32)
+            : this.resolveOpenPlayerPosition(mapId, unclampedX, unclampedY, 32, 32);
 
         const player = new Player(
             spawnPosition.x,
@@ -1172,6 +1246,7 @@ export default class World {
             typeof userId === "number" ? userId : null,
             trainerProfile
         );
+        player.isSurfing = restoreSurf;
 
         this.players.set(playerId, player);
         this.socketToPlayerId.set(socketId, playerId);
