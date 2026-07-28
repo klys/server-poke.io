@@ -72,6 +72,8 @@ Copy values from `.env.example` when setting up a local environment. Important v
 - `components/player.ts`: player state and movement/pathfinding logic
 - `components/projectil.ts`: projectile behavior
 - `components/gameMath.ts`: geometry and collision helpers
+- `components/TradeManager.ts` + `components/trade/`: player-to-player trading
+  (state machine, asset reservations, atomic Lua exchange, audit) — see `TRADING.md`
 - `Server/registerSocketHandlers.ts`: main Socket.IO event registration
 - `Server/*.ts`: typed Socket.IO event contracts
 - `emails/*.html`: templates used by `MailService`

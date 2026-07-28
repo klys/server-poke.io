@@ -278,7 +278,10 @@ async function bootstrap() {
   await auth.initialize();
   world.setSocketServer(io);
   await world.initializeGroundItems(groundItemStore);
-  registerSocketHandlers(io, world, auth, designerSectionStore, playableMapsStore, groundItemStore, mapAssetStore, pokecraftApi);
+  const { tradeManager } = registerSocketHandlers(io, world, auth, designerSectionStore, playableMapsStore, groundItemStore, redis, mapAssetStore, pokecraftApi);
+  // Trades never survive a restart: drop any player claims and asset
+  // reservations a previous run left behind before accepting connections.
+  await tradeManager.initialize();
 
   httpServer.listen(PORT, () => {
     console.log(`server-poke.io build ${GIT_SHA} started at ${STARTED_AT}`);

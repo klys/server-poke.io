@@ -981,6 +981,12 @@ export default class BattleManager {
   > | null = null;
   private readonly challenges = new Map<string, ChallengeRequest>();
   private readonly tradeRequests = new Map<string, TradeRequest>();
+  /**
+   * Set by registerSocketHandlers to TradeManager.isTrading. A battle would
+   * mutate HP/PP/held items on Venomon that a live trade has reserved, so no
+   * battle of any kind may start while the player is trading.
+   */
+  private tradeGuard: ((userId: number) => boolean) | null = null;
   private typeChart: TypeChart = buildTypeChart([]);
 
   constructor(
@@ -993,6 +999,15 @@ export default class BattleManager {
     this.world = world;
     this.auth = auth;
     this.designerSectionStore = designerSectionStore;
+  }
+
+  public setTradeGuard(guard: (userId: number) => boolean) {
+    this.tradeGuard = guard;
+  }
+
+  /** True when a live trade has this player's assets reserved. */
+  public isPlayerTrading(userId: number | null | undefined) {
+    return typeof userId === "number" && Boolean(this.tradeGuard?.(userId));
   }
 
   public isPlayerBattling(playerId: string) {
@@ -1751,6 +1766,9 @@ export default class BattleManager {
    * roll a chance to trigger a wild encounter drawn from the map's table.
    */
   public async tryRockSmashEncounter(userId: number, player: Player): Promise<void> {
+    if (this.isPlayerTrading(userId)) {
+      return;
+    }
     const user = await this.auth.getUserForBattle(userId);
     if (!user || !this.partyCanBattle(user)) {
       return;
@@ -3117,6 +3135,9 @@ export default class BattleManager {
     if (player.userId === null || this.isPlayerBattling(player.socketId)) {
       return;
     }
+    if (this.isPlayerTrading(player.userId)) {
+      return; // a wild encounter must not touch Venomon reserved by a trade
+    }
     if (this.activeFishingSocketIds.has(player.socketId)) {
       return; // a cast is in flight — no step encounters until it resolves
     }
@@ -3303,6 +3324,13 @@ export default class BattleManager {
       return;
     }
 
+    if (this.isPlayerTrading(challenger.userId) || this.isPlayerTrading(target.userId)) {
+      this.emitToSocket(socketId, "battle:error", {
+        message: "One of the trainers is in the middle of a trade."
+      });
+      return;
+    }
+
     const challengeId = crypto.randomUUID();
     const timeout = setTimeout(() => {
       this.challenges.delete(challengeId);
@@ -3346,6 +3374,14 @@ export default class BattleManager {
       this.emitToPlayer(challenger, "battle:challenge-declined", {
         challengeId: request.id,
         targetPlayerId: target.socketId
+      });
+      return;
+    }
+
+    // Either side may have entered a trade while the challenge sat pending.
+    if (this.isPlayerTrading(challenger.userId) || this.isPlayerTrading(target.userId)) {
+      this.emitToSocket(socketId, "battle:error", {
+        message: "One of the trainers is in the middle of a trade."
       });
       return;
     }

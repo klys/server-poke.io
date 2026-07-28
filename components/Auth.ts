@@ -1857,6 +1857,19 @@ export default class Auth {
         };
     }
 
+    /**
+     * Epoch ms of account creation, or 0 when unknown. Used by trading to flag
+     * (never block) brand-new accounts on the confirmation screen.
+     */
+    public async getAccountCreatedAtMs(userId:number):Promise<number> {
+        const raw = await this.redis.hGet(this.userKey(userId), "created_at");
+        if (typeof raw !== "string" || raw.length === 0) {
+            return 0;
+        }
+        const parsed = Date.parse(raw);
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+
     public async findSocialUserByUsername(username:string):Promise<SocialUserSummary | null> {
         const normalized = String(username ?? "").trim().toLowerCase();
         if (!normalized) {

@@ -1,3 +1,4 @@
+import type { RedisClientType } from "redis";
 import { type Server, type Socket } from "socket.io";
 import Auth, {
   type AuthenticatedUser,
@@ -23,6 +24,8 @@ import {
   resolvePlayableMapPortalDestination,
 } from "../components/PlayableMapsState";
 import SocialManager from "../components/SocialManager";
+import TradeManager from "../components/TradeManager";
+import { TradeError, type TradeMutationSource } from "../components/trade/tradeTypes";
 import World from "../components/world";
 import PokecraftApiClient, {
   PokecraftApiError,
@@ -571,6 +574,7 @@ function createConnectionHandler(
   battleManager:BattleManager,
   eventRuntime:EventRuntime,
   socialManager:SocialManager,
+  tradeManager:TradeManager,
   mapAssetStore?:MapAssetStore,
   pokecraftApi?:PokecraftApiClient
 ) {
@@ -582,6 +586,32 @@ function createConnectionHandler(
     void hydrateSocketAuth(socket, auth).catch((error) => {
       console.error("Unable to hydrate socket auth state:", error);
     });
+
+    /**
+     * Asset-reservation gate. Anything that could change an item, a Venomon or
+     * the player's money must pass through here first: if a live trade has the
+     * asset reserved, the mutation is refused instead of racing the trade.
+     */
+    const guardTradedAssets = (
+      source: TradeMutationSource,
+      target: { itemIds?: string[]; venomonIds?: string[]; currency?: boolean; anyVenomon?: boolean }
+    ) => {
+      if (typeof socket.data.userId !== "number") {
+        return true;
+      }
+      try {
+        tradeManager.assertMutationAllowed(socket.data.userId, source, target);
+        return true;
+      } catch (error) {
+        socket.emit("auth:error", {
+          message:
+            error instanceof TradeError
+              ? error.message
+              : "That is part of an active trade right now."
+        });
+        return false;
+      }
+    };
 
     socket.on("auth:register", async (data) => {
       try {
@@ -892,6 +922,8 @@ function createConnectionHandler(
           socket.emit("auth:error", { message: "Choose a Pokemon to name." });
           return;
         }
+
+        if (!guardTradedAssets("pokemon:name", { venomonIds: [data.pokemonId] })) return;
 
         const result = await auth.namePokemon(readSocketToken(socket), data.pokemonId, data.nickname);
         if (!("session" in result)) {
@@ -2068,6 +2100,8 @@ function createConnectionHandler(
           broadcastAdminPresence(io, world);
           // Push their friends snapshot and tell online friends they arrived.
           void socialManager.handlePlayerJoined(socket.data.userId);
+          // Re-entering the world resumes a trade paused by a disconnect.
+          tradeManager.handleUserReconnected(socket.data.userId);
         }
       }
     });
@@ -2363,12 +2397,20 @@ function createConnectionHandler(
       battleManager.respondToChallenge(socket.id, data);
     });
 
-    socket.on("battle:trade-request", (data) => {
-      battleManager.requestTrade(socket.id, data);
+    // Legacy trade entry points (nearby-trainer menu, friends list) from
+    // clients built before the `trade:*` contract existed. They now open a
+    // real trade session instead of the old no-op handshake.
+    socket.on("battle:trade-request", async (data) => {
+      await tradeManager.requestTrade(socket, { targetPlayerId: data?.targetPlayerId });
     });
 
-    socket.on("battle:trade-response", (data) => {
-      battleManager.respondToTrade(socket.id, data);
+    socket.on("battle:trade-response", async (data) => {
+      const tradeId = String((data as { requestId?: string })?.requestId ?? "");
+      if (data?.accepted) {
+        await tradeManager.acceptRequest(socket, { tradeId });
+        return;
+      }
+      await tradeManager.declineRequest(socket, { tradeId });
     });
 
     // Paid skin change ($300). The free `auth:update-profile` path only sets a
@@ -2489,6 +2531,8 @@ function createConnectionHandler(
         return;
       }
 
+      if (!guardTradedAssets("battle:start", { venomonIds: [data?.pokemonId] })) return;
+
       const result = await battleManager.resolveMoveLearn(
         socket.data.userId,
         data.pokemonId,
@@ -2511,6 +2555,11 @@ function createConnectionHandler(
         return;
       }
 
+      if (!guardTradedAssets("inventory:hold-item", {
+        itemIds: [data?.itemId],
+        venomonIds: [data?.pokemonId]
+      })) return;
+
       const result = await battleManager.setHeldItem(
         socket.data.userId,
         data.pokemonId,
@@ -2531,6 +2580,8 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Log in to manage moves." });
         return;
       }
+
+      if (!guardTradedAssets("pokemon:learn-move", { venomonIds: [data?.pokemonId] })) return;
 
       const result = await battleManager.learnAvailableMove(
         socket.data.userId,
@@ -2554,6 +2605,8 @@ function createConnectionHandler(
         return;
       }
 
+      if (!guardTradedAssets("pokemon:forget-move", { venomonIds: [data?.pokemonId] })) return;
+
       const result = await battleManager.forgetMove(
         socket.data.userId,
         data.pokemonId,
@@ -2574,6 +2627,10 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Log in to reorder your party." });
         return;
       }
+
+      if (!guardTradedAssets("pokemon:reorder", {
+        venomonIds: Array.isArray(data?.order) ? data.order : []
+      })) return;
 
       const result = await battleManager.reorderPokemonParty(
         socket.data.userId,
@@ -2599,6 +2656,8 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Select a Pokemon to deposit." });
         return;
       }
+
+      if (!guardTradedAssets("pokemon:box-deposit", { venomonIds: [data.pokemonId] })) return;
 
       const result = await battleManager.depositPokemonToBox(
         socket.data.userId,
@@ -2629,6 +2688,8 @@ function createConnectionHandler(
         return;
       }
 
+      if (!guardTradedAssets("pokemon:box-withdraw", { venomonIds: [data.pokemonId] })) return;
+
       const result = await battleManager.withdrawPokemonFromBox(
         socket.data.userId,
         data.pokemonId,
@@ -2650,6 +2711,8 @@ function createConnectionHandler(
         return;
       }
 
+      if (!guardTradedAssets("inventory:take-held-item", { venomonIds: [data?.pokemonId] })) return;
+
       const result = await battleManager.takeHeldItem(socket.data.userId, data.pokemonId);
 
       if (!result.ok) {
@@ -2666,6 +2729,11 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Log in to use items." });
         return;
       }
+
+      if (!guardTradedAssets("inventory:use-item", {
+        itemIds: [data?.itemId],
+        venomonIds: data?.targetPokemonId ? [data.targetPokemonId] : []
+      })) return;
 
       const result = await battleManager.useInventoryItem(socket.data.userId, data.itemId, {
         targetPokemonId: data.targetPokemonId,
@@ -2692,6 +2760,11 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Log in to teach moves." });
         return;
       }
+
+      if (!guardTradedAssets("inventory:teach-move", {
+        itemIds: [data?.itemId],
+        venomonIds: [data?.targetPokemonId]
+      })) return;
 
       const result = await battleManager.teachInventoryMove(
         socket.data.userId,
@@ -2724,6 +2797,8 @@ function createConnectionHandler(
         return;
       }
 
+      if (!guardTradedAssets("inventory:throw-away", { itemIds: [data?.itemId] })) return;
+
       const player = world.getPlayerBySocket(socket.id);
       if (!player) {
         socket.emit("auth:error", { message: "Enter the world before throwing away items." });
@@ -2752,6 +2827,8 @@ function createConnectionHandler(
         return;
       }
 
+      if (!guardTradedAssets("event:script", { anyVenomon: true })) return;
+
       const result = await battleManager.healPartyAtNpc(
         socket.data.userId,
         data?.npcPlacementId
@@ -2771,6 +2848,8 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Log in to battle NPCs." });
         return;
       }
+
+      if (!guardTradedAssets("battle:start", {})) return;
 
       const result = await battleManager.startNpcTrainerBattle(
         socket.data.userId,
@@ -2812,6 +2891,8 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Log in to shop with NPCs." });
         return;
       }
+
+      if (!guardTradedAssets("npc:store-buy", { currency: true })) return;
 
       const result = await battleManager.buyFromNpcStore(
         socket.data.userId,
@@ -2856,6 +2937,11 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Log in to sell items." });
         return;
       }
+
+      if (!guardTradedAssets("npc:store-sell", {
+        itemIds: [data?.itemId],
+        currency: true
+      })) return;
 
       const result = await battleManager.sellToNpcStore(
         socket.data.userId,
@@ -2983,6 +3069,169 @@ function createConnectionHandler(
       await socialManager.leavePrivateChat(userId, String(data?.chatId ?? ""));
     });
 
+    // ---- Player-to-player trading (TradeManager) --------------------------
+    // Handlers are intentionally thin: every rule, every validation and every
+    // authorization check lives in TradeManager, which answers each action
+    // with a uniform `trade:result` envelope (see TRADING.md).
+
+    socket.on("trade:request", async (data) => {
+      await tradeManager.requestTrade(socket, data ?? {});
+    });
+
+    socket.on("trade:request:accept", async (data) => {
+      await tradeManager.acceptRequest(socket, data ?? {});
+    });
+
+    socket.on("trade:request:decline", async (data) => {
+      await tradeManager.declineRequest(socket, data ?? {});
+    });
+
+    socket.on("trade:request:cancel", async (data) => {
+      await tradeManager.cancelRequest(socket, data ?? {});
+    });
+
+    socket.on("trade:offer:add-item", async (data) => {
+      await tradeManager.addItem(socket, data ?? {});
+    });
+
+    socket.on("trade:offer:update-item", async (data) => {
+      await tradeManager.updateItem(socket, data ?? {});
+    });
+
+    socket.on("trade:offer:remove-item", async (data) => {
+      await tradeManager.removeItem(socket, data ?? {});
+    });
+
+    socket.on("trade:offer:add-venomon", async (data) => {
+      await tradeManager.addVenomon(socket, data ?? {});
+    });
+
+    socket.on("trade:offer:remove-venomon", async (data) => {
+      await tradeManager.removeVenomon(socket, data ?? {});
+    });
+
+    socket.on("trade:offer:set-currency", async (data) => {
+      await tradeManager.setCurrency(socket, data ?? {});
+    });
+
+    socket.on("trade:offer:lock", async (data) => {
+      await tradeManager.lockOffer(socket, data ?? {});
+    });
+
+    socket.on("trade:offer:unlock", async (data) => {
+      await tradeManager.unlockOffer(socket, data ?? {});
+    });
+
+    socket.on("trade:confirm", async (data) => {
+      await tradeManager.confirm(socket, data ?? {});
+    });
+
+    socket.on("trade:cancel", async (data) => {
+      await tradeManager.cancel(socket, data ?? {});
+    });
+
+    socket.on("trade:chat:send", async (data) => {
+      await tradeManager.sendChat(socket, data ?? {});
+    });
+
+    socket.on("trade:sync", async (data) => {
+      await tradeManager.sync(socket, data);
+    });
+
+    socket.on("trade:history", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("trade:result", {
+          success: false,
+          tradeId: null,
+          state: null,
+          version: null,
+          errorCode: "NOT_AUTHENTICATED",
+          message: "Log in to view your trade history."
+        });
+        return;
+      }
+      try {
+        socket.emit("trade:history", await tradeManager.listHistory(socket, data));
+      } catch (error) {
+        console.error("Unable to list trade history:", error);
+      }
+    });
+
+    socket.on("trade:report", async (data) => {
+      await tradeManager.reportTrade(socket, data ?? {});
+    });
+
+    // ---- Trade moderation (moderator.access) -------------------------------
+
+    socket.on("moderation:trades:search", async (data) => {
+      if (!requireModeratorAccess(socket)) return;
+      try {
+        const page = Math.max(Number(data?.page) || 1, 1);
+        const pageSize = Math.min(Math.max(Number(data?.pageSize) || 20, 1), 100);
+        const result = await tradeManager.moderationSearch({
+          userId: typeof data?.userId === "number" ? data.userId : undefined,
+          tradeId: typeof data?.tradeId === "string" ? data.tradeId : undefined,
+          page,
+          pageSize
+        });
+        socket.emit("moderation:trades:list", { ...result, page, pageSize });
+      } catch (error) {
+        console.error("Unable to search trades:", error);
+        socket.emit("moderation:error", { message: "Unable to search trades." });
+      }
+    });
+
+    socket.on("moderation:trades:detail", async (data) => {
+      if (!requireModeratorAccess(socket)) return;
+      try {
+        socket.emit("moderation:trades:detail", await tradeManager.moderationDetail(String(data?.tradeId ?? "")));
+      } catch (error) {
+        console.error("Unable to load trade detail:", error);
+        socket.emit("moderation:error", { message: "Unable to load that trade." });
+      }
+    });
+
+    socket.on("moderation:trades:note", async (data) => {
+      if (!requireModeratorAccess(socket) || typeof socket.data.userId !== "number") return;
+      try {
+        await tradeManager.moderationAddNote(
+          String(data?.tradeId ?? ""),
+          socket.data.userId,
+          String(data?.text ?? "")
+        );
+        socket.emit("moderation:trades:detail", await tradeManager.moderationDetail(String(data?.tradeId ?? "")));
+      } catch (error) {
+        console.error("Unable to add trade note:", error);
+        socket.emit("moderation:error", { message: "Unable to save that note." });
+      }
+    });
+
+    socket.on("moderation:trades:set-restriction", async (data) => {
+      if (!requireModeratorAccess(socket)) return;
+      try {
+        await tradeManager.moderationSetTradingDisabled(
+          Number(data?.userId),
+          data?.disabled === true,
+          typeof data?.reason === "string" ? data.reason : undefined
+        );
+      } catch (error) {
+        console.error("Unable to change trade restriction:", error);
+        socket.emit("moderation:error", { message: "Unable to change that restriction." });
+      }
+    });
+
+    socket.on("moderation:trades:reports", async (data) => {
+      if (!requireModeratorAccess(socket)) return;
+      try {
+        const page = Math.max(Number(data?.page) || 1, 1);
+        const pageSize = Math.min(Math.max(Number(data?.pageSize) || 20, 1), 100);
+        socket.emit("moderation:trades:reports", await tradeManager.moderationListReports(page, pageSize));
+      } catch (error) {
+        console.error("Unable to list trade reports:", error);
+        socket.emit("moderation:error", { message: "Unable to list trade reports." });
+      }
+    });
+
     socket.on("disconnect", async (reason) => {
       const player = world.getPlayerBySocket(socket.id);
       const shouldPersistLocation =
@@ -3029,6 +3278,8 @@ function createConnectionHandler(
           !world.getPlayerByUserId(socket.data.userId)
         ) {
           void socialManager.handlePlayerLeft(socket.data.userId);
+          // Trades pause for a grace period, then cancel (see TRADING.md).
+          tradeManager.handleUserDisconnected(socket.data.userId);
         }
       }
     });
@@ -3042,6 +3293,7 @@ export default function registerSocketHandlers(
   designerSectionStore:DesignerSectionStore,
   playableMapsStore:PlayableMapsStore,
   _groundItemStore:GroundItemStore,
+  redis:RedisClientType,
   mapAssetStore?:MapAssetStore,
   pokecraftApi?:PokecraftApiClient
 ) {
@@ -3049,6 +3301,17 @@ export default function registerSocketHandlers(
   world.setBattleManager(battleManager);
   const eventRuntime = new EventRuntime(io, world, auth);
   const socialManager = new SocialManager(io, world, auth, battleManager, eventRuntime);
+  const tradeManager = new TradeManager(
+    io,
+    world,
+    auth,
+    designerSectionStore,
+    battleManager,
+    eventRuntime,
+    redis
+  );
+  // No battle of any kind may start while a trade holds the party reserved.
+  battleManager.setTradeGuard((userId) => tradeManager.isTrading(userId));
   // Event scripts can start real trainer battles (pbTrainerBattle).
   eventRuntime.setBattleManager(battleManager);
   // pbPokemonMart events open the regular store overlay; buy/sell requests
@@ -3115,5 +3378,7 @@ export default function registerSocketHandlers(
     touchCooldowns.set(userId, { placementId, at: now });
     void eventRuntime.startEvent(userId, placementId, { touch: true });
   });
-  io.on("connection", createConnectionHandler(io, world, auth, designerSectionStore, playableMapsStore, battleManager, eventRuntime, socialManager, mapAssetStore, pokecraftApi));
+  io.on("connection", createConnectionHandler(io, world, auth, designerSectionStore, playableMapsStore, battleManager, eventRuntime, socialManager, tradeManager, mapAssetStore, pokecraftApi));
+
+  return { tradeManager };
 }

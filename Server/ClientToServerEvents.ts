@@ -391,4 +391,82 @@ export default interface ClientToServerEvents {
 
   /** Leaves a private chat (empty chats are disposed). */
   "chat:private-leave": (data: { chatId: string }) => void;
+
+  // ---- Player-to-player trading (TradeManager) ----------------------------
+  //
+  // Every action carries the trade id, the version the client last saw, and an
+  // idempotency key. The server rejects stale versions and drops replayed
+  // request ids, and answers every one of these with `trade:result`.
+  // See TRADING.md for the full contract.
+
+  /** Opens a trade request. Identify the target by socket id or user id. */
+  "trade:request": (data: { targetPlayerId?: string; targetUserId?: number }) => void;
+  "trade:request:accept": (data: { tradeId: string }) => void;
+  "trade:request:decline": (data: { tradeId: string }) => void;
+  /** The sender withdrawing their own pending request. */
+  "trade:request:cancel": (data: { tradeId: string }) => void;
+
+  /** Adds `quantity` on top of whatever this item already contributes. */
+  "trade:offer:add-item": (data: TradeOfferItemAction & { quantity: number }) => void;
+  /** Sets an absolute quantity; 0 removes the entry. */
+  "trade:offer:update-item": (data: TradeOfferItemAction & { quantity: number }) => void;
+  "trade:offer:remove-item": (data: TradeOfferItemAction) => void;
+
+  "trade:offer:add-venomon": (data: TradeActionEnvelope & { venomonId: string }) => void;
+  "trade:offer:remove-venomon": (data: TradeActionEnvelope & { venomonId: string }) => void;
+
+  /** Absolute, non-negative integer amount of game money. */
+  "trade:offer:set-currency": (data: TradeActionEnvelope & { amount: number }) => void;
+
+  "trade:offer:lock": (data: TradeActionEnvelope) => void;
+  "trade:offer:unlock": (data: TradeActionEnvelope) => void;
+
+  /**
+   * Final confirmation. Must echo the exact `snapshotHash` the server issued
+   * with `trade:confirmation:started`; a mismatch means the offer moved.
+   */
+  "trade:confirm": (data: TradeActionEnvelope & { snapshotHash: string }) => void;
+
+  "trade:cancel": (data: { tradeId: string; requestId?: string }) => void;
+
+  /** Private, participants-only chat for one trade session. */
+  "trade:chat:send": (data: { tradeId: string; text: string; requestId?: string }) => void;
+
+  /** Requests the authoritative trade state (reconnect, window reopen). */
+  "trade:sync": (data?: { tradeId?: string }) => void;
+
+  /** Paginated player-facing trade history. */
+  "trade:history": (data?: { page?: number; pageSize?: number }) => void;
+
+  /** Reports a completed or failed trade for moderation review. */
+  "trade:report": (data: { tradeId: string; reason: string; explanation?: string }) => void;
+
+  // ---- Moderation (requires moderator.access) ------------------------------
+  "moderation:trades:search": (data?: {
+    userId?: number;
+    tradeId?: string;
+    page?: number;
+    pageSize?: number;
+  }) => void;
+  "moderation:trades:detail": (data: { tradeId: string }) => void;
+  "moderation:trades:note": (data: { tradeId: string; text: string }) => void;
+  "moderation:trades:set-restriction": (data: {
+    userId: number;
+    disabled: boolean;
+    reason?: string;
+  }) => void;
+  "moderation:trades:reports": (data?: { page?: number; pageSize?: number }) => void;
+}
+
+/** Common fields on every trade action (see TRADING.md §Concurrency). */
+export interface TradeActionEnvelope {
+  tradeId: string;
+  /** The version the client is acting on; a mismatch is rejected. */
+  expectedVersion: number;
+  /** Unique per user action — replays of the same id are dropped. */
+  requestId?: string;
+}
+
+export interface TradeOfferItemAction extends TradeActionEnvelope {
+  itemId: string;
 }

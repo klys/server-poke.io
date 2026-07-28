@@ -14,6 +14,16 @@ import type {
 import type {
   BattlePublicState
 } from "../components/BattleManager";
+import type {
+  TradeActionResult,
+  TradeAuditRecord,
+  TradeChatMessage,
+  TradeErrorCode,
+  TradeExchangeSummary,
+  TradeHistoryEntry,
+  TradeState,
+  TradeStatePayload
+} from "../components/trade/tradeTypes";
 import type { BattleEventsPayload } from "../components/battle/events";
 import type {
   DesignerSectionSyncPayload,
@@ -485,6 +495,86 @@ export default interface ServerToClientEvents {
   }) => void;
   /** You left (or the chat was disposed) — close its window. */
   "chat:private-closed": (data: { chatId: string }) => void;
+
+  // ---- Player-to-player trading (TradeManager) ----------------------------
+  //
+  // `trade:state` is the authoritative view of a session and is emitted
+  // per-recipient (each side gets its own `youAre`). The other state-carrying
+  // events use the same payload and exist so the client can react to *why*
+  // the state moved. `null` on `trade:state` means "you are in no trade".
+
+  "trade:request:received": (data: {
+    tradeId: string;
+    from: {
+      userId: number;
+      username: string;
+      displayName: string;
+      characterSkinId: string;
+      newAccount: boolean;
+    };
+    expiresAt: number;
+  }) => void;
+  "trade:request:expired": (data: { tradeId: string }) => void;
+
+  "trade:opened": (data: TradeStatePayload) => void;
+  "trade:state": (data: TradeStatePayload | null) => void;
+  "trade:offer:changed": (data: TradeStatePayload) => void;
+  "trade:offer:invalidated": (data: TradeStatePayload) => void;
+  "trade:confirmation:started": (data: TradeStatePayload) => void;
+
+  "trade:participant:disconnected": (data: {
+    tradeId: string;
+    userId: number;
+    graceSeconds: number;
+  }) => void;
+  "trade:participant:reconnected": (data: { tradeId: string; userId: number }) => void;
+
+  "trade:chat:message": (data: TradeChatMessage) => void;
+
+  "trade:completed": (data: {
+    tradeId: string;
+    state: TradeState;
+    version: number;
+    snapshotHash: string | null;
+    completedAt: string;
+    given: TradeExchangeSummary;
+    received: TradeExchangeSummary;
+  }) => void;
+  "trade:cancelled": (data: {
+    tradeId: string;
+    state: TradeState;
+    version: number;
+    reason: string;
+    errorCode: TradeErrorCode | null;
+  }) => void;
+  "trade:failed": (data: {
+    tradeId: string;
+    state: TradeState;
+    version: number;
+    errorCode: TradeErrorCode;
+    message: string;
+  }) => void;
+
+  /** Uniform acknowledgement emitted for every client trade action. */
+  "trade:result": (data: TradeActionResult) => void;
+
+  /** Player-facing trade history page (no security metadata). */
+  "trade:history": (data: {
+    entries: TradeHistoryEntry[];
+    page: number;
+    pageSize: number;
+    total: number;
+  }) => void;
+
+  /** Moderation surfaces — only ever emitted to moderator.access sockets. */
+  "moderation:trades:list": (data: {
+    rows: TradeAuditRecord[];
+    total: number;
+    page: number;
+    pageSize: number;
+  }) => void;
+  "moderation:trades:detail": (data: unknown) => void;
+  "moderation:trades:reports": (data: { rows: unknown[]; total: number }) => void;
 
   // Dynamic events using template literal types
   [event: `move${string}`]: (data: {
