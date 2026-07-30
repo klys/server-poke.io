@@ -305,6 +305,10 @@ export default class EventRuntime {
     }
 
     const essentials = placement.essentialsEvent;
+    // Halt before the first await: a sight-spotted or touch-triggered player
+    // must freeze on the tile where the event caught them, not drift onward
+    // while the event state loads.
+    player.stopMovement();
     let state = await this.auth.getEventState(userId);
     // Re-gift: an egg NPC that permanently locks itself with a one-time Self
     // Switch ("Regala huevo" flips A after giving the egg) becomes available

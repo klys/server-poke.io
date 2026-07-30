@@ -46,11 +46,17 @@ export interface AuthenticatedUser {
     inventory:InventoryItem[];
     pokemonParty:PokemonSummary[];
     pokemonStorage:PokemonStorageBox[];
+    itemStorage:ItemStorageBox[];
+    /** Money stored in the PC bank, separate from the wallet (`money`). */
+    pcMoney:number;
     trainerGender:string;
     characterSkinId:string;
     money:number;
     /** 0-based gym badge indices earned (see $Trainer.badges[N]). */
     badges:number[];
+    /** Map ids of fly-able towns the player has physically entered — gates
+     * Volar (Fly) destinations, classic town-map behavior. */
+    visitedTowns:string[];
     /** Palette key chosen for the Trainer Card background (client owns the palette). */
     trainerCardColor:string;
     battleHistory:BattleHistoryEntry[];
@@ -247,17 +253,38 @@ export interface PokemonSummary {
     frontImageSrc?:string;
 }
 
+/** Cosmetic per-box styling the player can customize at the PC. */
+export interface StorageBoxStyle {
+    /** CSS color for the box grid background (hex). */
+    bgColor?:string;
+    /** Asset path/URL of a background image chosen from the game's assets. */
+    bgImage?:string;
+    /** CSS color for the box border (hex). */
+    borderColor?:string;
+}
+
 /**
- * One PC storage box. Users have as many boxes as they need (a new one is
- * created whenever every existing box is full), each holding up to
+ * One PC storage box. Players can have up to MAX_STORAGE_BOXES boxes (auto-
+ * created on overflow, or added manually), each holding up to
  * POKEMON_BOX_CAPACITY Pokemon. Box ids are positional (`box-1`, `box-2`, ...)
  * and derived on parse, so they are stable across reads without being stored.
  */
-export interface PokemonStorageBox {
+export interface PokemonStorageBox extends StorageBoxStyle {
     id:string;
     name:string;
     capacity:number;
     pokemon:PokemonSummary[];
+}
+
+/**
+ * One PC item box. Mirrors PokemonStorageBox but holds inventory stacks; its
+ * `capacity` is the max number of distinct item stacks (quantities stack).
+ */
+export interface ItemStorageBox extends StorageBoxStyle {
+    id:string;
+    name:string;
+    capacity:number;
+    items:InventoryItem[];
 }
 
 export interface AdminItemCatalogEntry {
@@ -397,6 +424,10 @@ const DEFAULT_INVENTORY:InventoryItem[] = [
 const DEFAULT_POKEMON_PARTY:PokemonSummary[] = [];
 export const MAX_POKEMON_PARTY_SIZE = 6;
 export const POKEMON_BOX_CAPACITY = 30;
+/** Max boxes per storage kind (venomon and item each). */
+export const MAX_STORAGE_BOXES = 15;
+/** Max distinct item stacks per item box. */
+export const ITEM_BOX_CAPACITY = 40;
 /**
  * How many walked tiles a freshly received egg takes to hatch when the species
  * carries no `hatchSteps` metadata. Tuned for our engine (a few minutes of
@@ -1403,7 +1434,7 @@ export default class Auth {
             badges: JSON.stringify([])
         });
         await this.redis.hDel(this.userKey(userId), [
-            "last_map_id", "last_x", "last_y", "respawn_point", "pokemon_box", "egg_cooldowns"
+            "last_map_id", "last_x", "last_y", "respawn_point", "pokemon_box", "item_box", "pc_money", "egg_cooldowns"
         ]);
 
         const updatedUser = await this.getUserAdminDetails(userId);
@@ -1803,6 +1834,44 @@ export default class Auth {
             await this.redis.hSet(this.userKey(userId), { badges: JSON.stringify(badges) });
         }
         return badges;
+    }
+
+    // ---- Visited towns (Volar/Fly destination gating) ----
+    // Stored as a JSON array of playable-map ids in the `visited_towns` hash
+    // field. Read fresh from Redis on every call (no in-memory cache) so
+    // admin/tooling edits to the hash take effect immediately.
+
+    private parseVisitedTowns(value:string | undefined | null):string[] {
+        if (typeof value !== "string") {
+            return [];
+        }
+        try {
+            const parsed = JSON.parse(value);
+            if (!Array.isArray(parsed)) {
+                return [];
+            }
+            return [...new Set(parsed.filter((entry):entry is string => typeof entry === "string" && entry.length > 0))];
+        } catch {
+            return [];
+        }
+    }
+
+    public async getVisitedTowns(userId:number):Promise<string[]> {
+        return this.parseVisitedTowns(await this.redis.hGet(this.userKey(userId), "visited_towns"));
+    }
+
+    /** Records a town visit; returns true only when the town is new. */
+    public async markTownVisited(userId:number, mapId:string):Promise<boolean> {
+        if (typeof mapId !== "string" || mapId.length === 0) {
+            return false;
+        }
+        const visited = await this.getVisitedTowns(userId);
+        if (visited.includes(mapId)) {
+            return false;
+        }
+        visited.push(mapId);
+        await this.redis.hSet(this.userKey(userId), { visited_towns: JSON.stringify(visited) });
+        return true;
     }
 
     // ---- Pokemon Center respawn point (Kernel.pbSetPokemonCenter) ----
@@ -2523,9 +2592,12 @@ export default class Auth {
                     inventory: DEFAULT_INVENTORY,
                     pokemonParty: DEFAULT_POKEMON_PARTY,
                     pokemonStorage: this.parsePokemonStorage(undefined),
+                    itemStorage: this.parseItemStorage(undefined),
+                    pcMoney: 0,
                     trainerGender: "",
                     characterSkinId: "",
                     badges: [],
+                    visitedTowns: [],
                     trainerCardColor: "",
                     money: DEFAULT_MONEY,
                     battleHistory: DEFAULT_BATTLE_HISTORY,
@@ -2744,10 +2816,13 @@ export default class Auth {
             inventory: this.parseInventory(user.inventory),
             pokemonParty: this.parsePokemonParty(user.pokemon_party),
             pokemonStorage: this.parsePokemonStorage(user.pokemon_box),
+            itemStorage: this.parseItemStorage(user.item_box),
+            pcMoney: this.parseMoney(user.pc_money, 0),
             trainerGender: user.trainer_gender ?? "",
             characterSkinId: user.character_skin_id ?? "",
             money: this.parseMoney(user.money),
             badges: this.parseBadges(user.badges),
+            visitedTowns: this.parseVisitedTowns(user.visited_towns),
             trainerCardColor: user.trainer_card_color ?? "",
             battleHistory: this.parseBattleHistory(user.battle_history),
             role: resolvedRole.role,
@@ -2768,10 +2843,13 @@ export default class Auth {
             inventory: user.inventory,
             pokemonParty: user.pokemonParty,
             pokemonStorage: user.pokemonStorage,
+            itemStorage: user.itemStorage,
+            pcMoney: user.pcMoney,
             trainerGender: user.trainerGender,
             characterSkinId: user.characterSkinId,
             money: user.money,
             badges: user.badges,
+            visitedTowns: user.visitedTowns,
             trainerCardColor: user.trainerCardColor,
             battleHistory: user.battleHistory,
             role: user.role,
@@ -3208,6 +3286,42 @@ export default class Auth {
      * Always returns at least one (possibly empty) box so clients can render
      * the storage UI without special-casing brand-new accounts.
      */
+    private parseItemStorage(value:string | undefined):ItemStorageBox[] {
+        let rawBoxes:Array<{ name?:unknown; items?:unknown }> = [];
+
+        if (value) {
+            try {
+                const parsed = JSON.parse(value);
+                if (parsed && Array.isArray(parsed.boxes)) {
+                    rawBoxes = parsed.boxes.filter(
+                        (box:unknown):box is { name?:unknown; items?:unknown } =>
+                            Boolean(box) && typeof box === "object"
+                    );
+                }
+            } catch {
+                rawBoxes = [];
+            }
+        }
+
+        const boxes = rawBoxes.map((box, index) => ({
+            id: `box-${index + 1}`,
+            name:
+                typeof box.name === "string" && box.name.trim().length > 0
+                    ? box.name.trim().slice(0, 20)
+                    : `Box ${index + 1}`,
+            capacity: ITEM_BOX_CAPACITY,
+            items: this.sanitizeInventoryForStorage(
+                Array.isArray(box.items) ? (box.items as InventoryItem[]) : []
+            ).slice(0, ITEM_BOX_CAPACITY)
+        } satisfies ItemStorageBox));
+
+        if (boxes.length === 0) {
+            boxes.push({ id: "box-1", name: "Box 1", capacity: ITEM_BOX_CAPACITY, items: [] });
+        }
+
+        return boxes;
+    }
+
     private parsePokemonStorage(value:string | undefined):PokemonStorageBox[] {
         let rawBoxes:Array<{ name?:unknown; pokemon?:unknown }> = [];
 
@@ -3422,13 +3536,13 @@ export default class Auth {
         return null;
     }
 
-    private parseMoney(value:string | undefined) {
+    private parseMoney(value:string | undefined, fallback:number = DEFAULT_MONEY) {
         if (typeof value !== "string") {
-            return DEFAULT_MONEY;
+            return fallback;
         }
 
         const parsed = Number.parseInt(value, 10);
-        return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : DEFAULT_MONEY;
+        return Number.isFinite(parsed) ? Math.max(0, Math.round(parsed)) : fallback;
     }
 
     private parseBadges(value:string | undefined | null):number[] {

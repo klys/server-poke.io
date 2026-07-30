@@ -132,6 +132,61 @@ const ADMIN_PRESENCE_ROOM = "admin:presence";
  * live presence room. Called whenever the world's authenticated population
  * changes (player joins / leaves).
  */
+// ---- Visited towns (Volar/Fly gating) ----
+// Fly-able town ids, memoized per maps-state snapshot (designer edits swap
+// the snapshot object, invalidating the memo).
+let flyTownsSnapshotRef:unknown = null;
+let flyTownIdsCache = new Set<string>();
+
+function getFlyTownIds(world:World):Set<string> {
+  const snapshot = world.getPlayableMapsState();
+  if (!snapshot) {
+    return new Set();
+  }
+  if (snapshot !== flyTownsSnapshotRef) {
+    flyTownsSnapshotRef = snapshot;
+    flyTownIdsCache = new Set(resolveFlyDestinations(snapshot).map((destination) => destination.mapId));
+  }
+  return flyTownIdsCache;
+}
+
+/**
+ * Records that the player entered a fly-able town. Runs on every map
+ * transfer and on join; non-town maps return immediately. A NEW town pushes
+ * a fresh auth:session to the player's sockets so the map window unlocks the
+ * destination without a relog.
+ */
+function recordTownVisit(
+  io:TypedSocketServer,
+  world:World,
+  auth:Auth,
+  userId:number,
+  mapId:string,
+  socketIds:Iterable<string>
+) {
+  if (!getFlyTownIds(world).has(mapId)) {
+    return;
+  }
+
+  void auth
+    .markTownVisited(userId, mapId)
+    .then(async (isNewTown) => {
+      if (!isNewTown) {
+        return;
+      }
+      const user = await auth.getUserForBattle(userId);
+      if (!user) {
+        return;
+      }
+      for (const socketId of socketIds) {
+        io.to(socketId).emit("auth:session", { authenticated: true, user });
+      }
+    })
+    .catch((error) => {
+      console.error("Unable to record town visit:", error);
+    });
+}
+
 function broadcastAdminPresence(io:TypedSocketServer, world:World) {
   io.to(ADMIN_PRESENCE_ROOM).emit("admin:presence:state", {
     onlineUserIds: world.getOnlineUserIds()
@@ -2102,6 +2157,16 @@ function createConnectionHandler(
           void socialManager.handlePlayerJoined(socket.data.userId);
           // Re-entering the world resumes a trade paused by a disconnect.
           tradeManager.handleUserReconnected(socket.data.userId);
+          // Spawning inside a town counts as visiting it (initial spawn and
+          // players created before visited-town tracking existed).
+          recordTownVisit(
+            io,
+            world,
+            auth,
+            socket.data.userId,
+            playerRegistration.player.currentMapId,
+            playerRegistration.player.socketConnections
+          );
         }
       }
     });
@@ -2205,12 +2270,18 @@ function createConnectionHandler(
       }
 
       const user = await auth.getUserForBattle(socket.data.userId);
-      const knowsFly = (user?.pokemonParty ?? []).some((pokemon) =>
-        (pokemon.moves ?? []).some((move) => move.trim().toLowerCase() === "volar")
-      );
+      const knowsFly = await battleManager.partyKnowsFly(user?.pokemonParty ?? []);
 
       if (!knowsFly) {
-        socket.emit("player:fly-error", { message: "No venomon in your party knows Volar." });
+        socket.emit("player:fly-error", { message: "No venomon in your party knows Vuelo." });
+        return;
+      }
+
+      // Classic Fly: only towns the player has physically entered are
+      // reachable — flying ahead would skip story progression.
+      const visitedTowns = user?.visitedTowns ?? [];
+      if (!visitedTowns.includes(destination.mapId)) {
+        socket.emit("player:fly-error", { message: "You have not visited that town yet." });
         return;
       }
 
@@ -3362,6 +3433,8 @@ export default function registerSocketHandlers(
       .catch((error) => {
         console.error("Unable to save player location on transfer:", error);
       });
+    // Entering a fly-able town unlocks it as a Volar destination.
+    recordTownVisit(io, world, auth, player.userId, player.currentMapId, player.socketConnections);
     // Map transfers also feed friends presence (same-map action gating).
     socialManager.handlePlayerMapChanged(player);
   });
@@ -3378,6 +3451,11 @@ export default function registerSocketHandlers(
     touchCooldowns.set(userId, { placementId, at: now });
     void eventRuntime.startEvent(userId, placementId, { touch: true });
   });
+  // RMXP interpreter lock: while an event session runs (dialog, trainer spot,
+  // cutscene) the player cannot move, so line-of-sight traps actually hold.
+  world.setEventMovementLockChecker(
+    (player) => typeof player.userId === "number" && eventRuntime.isRunning(player.userId)
+  );
   io.on("connection", createConnectionHandler(io, world, auth, designerSectionStore, playableMapsStore, battleManager, eventRuntime, socialManager, tradeManager, mapAssetStore, pokecraftApi));
 
   return { tradeManager };

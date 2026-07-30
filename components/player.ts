@@ -195,6 +195,10 @@ export default class Player {
      */
     public move() {
         if (this.inBattle) return;
+        // A running event session (dialog, cutscene, trainer spot) freezes
+        // movement like the RMXP interpreter — otherwise players could walk
+        // through sight-traps while the trainer is still talking.
+        if (this.world.isEventMovementLocked(this)) return;
         if (this.relocateInsideMapIfNeeded()) return;
 
         const steps = Math.max(1, Math.round(this.speedMultiplier));

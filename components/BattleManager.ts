@@ -9622,6 +9622,34 @@ export default class BattleManager {
     return side.party.some((pokemon) => !isFainted(pokemon));
   }
 
+  /**
+   * True when any party member knows the Fly skill, matched through the
+   * skills catalog by id (skill-FLY / essentialsId FLY) so display renames
+   * (volar -> Vuelo) don't break the Volar field action. Move names that no
+   * longer resolve in the catalog (parties saved under an old name) fall back
+   * to the known historical names.
+   */
+  public async partyKnowsFly(party: PokemonSummary[]): Promise<boolean> {
+    const catalogs = await this.loadCatalogs();
+    const legacyFlyNames = new Set(["vuelo", "volar", "fly"]);
+
+    return party.some((pokemon) =>
+      (pokemon.moves ?? []).some((moveName) => {
+        const normalized = String(moveName ?? "").trim().toLowerCase();
+        if (!normalized) {
+          return false;
+        }
+
+        const skill = catalogs.skillsByName.get(normalized);
+        if (skill) {
+          return skill.id === "skill-FLY" || skill.essentialsId.toUpperCase() === "FLY";
+        }
+
+        return legacyFlyNames.has(normalized);
+      })
+    );
+  }
+
   private async loadCatalogs() {
     const [pokemonPayload, skillsPayload, itemsPayload, levelingCurvePayload, npcsPayload, typesPayload, encountersPayload] = await Promise.all([
       this.designerSectionStore.read("pokemons"),

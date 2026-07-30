@@ -152,6 +152,8 @@ interface AuthUserData {
   money: number;
   /** 0-based gym badge indices earned. */
   badges: number[];
+  /** Map ids of fly-able towns the player has entered (gates Volar/Fly). */
+  visitedTowns: string[];
   /** Palette key for the Trainer Card background. */
   trainerCardColor: string;
   role: "admin" | "designer" | "moderator" | "user";

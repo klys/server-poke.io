@@ -62,9 +62,12 @@ export default class World {
     battleManager: BattleManager | null;
     groundItems: Map<string, GroundItem>;
     /** Per-snapshot cache of NPC collision rectangles by map. */
-    private npcBlockerCache = new WeakMap<object, Map<string, Array<{ id:string; x:number; y:number; essentials:EssentialsEventRecord | null }>>>();
+    private npcBlockerCache = new WeakMap<object, Map<string, Array<{ id:string; x:number; y:number; name:string | null; essentials:EssentialsEventRecord | null }>>>();
     /** Fires trigger-1/2 (touch) events; wired to the event runtime. */
     private eventTouchHandler:((player:Player, placementId:string) => void) | null = null;
+    /** True while the player is inside a running event (dialog/cutscene):
+     * movement is frozen like RPG Maker, so sight-traps actually hold. */
+    private eventMovementLockChecker:((player:Player) => boolean) | null = null;
     private locationPersistHandler:((player:Player) => void) | null = null;
     private portalHandler:((player:Player, portal:MapEditorPortalPlacement) => void) | null = null;
     groundItemStore: GroundItemStore | null;
@@ -668,6 +671,15 @@ export default class World {
         this.eventTouchHandler = handler;
     }
 
+    setEventMovementLockChecker(checker:(player:Player) => boolean) {
+        this.eventMovementLockChecker = checker;
+    }
+
+    /** Movement freeze during a running event session (RMXP interpreter lock). */
+    isEventMovementLocked(player:Player): boolean {
+        return this.eventMovementLockChecker?.(player) ?? false;
+    }
+
     setLocationPersistHandler(handler:(player:Player) => void) {
         this.locationPersistHandler = handler;
     }
@@ -851,12 +863,117 @@ export default class World {
                 return;
             }
         }
+
+        this.handleTrainerSightStep(player, cellX, cellY);
+    }
+
+    /**
+     * Essentials trainer line-of-sight: an event named "Trainer(X)" spots the
+     * player up to X tiles straight ahead of its facing direction and starts
+     * itself (pbEventCanReachPlayer?), which is how trainer ambushes and
+     * road-block guards work. Only touch-trigger pages (1/2) fire — the
+     * post-defeat / quest-satisfied pages of these events are Action Button
+     * (trigger 0), so beaten trainers stop spotting automatically. Every tile
+     * between the two must be walkable, exactly like the original (trainers
+     * cannot see through walls, trees or other NPCs).
+     */
+    private handleTrainerSightStep(player:Player, cellX:number, cellY:number) {
+        if (!this.eventTouchHandler) {
+            return;
+        }
+        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
+            if (!blocker.essentials || !blocker.name) {
+                continue;
+            }
+            const match = /trainer\s*\(\s*(\d+)\s*\)/i.exec(blocker.name);
+            if (!match) {
+                continue;
+            }
+            const range = Math.min(Number(match[1]), 10);
+            if (range <= 0) {
+                continue;
+            }
+            const eventCellX = blocker.x / 32;
+            const eventCellY = blocker.y / 32;
+            // The player must be exactly on the row/column the NPC faces.
+            const facingHorizontal = cellY === eventCellY && cellX !== eventCellX;
+            const facingVertical = cellX === eventCellX && cellY !== eventCellY;
+            if (!facingHorizontal && !facingVertical) {
+                continue;
+            }
+            const page = selectConditionMetPage(
+                blocker.essentials,
+                this.eventStateFor(player),
+                this.pageSelectionOptions()
+            );
+            if (!page || (page.trigger !== 1 && page.trigger !== 2)) {
+                continue;
+            }
+            const direction = page.graphic?.direction;
+            const dx = direction === 6 ? 1 : direction === 4 ? -1 : 0;
+            const dy = direction === 2 ? 1 : direction === 8 ? -1 : 0;
+            if ((dx !== 0) !== facingHorizontal) {
+                continue; // player is beside/behind the NPC, not in front
+            }
+            const distance = dx !== 0 ? (cellX - eventCellX) * dx : (cellY - eventCellY) * dy;
+            if (distance < 1 || distance > range) {
+                continue;
+            }
+            let lineOfSight = true;
+            for (let step = 1; step < distance; step++) {
+                if (this.isCellBlockedForSight(player, eventCellX + dx * step, eventCellY + dy * step)) {
+                    lineOfSight = false;
+                    break;
+                }
+            }
+            if (!lineOfSight) {
+                continue;
+            }
+            this.eventTouchHandler(player, blocker.id);
+            return;
+        }
+    }
+
+    /**
+     * Sight-line passability for one tile: static collision plus NPC events
+     * whose active page shows a solid sprite for THIS player. Other players
+     * never break line of sight — a friend standing in the way must not smuggle
+     * anyone past a trainer.
+     */
+    private isCellBlockedForSight(player:Player, cellX:number, cellY:number): boolean {
+        const inset = 4;
+        const x = cellX * 32 + inset;
+        const y = cellY * 32 + inset;
+        const size = 32 - inset * 2;
+        if (this.getMapObjects(player.currentMapId).some((object) => this.checkCollision({ x, y, width: size, height: size }, object))) {
+            return true;
+        }
+        if (this.isRectBlockedByCollisionGrid(player.currentMapId, x, y, size, size, player.isSurfing)) {
+            return true;
+        }
+        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
+            if (blocker.x !== cellX * 32 || blocker.y !== cellY * 32) {
+                continue;
+            }
+            if (!blocker.essentials) {
+                return true;
+            }
+            const page = selectConditionMetPage(
+                blocker.essentials,
+                this.eventStateFor(player),
+                this.pageSelectionOptions()
+            );
+            if (page && page.graphic?.characterName && !page.move?.through) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private getNpcBlockers(mapId:string) {
         const state = this.playableMapsState;
         if (!state) {
-            return [] as Array<{ id:string; x:number; y:number; essentials:EssentialsEventRecord | null }>;
+            return [] as Array<{ id:string; x:number; y:number; name:string | null; essentials:EssentialsEventRecord | null }>;
         }
 
         let byMap = this.npcBlockerCache.get(state);
@@ -870,23 +987,25 @@ export default class World {
             blockers = [];
             const npcs = state.editorDataByMapId[mapId]?.npcs ?? [];
             for (const npc of npcs) {
-                const placement = npc as typeof npc & { essentialsEvent?: EssentialsEventRecord };
+                const placement = npc as typeof npc & { essentialsEvent?: EssentialsEventRecord; name?: string };
                 if (
                     typeof placement.x !== "number" ||
                     typeof placement.y !== "number"
                 ) {
                     continue;
                 }
+                const name = typeof placement.name === "string" ? placement.name : null;
                 if (placement.essentialsEvent) {
                     // Conditional blocker; page visibility is resolved per player.
                     blockers.push({
                         id: placement.id,
                         x: placement.x * 32,
                         y: placement.y * 32,
+                        name,
                         essentials: placement.essentialsEvent
                     });
                 } else if (placement.previewImageSrc) {
-                    blockers.push({ id: placement.id, x: placement.x * 32, y: placement.y * 32, essentials: null });
+                    blockers.push({ id: placement.id, x: placement.x * 32, y: placement.y * 32, name, essentials: null });
                 }
             }
             byMap.set(mapId, blockers);
