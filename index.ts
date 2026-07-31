@@ -1,7 +1,7 @@
 import "@dotenvx/dotenvx/config";
 import Auth from "./components/Auth";
 import DBInit from "./components/DBInit";
-import DesignerSectionStore, { type DesignerSectionKey } from "./components/DesignerSectionStore";
+import DesignerSectionStore, { isDesignerSectionKey, type DesignerSectionKey } from "./components/DesignerSectionStore";
 import GroundItemStore from "./components/GroundItemStore";
 import MailService from "./components/MailService";
 import MapAssetStore from "./components/MapAssetStore";
@@ -194,10 +194,57 @@ async function bootstrap() {
     }
   };
 
+  // Designer-only sections (items, skills, trainers, ...) are also served
+  // over HTTP so the designer UI can lazy-load them per page instead of
+  // streaming every catalog through the websocket at connect. They require a
+  // session token with designer.access, passed as "Authorization: Bearer".
+  const readBearerToken = (request:import("http").IncomingMessage) => {
+    const header = request.headers.authorization;
+
+    return typeof header === "string" && header.startsWith("Bearer ")
+      ? header.slice("Bearer ".length).trim()
+      : undefined;
+  };
+  const serveDesignerOnlySection = async (
+    sectionKey:string,
+    request:import("http").IncomingMessage,
+    response:import("http").ServerResponse
+  ) => {
+    try {
+      const session = await auth.resolveSession(readBearerToken(request));
+      const permissions = session.user?.permissions ?? [];
+
+      if (!permissions.includes("designer.access")) {
+        response.writeHead(session.authenticated ? 403 : 401, buildCorsHeaders(request.headers.origin));
+        response.end();
+        return;
+      }
+
+      await serveDesignerSection(sectionKey, request, response);
+    } catch (error) {
+      console.error(`Unable to authorize designer section ${sectionKey}:`, error);
+      response.writeHead(500, buildCorsHeaders(request.headers.origin));
+      response.end();
+    }
+  };
+
   // Static assets (including /map-assets/...) are served by the standalone
   // asset-storage nginx server; this process only handles Socket.IO traffic
   // plus the endpoints below.
   const httpServer = createServer((request, response) => {
+    // Preflight for requests carrying the Authorization header (designer-only
+    // section downloads). Socket.IO handles its own preflights.
+    if (request.method === "OPTIONS" && request.url?.startsWith("/designer-sections/")) {
+      response.writeHead(204, {
+        ...buildCorsHeaders(request.headers.origin),
+        "Access-Control-Allow-Methods": "GET, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Max-Age": "86400"
+      });
+      response.end();
+      return;
+    }
+
     if (request.url === "/healthz") {
       response.writeHead(200, { "Content-Type": "text/plain" });
       response.end("ok");
@@ -216,11 +263,12 @@ async function bootstrap() {
     }
 
     const sectionMatch = request.url?.match(/^\/designer-sections\/([a-zA-Z]+)\.json$/);
-    if (
-      sectionMatch &&
-      (PUBLIC_SECTION_KEYS.has(sectionMatch[1]) || HEAVY_SECTION_KEYS.has(sectionMatch[1]))
-    ) {
-      void serveDesignerSection(sectionMatch[1], request, response);
+    if (sectionMatch && isDesignerSectionKey(sectionMatch[1])) {
+      if (PUBLIC_SECTION_KEYS.has(sectionMatch[1]) || HEAVY_SECTION_KEYS.has(sectionMatch[1])) {
+        void serveDesignerSection(sectionMatch[1], request, response);
+      } else {
+        void serveDesignerOnlySection(sectionMatch[1], request, response);
+      }
       return;
     }
 

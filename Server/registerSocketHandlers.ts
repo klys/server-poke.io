@@ -9,6 +9,7 @@ import BattleManager from "../components/BattleManager";
 import EventRuntime from "../components/EventRuntime";
 import DesignerSectionStore, {
   isDesignerSectionKey,
+  sanitizeDesignerSectionPatchOps,
   type DesignerSectionKey,
   type DesignerSectionSyncPayload,
 } from "../components/DesignerSectionStore";
@@ -1160,6 +1161,78 @@ function createConnectionHandler(
         });
       } catch (error) {
         console.error(`Unable to save designer ${sectionKey} state:`, error);
+        socket.emit("designer:section:error", {
+          message: "Unable to save the collaborative designer state."
+        });
+      }
+    });
+
+    socket.on("designer:section:patch", async (data) => {
+      if (!requireDesignerSectionAccess(socket)) {
+        return;
+      }
+
+      if (!isDesignerSectionKey(data?.sectionKey)) {
+        socket.emit("designer:section:error", {
+          message: "Unknown designer section."
+        });
+        return;
+      }
+
+      const ops = sanitizeDesignerSectionPatchOps(data?.ops);
+
+      if (!ops) {
+        socket.emit("designer:section:error", {
+          message: "Invalid designer section patch."
+        });
+        return;
+      }
+
+      const sectionKey = data.sectionKey;
+      const room = getDesignerSectionRoom(sectionKey);
+
+      if (!HEAVY_SECTION_KEYS.has(sectionKey)) {
+        socket.join(room);
+      }
+
+      try {
+        const payload = await designerSectionStore.patch(
+          sectionKey,
+          ops,
+          socket.data.userId ?? null,
+          socket.data.username ?? null
+        );
+
+        if (!payload) {
+          // No stored state to patch — the client must seed with a full save.
+          socket.emit("designer:section:error", {
+            message: "Section has no saved state yet; use a full save first."
+          });
+          return;
+        }
+
+        const broadcast = {
+          sectionKey,
+          ops,
+          version: payload.version,
+          updatedAt: payload.updatedAt,
+          updatedByUserId: payload.updatedByUserId,
+          updatedByUsername: payload.updatedByUsername
+        };
+
+        // The patch itself is small, so unlike full-state saves it is safe to
+        // send even for heavy sections (their state room is empty anyway —
+        // everyone sits in the versions room and refetches over HTTP).
+        socket.emit("designer:section:patched", broadcast);
+        socket.broadcast.to(room).emit("designer:section:patched", broadcast);
+        io.to(getDesignerSectionVersionsRoom(sectionKey)).emit("designer:section:version", {
+          sectionKey,
+          hasState: true,
+          version: payload.version,
+          updatedAt: payload.updatedAt ?? null
+        });
+      } catch (error) {
+        console.error(`Unable to patch designer ${sectionKey} state:`, error);
         socket.emit("designer:section:error", {
           message: "Unable to save the collaborative designer state."
         });

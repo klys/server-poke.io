@@ -13,6 +13,7 @@ import type {
 } from "../components/BattleManager";
 import type {
   DesignerSectionJoinPayload,
+  DesignerSectionPatchPayload,
   DesignerSectionUpdatePayload
 } from "../components/DesignerSectionStore";
 import type { PlayableMapsStateSnapshot } from "../components/PlayableMapsState";
@@ -268,6 +269,13 @@ export default interface ClientToServerEvents {
    * The server persists the payload in Redis and broadcasts it to everyone in the room.
    */
   "designer:section:update": (data: DesignerSectionUpdatePayload) => void;
+
+  /**
+   * Applies item-level ops (upsert/delete/setCategories) to a designer
+   * section without re-uploading the whole state. The server persists the
+   * patched state and rebroadcasts the ops to the section room.
+   */
+  "designer:section:patch": (data: DesignerSectionPatchPayload) => void;
 
   /**
    * Requests the authoritative playable map state if the server version differs

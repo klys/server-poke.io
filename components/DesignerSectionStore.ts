@@ -513,6 +513,28 @@ export interface DesignerSectionUpdatePayload {
   state: DesignerSectionState;
 }
 
+// Item-level mutations. A patch touches only the records that changed, so a
+// one-item edit no longer re-uploads the whole section state; the server
+// applies the ops to the stored state and rebroadcasts the (small) patch.
+export type DesignerSectionPatchOp =
+  | { kind: "upsert"; item: DesignerSectionItem }
+  | { kind: "delete"; itemId: string }
+  | { kind: "setCategories"; categories: string[] };
+
+export interface DesignerSectionPatchPayload {
+  sectionKey: DesignerSectionKey;
+  ops: DesignerSectionPatchOp[];
+}
+
+export interface DesignerSectionPatchBroadcast {
+  sectionKey: DesignerSectionKey;
+  ops: DesignerSectionPatchOp[];
+  version: number;
+  updatedAt: string | null;
+  updatedByUserId: number | null;
+  updatedByUsername: string | null;
+}
+
 const UNCATEGORIZED = "Uncategorized";
 const VALID_SECTION_KEYS: DesignerSectionKey[] = [
   "skillsGfx",
@@ -650,6 +672,105 @@ function normalizeStoredPayload(
   };
 }
 
+// Guardrail: a patch bigger than this is a bulk operation (import/replace)
+// and must go through the full-state update path instead.
+export const MAX_PATCH_OPS = 200;
+
+export function sanitizeDesignerSectionPatchOps(
+  value: unknown
+): DesignerSectionPatchOp[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_PATCH_OPS) {
+    return null;
+  }
+
+  const ops: DesignerSectionPatchOp[] = [];
+
+  for (const candidate of value as Array<Partial<DesignerSectionPatchOp>>) {
+    if (!candidate || typeof candidate !== "object") {
+      return null;
+    }
+
+    if (candidate.kind === "upsert") {
+      // Run the item through the same sanitizer as full-state saves so a
+      // patched record can't smuggle malformed data past validation.
+      const sanitized = sanitizeDesignerSectionState({
+        categories: [],
+        items: [(candidate as { item?: unknown }).item]
+      }).items[0];
+
+      if (!sanitized) {
+        return null;
+      }
+
+      ops.push({ kind: "upsert", item: sanitized });
+      continue;
+    }
+
+    if (candidate.kind === "delete") {
+      const itemId = (candidate as { itemId?: unknown }).itemId;
+
+      if (typeof itemId !== "string" || itemId.length === 0) {
+        return null;
+      }
+
+      ops.push({ kind: "delete", itemId });
+      continue;
+    }
+
+    if (candidate.kind === "setCategories") {
+      const categories = (candidate as { categories?: unknown }).categories;
+
+      if (!Array.isArray(categories)) {
+        return null;
+      }
+
+      ops.push({
+        kind: "setCategories",
+        categories: categories.filter(
+          (category): category is string => typeof category === "string"
+        )
+      });
+      continue;
+    }
+
+    return null;
+  }
+
+  return ops;
+}
+
+// Pure and shared with the client (mirrored in designerCache.ts): upserts
+// replace in place (or append), deletes filter, setCategories replaces the
+// category list. Category/item consistency is restored by the state
+// sanitizer on save.
+export function applyDesignerSectionPatchOps(
+  state: DesignerSectionState,
+  ops: DesignerSectionPatchOp[]
+): DesignerSectionState {
+  let categories = state.categories;
+  let items = state.items;
+
+  for (const op of ops) {
+    if (op.kind === "upsert") {
+      const index = items.findIndex((item) => item.id === op.item.id);
+
+      items = index >= 0
+        ? [...items.slice(0, index), op.item, ...items.slice(index + 1)]
+        : [...items, op.item];
+
+      if (!categories.includes(op.item.category)) {
+        categories = [...categories, op.item.category];
+      }
+    } else if (op.kind === "delete") {
+      items = items.filter((item) => item.id !== op.itemId);
+    } else if (op.kind === "setCategories") {
+      categories = op.categories;
+    }
+  }
+
+  return { categories, items };
+}
+
 export default class DesignerSectionStore {
   private readonly redis: RedisClientType;
   // Sections can be tens of MB (assets, tilesets, battleBackgrounds); parsing
@@ -662,6 +783,10 @@ export default class DesignerSectionStore {
     { payload: DesignerSectionSyncPayload | null; fetchedAt: number; probe: string }
   >();
   private static CACHE_TTL_MS = 5000;
+
+  // Patches are read-modify-write; serialize them per section so two
+  // designers patching concurrently can't interleave reads and drop ops.
+  private readonly patchQueues = new Map<string, Promise<unknown>>();
 
   constructor(redis: RedisClientType) {
     this.redis = redis;
@@ -696,6 +821,34 @@ export default class DesignerSectionStore {
     }
 
     return this.save(sectionKey, seedState ?? buildEmptyState(), null, null);
+  }
+
+  /**
+   * Applies item-level ops to the stored state and saves the result. Returns
+   * null when the section has no stored state yet (callers fall back to a
+   * full-state save). Serialized per section.
+   */
+  async patch(
+    sectionKey: DesignerSectionKey,
+    ops: DesignerSectionPatchOp[],
+    updatedByUserId: number | null,
+    updatedByUsername: string | null
+  ): Promise<DesignerSectionSyncPayload | null> {
+    const previous = this.patchQueues.get(sectionKey) ?? Promise.resolve();
+    const run = previous.then(async () => {
+      const existing = await this.read(sectionKey);
+
+      if (!existing) {
+        return null;
+      }
+
+      const nextState = applyDesignerSectionPatchOps(existing.state, ops);
+
+      return this.save(sectionKey, nextState, updatedByUserId, updatedByUsername);
+    });
+
+    this.patchQueues.set(sectionKey, run.catch(() => undefined));
+    return run;
   }
 
   async save(

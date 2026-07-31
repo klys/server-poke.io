@@ -26,6 +26,7 @@ import type {
 } from "../components/trade/tradeTypes";
 import type { BattleEventsPayload } from "../components/battle/events";
 import type {
+  DesignerSectionPatchBroadcast,
   DesignerSectionSyncPayload,
   DesignerSectionVersionPayload
 } from "../components/DesignerSectionStore";
@@ -346,6 +347,13 @@ export default interface ServerToClientEvents {
    * The same event is used for the initial hydration and for live rebroadcasts after edits.
    */
   "designer:section:state": (data: DesignerSectionSyncPayload) => void;
+
+  /**
+   * Item-level ops applied to a designer section (see designer:section:patch).
+   * Clients holding version-1 apply the ops locally; anyone behind refetches
+   * the full state over HTTP.
+   */
+  "designer:section:patched": (data: DesignerSectionPatchBroadcast) => void;
 
   /**
    * Lightweight designer section cache metadata.
