@@ -184,6 +184,13 @@ export type PlayableMapTileMapProfile = {
   collisionEncoding: typeof TILE_MAP_GRID_ENCODING;
   collision: string;
   terrainTags?: string;
+  /** u8rle-base64: terrain tag OF THE COLLISION-DECIDING TILE per cell (the
+   * top-down first non-star tile, same walk the collision derivation uses).
+   * Distinguishes plain water (deciding tile is the water tile → water tag)
+   * from an obstacle drawn OVER water (rock decides → tag 0), which plain
+   * `terrainTags` cannot: it takes the first non-zero tag, letting the water
+   * tag show through the rock. Derived by tools/derivePassageTerrainTags.ts. */
+  passageTerrainTags?: string;
   baked?: {
     chunkCells: number;
     background: PlayableMapBakedChunk[];
@@ -536,6 +543,10 @@ function sanitizeTileMapProfile(value: unknown): PlayableMapTileMapProfile | und
     collision: candidate.collision,
     terrainTags:
       typeof candidate.terrainTags === "string" ? candidate.terrainTags : undefined,
+    passageTerrainTags:
+      typeof candidate.passageTerrainTags === "string"
+        ? candidate.passageTerrainTags
+        : undefined,
     baked:
       candidate.baked && typeof candidate.baked === "object"
         ? {

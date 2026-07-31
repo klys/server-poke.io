@@ -190,15 +190,34 @@ interface AuthUserData {
     };
   }>;
   /**
-   * PC box storage: endless boxes, each holding up to `capacity` Pokemon.
+   * PC venomon box storage: up to 15 boxes, each holding `capacity` Pokemon.
    * Always contains at least one box. Entries share the party Pokemon shape.
+   * `bgColor`/`bgImage`/`borderColor` are optional per-box cosmetics.
    */
   pokemonStorage: Array<{
     id: string;
     name: string;
     capacity: number;
+    bgColor?: string;
+    bgImage?: string;
+    borderColor?: string;
     pokemon: AuthUserData["pokemonParty"];
   }>;
+  /**
+   * PC item box storage: up to 15 boxes, each holding `capacity` item stacks.
+   * Always contains at least one box. Entries share the inventory item shape.
+   */
+  itemStorage: Array<{
+    id: string;
+    name: string;
+    capacity: number;
+    bgColor?: string;
+    bgImage?: string;
+    borderColor?: string;
+    items: AuthUserData["inventory"];
+  }>;
+  /** Money stored in the PC bank, separate from the wallet (`money`). */
+  pcMoney: number;
 }
 
 /** Public trainer card for another player (never carries money/email). */

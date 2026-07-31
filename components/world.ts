@@ -57,7 +57,7 @@ export default class World {
     mapBoundsByMapId: Map<string, MapBounds>;
     collisionGridsByMapId: Map<string, MapCollisionGrid>;
     /** Lazily-decoded per-cell terrain-tag grid per map (null = no tags). */
-    private terrainGridsByMapId = new Map<string, { width: number; height: number; cellSize: number; tags: Uint8Array } | null>();
+    private terrainGridsByMapId = new Map<string, { width: number; height: number; cellSize: number; tags: Uint8Array; passageTags: Uint8Array | null } | null>();
     playableMapsState: PlayableMapsStateSnapshot | null;
     battleManager: BattleManager | null;
     groundItems: Map<string, GroundItem>;
@@ -294,18 +294,25 @@ export default class World {
         return this.collisionGridsByMapId.get(mapId) ?? null;
     }
 
-    /** Decoded terrain-tag grid for a map (lazy; cached; null when unavailable). */
+    /** Decoded terrain-tag grid for a map (lazy; cached; null when unavailable).
+     * `passageTags` (when baked) carries the tag of the collision-DECIDING tile,
+     * which tells plain water apart from obstacles drawn over water. */
     private getTerrainGrid(mapId: string) {
         if (this.terrainGridsByMapId.has(mapId)) {
             return this.terrainGridsByMapId.get(mapId) ?? null;
         }
         const collision = this.collisionGridsByMapId.get(mapId);
         const tileMap = this.playableMapsState?.editorDataByMapId?.[mapId]?.tileMap;
-        let result: { width: number; height: number; cellSize: number; tags: Uint8Array } | null = null;
+        let result:
+            | { width: number; height: number; cellSize: number; tags: Uint8Array; passageTags: Uint8Array | null }
+            | null = null;
         if (collision && tileMap?.terrainTags) {
             const tags = decodeU8RleGrid(tileMap.terrainTags, collision.width * collision.height);
             if (tags) {
-                result = { width: collision.width, height: collision.height, cellSize: collision.cellSize, tags };
+                const passageTags = tileMap.passageTerrainTags
+                    ? decodeU8RleGrid(tileMap.passageTerrainTags, collision.width * collision.height)
+                    : null;
+                result = { width: collision.width, height: collision.height, cellSize: collision.cellSize, tags, passageTags };
             }
         }
         this.terrainGridsByMapId.set(mapId, result);
@@ -319,6 +326,26 @@ export default class World {
             return 0;
         }
         return grid.tags[cellY * grid.width + cellX];
+    }
+
+    /** True when a cell is genuinely open water for Surf/Fishing: water
+     * terrain tag AND, when the passage-tag grid is baked, the collision-
+     * deciding tile is itself water. A rock drawn over the sea keeps the
+     * water terrain tag (tags take the first NON-ZERO tag top-down) but its
+     * deciding tile has tag 0 — that cell must block surfers and casts. */
+    isOpenWaterCell(mapId: string, cellX: number, cellY: number): boolean {
+        const grid = this.getTerrainGrid(mapId);
+        if (!grid || cellX < 0 || cellY < 0 || cellX >= grid.width || cellY >= grid.height) {
+            return false;
+        }
+        const index = cellY * grid.width + cellX;
+        if (!isSurfableWaterTag(grid.tags[index])) {
+            return false;
+        }
+        if (grid.passageTags && !isSurfableWaterTag(grid.passageTags[index])) {
+            return false;
+        }
+        return true;
     }
 
     /** The terrain tag of the cell the player currently occupies. */
@@ -412,7 +439,7 @@ export default class World {
             player.faceCell(target, cellSize);
         }
         const facing = player.getFacingCell(cellSize);
-        if (!isSurfableWaterTag(this.getTerrainTagAtCell(player.currentMapId, facing.x, facing.y))) {
+        if (!this.isOpenWaterCell(player.currentMapId, facing.x, facing.y)) {
             return { ok: false, message: "No hay agua por la que surfear." };
         }
         player.isSurfing = true;
@@ -548,9 +575,10 @@ export default class World {
         for (let row = firstRow; row <= lastRow; row += 1) {
             for (let column = firstColumn; column <= lastColumn; column += 1) {
                 if (isSolidCollisionCell(grid.cells[row * grid.width + column])) {
-                    // While surfing, water is solid to the grid but passable to us
-                    // (walls — solid + non-water — still block).
-                    if (passThroughWater && isSurfableWaterTag(this.getTerrainTagAtCell(mapId, column, row))) {
+                    // While surfing, OPEN water is solid to the grid but passable
+                    // to us. Walls AND obstacles drawn over water (rocks — water
+                    // terrain tag but a non-water deciding tile) still block.
+                    if (passThroughWater && this.isOpenWaterCell(mapId, column, row)) {
                         continue;
                     }
                     return true;
@@ -1455,7 +1483,7 @@ export default class World {
         const savedCellY = Math.floor((unclampedY + 16) / cellSize);
         const restoreSurf =
             spawnState?.surfing === true &&
-            isSurfableWaterTag(this.getTerrainTagAtCell(mapId, savedCellX, savedCellY));
+            this.isOpenWaterCell(mapId, savedCellX, savedCellY);
         const spawnPosition = restoreSurf
             ? this.clampPlayerPosition(mapId, unclampedX, unclampedY, 32, 32)
             : this.resolveOpenPlayerPosition(mapId, unclampedX, unclampedY, 32, 32);

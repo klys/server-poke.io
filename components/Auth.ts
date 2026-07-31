@@ -2273,7 +2273,10 @@ export default class Auth {
         }
 
         // Otherwise send to PC storage so nothing is lost.
-        await this.addPokemonToStorage(userId, summary);
+        const stored = await this.addPokemonToStorage(userId, summary);
+        if (!stored.ok) {
+            return { ok: false, message: stored.message, partyFull: true };
+        }
         return { ok: true, pokemonName: resolved.name, boxed: true };
     }
 
@@ -3377,23 +3380,37 @@ export default class Auth {
         }
     }
 
-    /**
-     * Parses the `pokemon_box` hash field into storage boxes. Understands both
-     * the current `{ boxes: [{ name, pokemon }] }` shape and the legacy flat
-     * `PokemonSummary[]` overflow array (migrated by chunking into boxes).
-     * Always returns at least one (possibly empty) box so clients can render
-     * the storage UI without special-casing brand-new accounts.
-     */
+    /** Validates the cosmetic per-box style fields (hex colors, safe image ref). */
+    private sanitizeBoxStyle(raw:{ bgColor?:unknown; bgImage?:unknown; borderColor?:unknown }):StorageBoxStyle {
+        const color = (value:unknown) =>
+            typeof value === "string" && /^#[0-9a-fA-F]{3,8}$/.test(value.trim()) ? value.trim() : undefined;
+        const image = (value:unknown) => {
+            if (typeof value !== "string") return undefined;
+            const trimmed = value.trim();
+            if (trimmed.length === 0 || trimmed.length > 500) return undefined;
+            // Keep it usable inside a CSS url() and block script/data URIs.
+            if (/["'<>]/.test(trimmed) || /^(javascript|data):/i.test(trimmed)) return undefined;
+            return trimmed;
+        };
+        const style:StorageBoxStyle = {};
+        const bgColor = color(raw.bgColor);
+        const bgImage = image(raw.bgImage);
+        const borderColor = color(raw.borderColor);
+        if (bgColor) style.bgColor = bgColor;
+        if (bgImage) style.bgImage = bgImage;
+        if (borderColor) style.borderColor = borderColor;
+        return style;
+    }
+
     private parseItemStorage(value:string | undefined):ItemStorageBox[] {
-        let rawBoxes:Array<{ name?:unknown; items?:unknown }> = [];
+        let rawBoxes:Array<Record<string, unknown>> = [];
 
         if (value) {
             try {
                 const parsed = JSON.parse(value);
                 if (parsed && Array.isArray(parsed.boxes)) {
                     rawBoxes = parsed.boxes.filter(
-                        (box:unknown):box is { name?:unknown; items?:unknown } =>
-                            Boolean(box) && typeof box === "object"
+                        (box:unknown):box is Record<string, unknown> => Boolean(box) && typeof box === "object"
                     );
                 }
             } catch {
@@ -3401,16 +3418,15 @@ export default class Auth {
             }
         }
 
-        const boxes = rawBoxes.map((box, index) => ({
+        const boxes = rawBoxes.slice(0, MAX_STORAGE_BOXES).map((box, index) => ({
             id: `box-${index + 1}`,
             name:
                 typeof box.name === "string" && box.name.trim().length > 0
                     ? box.name.trim().slice(0, 20)
                     : `Box ${index + 1}`,
             capacity: ITEM_BOX_CAPACITY,
-            items: this.sanitizeInventoryForStorage(
-                Array.isArray(box.items) ? (box.items as InventoryItem[]) : []
-            ).slice(0, ITEM_BOX_CAPACITY)
+            ...this.sanitizeBoxStyle(box),
+            items: this.mergeItemStacks(Array.isArray(box.items) ? (box.items as InventoryItem[]) : []).slice(0, ITEM_BOX_CAPACITY)
         } satisfies ItemStorageBox));
 
         if (boxes.length === 0) {
@@ -3420,8 +3436,15 @@ export default class Auth {
         return boxes;
     }
 
+    /**
+     * Parses the `pokemon_box` hash field into storage boxes. Understands both
+     * the current `{ boxes: [{ name, style, pokemon }] }` shape and the legacy
+     * flat `PokemonSummary[]` overflow array (migrated by chunking into boxes).
+     * Always returns at least one (possibly empty) box; capped at
+     * MAX_STORAGE_BOXES.
+     */
     private parsePokemonStorage(value:string | undefined):PokemonStorageBox[] {
-        let rawBoxes:Array<{ name?:unknown; pokemon?:unknown }> = [];
+        let rawBoxes:Array<Record<string, unknown>> = [];
 
         if (value) {
             try {
@@ -3434,8 +3457,7 @@ export default class Auth {
                     }
                 } else if (parsed && Array.isArray(parsed.boxes)) {
                     rawBoxes = parsed.boxes.filter(
-                        (box:unknown):box is { name?:unknown; pokemon?:unknown } =>
-                            Boolean(box) && typeof box === "object"
+                        (box:unknown):box is Record<string, unknown> => Boolean(box) && typeof box === "object"
                     );
                 }
             } catch {
@@ -3443,13 +3465,14 @@ export default class Auth {
             }
         }
 
-        const boxes = rawBoxes.map((box, index) => ({
+        const boxes = rawBoxes.slice(0, MAX_STORAGE_BOXES).map((box, index) => ({
             id: `box-${index + 1}`,
             name:
                 typeof box.name === "string" && box.name.trim().length > 0
                     ? box.name.trim().slice(0, 20)
                     : `Box ${index + 1}`,
             capacity: POKEMON_BOX_CAPACITY,
+            ...this.sanitizeBoxStyle(box),
             pokemon: this.sanitizePokemonListForStorage(
                 Array.isArray(box.pokemon) ? box.pokemon : [],
                 POKEMON_BOX_CAPACITY
@@ -3465,8 +3488,9 @@ export default class Auth {
 
     private serializePokemonStorage(boxes:PokemonStorageBox[]) {
         return JSON.stringify({
-            boxes: boxes.map((box) => ({
+            boxes: boxes.slice(0, MAX_STORAGE_BOXES).map((box) => ({
                 name: box.name,
+                ...this.sanitizeBoxStyle(box),
                 pokemon: this.sanitizePokemonListForStorage(box.pokemon, POKEMON_BOX_CAPACITY)
             }))
         });
@@ -3477,37 +3501,75 @@ export default class Auth {
         return this.parsePokemonStorage(raw ?? undefined);
     }
 
-    /**
-     * Appends a Pokemon to the first storage box with free space, creating a
-     * new box when every existing one is full ("endless" boxes). Used for
-     * captures and event grants that arrive while the party is full.
-     */
-    public async addPokemonToStorage(userId:number, summary:PokemonSummary):Promise<{ boxName:string }> {
-        const boxes = await this.getPokemonStorage(userId);
-        let target = boxes.find((box) => box.pokemon.length < box.capacity);
-        if (!target) {
-            target = {
-                id: `box-${boxes.length + 1}`,
-                name: `Box ${boxes.length + 1}`,
-                capacity: POKEMON_BOX_CAPACITY,
-                pokemon: []
-            };
-            boxes.push(target);
-        }
-        target.pokemon.push(summary);
-        await this.redis.hSet(this.userKey(userId), {
-            pokemon_box: this.serializePokemonStorage(boxes)
-        });
-        return { boxName: target.name };
+    /** Free venomon slots across existing boxes plus boxes that could still be created. */
+    private freePokemonCapacity(boxes:PokemonStorageBox[]):number {
+        const existing = boxes.reduce((sum, box) => sum + (box.capacity - box.pokemon.length), 0);
+        return existing + Math.max(0, MAX_STORAGE_BOXES - boxes.length) * POKEMON_BOX_CAPACITY;
     }
 
     /**
-     * Moves a party Pokemon into a storage box (the given one, or the first
-     * with space). The party can never be emptied completely.
+     * Places `mons` into boxes, filling `preferredBoxId` first (when given),
+     * then the remaining boxes in order, creating new boxes as needed. The
+     * caller must have checked freePokemonCapacity first. Mutates `boxes` and
+     * returns the name of the first box a mon landed in.
      */
+    private placePokemonInStorage(boxes:PokemonStorageBox[], mons:PokemonSummary[], preferredBoxId?:string):string {
+        const order = [...boxes];
+        if (preferredBoxId) {
+            const idx = order.findIndex((box) => box.id === preferredBoxId);
+            if (idx > 0) {
+                const [chosen] = order.splice(idx, 1);
+                order.unshift(chosen);
+            }
+        }
+        let cursor = 0;
+        let firstBoxName = boxes[0]?.name ?? "Box 1";
+        mons.forEach((mon, monIndex) => {
+            while (cursor < order.length && order[cursor].pokemon.length >= order[cursor].capacity) {
+                cursor += 1;
+            }
+            if (cursor >= order.length) {
+                const next:PokemonStorageBox = {
+                    id: `box-${boxes.length + 1}`,
+                    name: `Box ${boxes.length + 1}`,
+                    capacity: POKEMON_BOX_CAPACITY,
+                    pokemon: []
+                };
+                boxes.push(next);
+                order.push(next);
+            }
+            order[cursor].pokemon.push(mon);
+            if (monIndex === 0) {
+                firstBoxName = order[cursor].name;
+            }
+        });
+        return firstBoxName;
+    }
+
+    /**
+     * Appends a Pokemon to the first storage box with free space, creating a
+     * new box when every existing one is full (up to MAX_STORAGE_BOXES). Used
+     * for captures and event grants that arrive while the party is full.
+     */
+    public async addPokemonToStorage(
+        userId:number,
+        summary:PokemonSummary
+    ):Promise<{ ok:true; boxName:string } | { ok:false; message:string }> {
+        const boxes = await this.getPokemonStorage(userId);
+        if (this.freePokemonCapacity(boxes) < 1) {
+            return { ok: false, message: "Your PC storage is completely full." };
+        }
+        const boxName = this.placePokemonInStorage(boxes, [summary]);
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_box: this.serializePokemonStorage(boxes)
+        });
+        return { ok: true, boxName };
+    }
+
+    /** Moves one or more party Pokemon into storage. The party keeps ≥1 member. */
     public async depositPokemonToStorage(
         userId:number,
-        pokemonId:string,
+        pokemonIds:string[],
         boxId?:string
     ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
         const user = await this.getUserById(String(userId));
@@ -3515,70 +3577,52 @@ export default class Auth {
             return { ok: false, message: "Account not found." };
         }
 
-        const party = [...user.pokemonParty];
-        const partyIndex = party.findIndex((pokemon) => pokemon.id === pokemonId);
-        if (partyIndex === -1) {
-            return { ok: false, message: "That Pokemon is not in your party." };
+        const ids = this.uniqueStrings(pokemonIds);
+        if (ids.length === 0) {
+            return { ok: false, message: "Select a Pokemon to deposit." };
         }
-        if (party.length <= 1) {
+
+        const party = [...user.pokemonParty];
+        const moving = ids
+            .map((id) => party.find((pokemon) => pokemon.id === id))
+            .filter((pokemon): pokemon is PokemonSummary => Boolean(pokemon));
+        if (moving.length !== ids.length) {
+            return { ok: false, message: "Some of those Pokemon are not in your party." };
+        }
+        if (party.length - moving.length < 1) {
             return { ok: false, message: "You must keep at least one Pokemon with you." };
         }
 
         const boxes = await this.getPokemonStorage(userId);
-        let target:PokemonStorageBox | undefined;
-        if (typeof boxId === "string" && boxId.length > 0) {
-            target = boxes.find((box) => box.id === boxId);
-            if (!target) {
-                // The client can page into one not-yet-created box (`box-<n+1>`)
-                // and deposit there; materialize it so storage stays endless.
-                if (boxId === `box-${boxes.length + 1}`) {
-                    target = {
-                        id: boxId,
-                        name: `Box ${boxes.length + 1}`,
-                        capacity: POKEMON_BOX_CAPACITY,
-                        pokemon: []
-                    };
-                    boxes.push(target);
-                } else {
-                    return { ok: false, message: "That storage box does not exist." };
-                }
-            } else if (target.pokemon.length >= target.capacity) {
-                return { ok: false, message: `${target.name} is full.` };
-            }
-        } else {
-            target = boxes.find((box) => box.pokemon.length < box.capacity);
-            if (!target) {
-                target = {
-                    id: `box-${boxes.length + 1}`,
-                    name: `Box ${boxes.length + 1}`,
-                    capacity: POKEMON_BOX_CAPACITY,
-                    pokemon: []
-                };
-                boxes.push(target);
-            }
+        const nextId = `box-${boxes.length + 1}`;
+        const targetId = typeof boxId === "string" && boxId.length > 0 ? boxId : undefined;
+        if (targetId && targetId !== nextId && !boxes.some((box) => box.id === targetId)) {
+            return { ok: false, message: "That storage box does not exist." };
+        }
+        if (this.freePokemonCapacity(boxes) < moving.length) {
+            return { ok: false, message: "Your PC storage does not have enough room." };
         }
 
-        const [deposited] = party.splice(partyIndex, 1);
-        target.pokemon.push(deposited);
+        const remaining = party.filter((pokemon) => !ids.includes(pokemon.id));
+        const boxName = this.placePokemonInStorage(boxes, moving, targetId);
 
         await this.redis.hSet(this.userKey(userId), {
-            pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party)),
+            pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(remaining)),
             pokemon_box: this.serializePokemonStorage(boxes)
         });
         this.markPartyChanged(userId);
 
-        const displayName = deposited.nickname || deposited.name;
-        return {
-            ok: true,
-            user: await this.getUserById(String(userId)),
-            message: `${displayName} was deposited into ${target.name}.`
-        };
+        const message =
+            moving.length === 1
+                ? `${moving[0].nickname || moving[0].name} was deposited into ${boxName}.`
+                : `${moving.length} Pokemon were deposited into storage.`;
+        return { ok: true, user: await this.getUserById(String(userId)), message };
     }
 
-    /** Moves a Pokemon from a storage box back into the party (max 6). */
+    /** Moves one or more stored Pokemon back into the party (max 6 total). */
     public async withdrawPokemonFromStorage(
         userId:number,
-        pokemonId:string,
+        pokemonIds:string[],
         boxId:string
     ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
         const user = await this.getUserById(String(userId));
@@ -3586,8 +3630,12 @@ export default class Auth {
             return { ok: false, message: "Account not found." };
         }
 
-        if (user.pokemonParty.length >= MAX_POKEMON_PARTY_SIZE) {
-            return { ok: false, message: "Your party is full." };
+        const ids = this.uniqueStrings(pokemonIds);
+        if (ids.length === 0) {
+            return { ok: false, message: "Select a Pokemon to withdraw." };
+        }
+        if (user.pokemonParty.length + ids.length > MAX_POKEMON_PARTY_SIZE) {
+            return { ok: false, message: "Your party does not have enough room." };
         }
 
         const boxes = await this.getPokemonStorage(userId);
@@ -3596,26 +3644,486 @@ export default class Auth {
             return { ok: false, message: "That storage box does not exist." };
         }
 
-        const boxIndex = box.pokemon.findIndex((pokemon) => pokemon.id === pokemonId);
-        if (boxIndex === -1) {
-            return { ok: false, message: "That Pokemon is not in this box." };
+        const withdrawn:PokemonSummary[] = [];
+        for (const id of ids) {
+            const index = box.pokemon.findIndex((pokemon) => pokemon.id === id);
+            if (index === -1) {
+                return { ok: false, message: "Some of those Pokemon are not in this box." };
+            }
+            withdrawn.push(box.pokemon[index]);
+            box.pokemon.splice(index, 1);
         }
 
-        const [withdrawn] = box.pokemon.splice(boxIndex, 1);
-        const party = [...user.pokemonParty, withdrawn];
-
+        const party = [...user.pokemonParty, ...withdrawn];
         await this.redis.hSet(this.userKey(userId), {
             pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party)),
             pokemon_box: this.serializePokemonStorage(boxes)
         });
         this.markPartyChanged(userId);
 
-        const displayName = withdrawn.nickname || withdrawn.name;
+        const message =
+            withdrawn.length === 1
+                ? `${withdrawn[0].nickname || withdrawn[0].name} joined your party.`
+                : `${withdrawn.length} Pokemon joined your party.`;
+        return { ok: true, user: await this.getUserById(String(userId)), message };
+    }
+
+    /** Moves stored Pokemon from wherever they are into another box. */
+    public async movePokemonBetweenBoxes(
+        userId:number,
+        pokemonIds:string[],
+        toBoxId:string
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const ids = this.uniqueStrings(pokemonIds);
+        if (ids.length === 0) {
+            return { ok: false, message: "Select a Pokemon to move." };
+        }
+
+        const boxes = await this.getPokemonStorage(userId);
+        const nextId = `box-${boxes.length + 1}`;
+        let destination = boxes.find((box) => box.id === toBoxId);
+        if (!destination) {
+            if (toBoxId === nextId && boxes.length < MAX_STORAGE_BOXES) {
+                destination = { id: nextId, name: `Box ${boxes.length + 1}`, capacity: POKEMON_BOX_CAPACITY, pokemon: [] };
+                boxes.push(destination);
+            } else {
+                return { ok: false, message: "That storage box does not exist." };
+            }
+        }
+
+        // Pull the requested mons out of their current boxes (skip the ones
+        // already in the destination), preserving order.
+        const moving:PokemonSummary[] = [];
+        for (const box of boxes) {
+            if (box.id === destination.id) continue;
+            for (let i = box.pokemon.length - 1; i >= 0; i -= 1) {
+                if (ids.includes(box.pokemon[i].id)) {
+                    moving.unshift(box.pokemon[i]);
+                    box.pokemon.splice(i, 1);
+                }
+            }
+        }
+        if (moving.length === 0) {
+            return { ok: false, message: "Those Pokemon are already in that box." };
+        }
+        if (destination.capacity - destination.pokemon.length < moving.length) {
+            return { ok: false, message: `${destination.name} does not have enough room.` };
+        }
+        destination.pokemon.push(...moving);
+
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_box: this.serializePokemonStorage(boxes)
+        });
+        this.markPartyChanged(userId);
+
         return {
             ok: true,
             user: await this.getUserById(String(userId)),
-            message: `${displayName} joined your party.`
+            message:
+                moving.length === 1
+                    ? `${moving[0].nickname || moving[0].name} moved to ${destination.name}.`
+                    : `${moving.length} Pokemon moved to ${destination.name}.`
         };
+    }
+
+    /** Permanently releases ("let go") one or more stored Pokemon. */
+    public async releasePokemonFromStorage(
+        userId:number,
+        pokemonIds:string[]
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const ids = this.uniqueStrings(pokemonIds);
+        if (ids.length === 0) {
+            return { ok: false, message: "Select a Pokemon to let go." };
+        }
+
+        const boxes = await this.getPokemonStorage(userId);
+        const released:PokemonSummary[] = [];
+        for (const box of boxes) {
+            for (let i = box.pokemon.length - 1; i >= 0; i -= 1) {
+                if (ids.includes(box.pokemon[i].id)) {
+                    released.unshift(box.pokemon[i]);
+                    box.pokemon.splice(i, 1);
+                }
+            }
+        }
+        if (released.length === 0) {
+            return { ok: false, message: "Those Pokemon are not in storage." };
+        }
+
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_box: this.serializePokemonStorage(boxes)
+        });
+        this.markPartyChanged(userId);
+
+        return {
+            ok: true,
+            user: await this.getUserById(String(userId)),
+            message:
+                released.length === 1
+                    ? `${released[0].nickname || released[0].name} was let go. Bye-bye!`
+                    : `${released.length} Pokemon were let go.`
+        };
+    }
+
+    /** Adds an empty venomon box (up to MAX_STORAGE_BOXES). */
+    public async createPokemonBox(
+        userId:number
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const boxes = await this.getPokemonStorage(userId);
+        if (boxes.length >= MAX_STORAGE_BOXES) {
+            return { ok: false, message: `You can only have ${MAX_STORAGE_BOXES} boxes.` };
+        }
+        const box:PokemonStorageBox = {
+            id: `box-${boxes.length + 1}`,
+            name: `Box ${boxes.length + 1}`,
+            capacity: POKEMON_BOX_CAPACITY,
+            pokemon: []
+        };
+        boxes.push(box);
+        await this.redis.hSet(this.userKey(userId), { pokemon_box: this.serializePokemonStorage(boxes) });
+        return { ok: true, user: await this.getUserById(String(userId)), message: `${box.name} added.` };
+    }
+
+    /** Updates a venomon box's name and/or cosmetic style. */
+    public async setPokemonBoxStyle(
+        userId:number,
+        boxId:string,
+        patch:{ name?:string } & StorageBoxStyle
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const boxes = await this.getPokemonStorage(userId);
+        const box = boxes.find((candidate) => candidate.id === boxId);
+        if (!box) {
+            return { ok: false, message: "That storage box does not exist." };
+        }
+        this.applyBoxStylePatch(box, patch);
+        await this.redis.hSet(this.userKey(userId), { pokemon_box: this.serializePokemonStorage(boxes) });
+        return { ok: true, user: await this.getUserById(String(userId)), message: `${box.name} updated.` };
+    }
+
+    // ---- item storage -----------------------------------------------------
+
+    private mergeItemStacks(items:InventoryItem[]):InventoryItem[] {
+        const byId = new Map<string, InventoryItem>();
+        for (const item of this.sanitizeInventoryForStorage(items)) {
+            if (item.quantity <= 0) continue;
+            const existing = byId.get(item.id);
+            if (existing) {
+                existing.quantity += item.quantity;
+            } else {
+                byId.set(item.id, { ...item });
+            }
+        }
+        return Array.from(byId.values());
+    }
+
+    private serializeItemStorage(boxes:ItemStorageBox[]) {
+        return JSON.stringify({
+            boxes: boxes.slice(0, MAX_STORAGE_BOXES).map((box) => ({
+                name: box.name,
+                ...this.sanitizeBoxStyle(box),
+                items: this.mergeItemStacks(box.items).slice(0, ITEM_BOX_CAPACITY)
+            }))
+        });
+    }
+
+    public async getItemStorage(userId:number):Promise<ItemStorageBox[]> {
+        const raw = await this.redis.hGet(this.userKey(userId), "item_box");
+        return this.parseItemStorage(raw ?? undefined);
+    }
+
+    /** Moves a quantity of an inventory item into an item box. */
+    public async depositItemToStorage(
+        userId:number,
+        itemId:string,
+        quantity:number,
+        boxId?:string
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const user = await this.getUserById(String(userId));
+        if (!user) {
+            return { ok: false, message: "Account not found." };
+        }
+        const amount = Math.max(1, Math.round(Number(quantity) || 0));
+        const inventory = user.inventory.map((item) => ({ ...item }));
+        const source = inventory.find((item) => item.id === itemId);
+        if (!source || source.quantity <= 0) {
+            return { ok: false, message: "You don't have that item." };
+        }
+        const moved = Math.min(amount, source.quantity);
+
+        const boxes = await this.getItemStorage(userId);
+        const nextId = `box-${boxes.length + 1}`;
+        let target = typeof boxId === "string" && boxId.length > 0 ? boxes.find((box) => box.id === boxId) : undefined;
+        if (typeof boxId === "string" && boxId.length > 0 && !target) {
+            if (boxId === nextId && boxes.length < MAX_STORAGE_BOXES) {
+                target = { id: nextId, name: `Box ${boxes.length + 1}`, capacity: ITEM_BOX_CAPACITY, items: [] };
+                boxes.push(target);
+            } else {
+                return { ok: false, message: "That item box does not exist." };
+            }
+        }
+        if (!target) {
+            target = boxes.find((box) => box.items.some((item) => item.id === itemId))
+                ?? boxes.find((box) => box.items.length < box.capacity);
+            if (!target) {
+                if (boxes.length >= MAX_STORAGE_BOXES) {
+                    return { ok: false, message: "Your item storage is completely full." };
+                }
+                target = { id: nextId, name: `Box ${boxes.length + 1}`, capacity: ITEM_BOX_CAPACITY, items: [] };
+                boxes.push(target);
+            }
+        }
+
+        const existing = target.items.find((item) => item.id === itemId);
+        if (!existing && target.items.length >= target.capacity) {
+            return { ok: false, message: `${target.name} is full.` };
+        }
+
+        source.quantity -= moved;
+        if (existing) {
+            existing.quantity += moved;
+        } else {
+            target.items.push({ ...source, quantity: moved });
+        }
+
+        await this.redis.hSet(this.userKey(userId), {
+            inventory: JSON.stringify(this.sanitizeInventoryForStorage(inventory.filter((item) => item.quantity > 0))),
+            item_box: this.serializeItemStorage(boxes)
+        });
+        return {
+            ok: true,
+            user: await this.getUserById(String(userId)),
+            message: `${moved}x ${source.name} stored in ${target.name}.`
+        };
+    }
+
+    /** Moves a quantity of an item from a box back into the bag. */
+    public async withdrawItemFromStorage(
+        userId:number,
+        itemId:string,
+        quantity:number,
+        boxId:string
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const user = await this.getUserById(String(userId));
+        if (!user) {
+            return { ok: false, message: "Account not found." };
+        }
+        const amount = Math.max(1, Math.round(Number(quantity) || 0));
+        const boxes = await this.getItemStorage(userId);
+        const box = boxes.find((candidate) => candidate.id === boxId);
+        if (!box) {
+            return { ok: false, message: "That item box does not exist." };
+        }
+        const stack = box.items.find((item) => item.id === itemId);
+        if (!stack || stack.quantity <= 0) {
+            return { ok: false, message: "That item is not in this box." };
+        }
+        const moved = Math.min(amount, stack.quantity);
+        stack.quantity -= moved;
+        box.items = box.items.filter((item) => item.quantity > 0);
+
+        const inventory = user.inventory.map((item) => ({ ...item }));
+        const existing = inventory.find((item) => item.id === itemId);
+        if (existing) {
+            existing.quantity += moved;
+        } else {
+            inventory.push({ ...stack, quantity: moved });
+        }
+
+        await this.redis.hSet(this.userKey(userId), {
+            inventory: JSON.stringify(this.sanitizeInventoryForStorage(inventory)),
+            item_box: this.serializeItemStorage(boxes)
+        });
+        return {
+            ok: true,
+            user: await this.getUserById(String(userId)),
+            message: `${moved}x ${stack.name} returned to your bag.`
+        };
+    }
+
+    /** Moves a quantity of an item from one box to another. */
+    public async moveItemBetweenBoxes(
+        userId:number,
+        itemId:string,
+        quantity:number,
+        fromBoxId:string,
+        toBoxId:string
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        if (fromBoxId === toBoxId) {
+            return { ok: false, message: "Pick a different box." };
+        }
+        const amount = Math.max(1, Math.round(Number(quantity) || 0));
+        const boxes = await this.getItemStorage(userId);
+        const from = boxes.find((box) => box.id === fromBoxId);
+        if (!from) {
+            return { ok: false, message: "That item box does not exist." };
+        }
+        const nextId = `box-${boxes.length + 1}`;
+        let to = boxes.find((box) => box.id === toBoxId);
+        if (!to) {
+            if (toBoxId === nextId && boxes.length < MAX_STORAGE_BOXES) {
+                to = { id: nextId, name: `Box ${boxes.length + 1}`, capacity: ITEM_BOX_CAPACITY, items: [] };
+                boxes.push(to);
+            } else {
+                return { ok: false, message: "That item box does not exist." };
+            }
+        }
+        const stack = from.items.find((item) => item.id === itemId);
+        if (!stack || stack.quantity <= 0) {
+            return { ok: false, message: "That item is not in the source box." };
+        }
+        const existing = to.items.find((item) => item.id === itemId);
+        if (!existing && to.items.length >= to.capacity) {
+            return { ok: false, message: `${to.name} is full.` };
+        }
+        const moved = Math.min(amount, stack.quantity);
+        stack.quantity -= moved;
+        from.items = from.items.filter((item) => item.quantity > 0);
+        if (existing) {
+            existing.quantity += moved;
+        } else {
+            to.items.push({ ...stack, quantity: moved });
+        }
+
+        await this.redis.hSet(this.userKey(userId), { item_box: this.serializeItemStorage(boxes) });
+        return {
+            ok: true,
+            user: await this.getUserById(String(userId)),
+            message: `${moved}x ${stack.name} moved to ${to.name}.`
+        };
+    }
+
+    /** Permanently discards ("let go") a quantity of an item from a box. */
+    public async releaseItemFromStorage(
+        userId:number,
+        itemId:string,
+        quantity:number,
+        boxId:string
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const amount = Math.max(1, Math.round(Number(quantity) || 0));
+        const boxes = await this.getItemStorage(userId);
+        const box = boxes.find((candidate) => candidate.id === boxId);
+        if (!box) {
+            return { ok: false, message: "That item box does not exist." };
+        }
+        const stack = box.items.find((item) => item.id === itemId);
+        if (!stack || stack.quantity <= 0) {
+            return { ok: false, message: "That item is not in this box." };
+        }
+        const removed = Math.min(amount, stack.quantity);
+        const name = stack.name;
+        stack.quantity -= removed;
+        box.items = box.items.filter((item) => item.quantity > 0);
+
+        await this.redis.hSet(this.userKey(userId), { item_box: this.serializeItemStorage(boxes) });
+        return {
+            ok: true,
+            user: await this.getUserById(String(userId)),
+            message: `Threw away ${removed}x ${name}.`
+        };
+    }
+
+    /** Adds an empty item box (up to MAX_STORAGE_BOXES). */
+    public async createItemBox(
+        userId:number
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const boxes = await this.getItemStorage(userId);
+        if (boxes.length >= MAX_STORAGE_BOXES) {
+            return { ok: false, message: `You can only have ${MAX_STORAGE_BOXES} item boxes.` };
+        }
+        const box:ItemStorageBox = {
+            id: `box-${boxes.length + 1}`,
+            name: `Box ${boxes.length + 1}`,
+            capacity: ITEM_BOX_CAPACITY,
+            items: []
+        };
+        boxes.push(box);
+        await this.redis.hSet(this.userKey(userId), { item_box: this.serializeItemStorage(boxes) });
+        return { ok: true, user: await this.getUserById(String(userId)), message: `${box.name} added.` };
+    }
+
+    /** Updates an item box's name and/or cosmetic style. */
+    public async setItemBoxStyle(
+        userId:number,
+        boxId:string,
+        patch:{ name?:string } & StorageBoxStyle
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const boxes = await this.getItemStorage(userId);
+        const box = boxes.find((candidate) => candidate.id === boxId);
+        if (!box) {
+            return { ok: false, message: "That item box does not exist." };
+        }
+        this.applyBoxStylePatch(box, patch);
+        await this.redis.hSet(this.userKey(userId), { item_box: this.serializeItemStorage(boxes) });
+        return { ok: true, user: await this.getUserById(String(userId)), message: `${box.name} updated.` };
+    }
+
+    // ---- PC money bank ----------------------------------------------------
+
+    /** Moves money from the wallet into the PC bank. */
+    public async depositMoneyToPc(
+        userId:number,
+        amount:number
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const value = Math.max(1, Math.round(Number(amount) || 0));
+        const user = await this.getUserById(String(userId));
+        if (!user) {
+            return { ok: false, message: "Account not found." };
+        }
+        if (user.money < value) {
+            return { ok: false, message: "You don't have that much money on hand." };
+        }
+        await this.redis.hSet(this.userKey(userId), {
+            money: String(user.money - value),
+            pc_money: String(user.pcMoney + value)
+        });
+        return { ok: true, user: await this.getUserById(String(userId)), message: `Deposited $${value} into the PC.` };
+    }
+
+    /** Moves money from the PC bank back into the wallet. */
+    public async withdrawMoneyFromPc(
+        userId:number,
+        amount:number
+    ):Promise<{ ok:true; user:AuthenticatedUser | null; message:string } | { ok:false; message:string }> {
+        const value = Math.max(1, Math.round(Number(amount) || 0));
+        const user = await this.getUserById(String(userId));
+        if (!user) {
+            return { ok: false, message: "Account not found." };
+        }
+        if (user.pcMoney < value) {
+            return { ok: false, message: "The PC doesn't hold that much money." };
+        }
+        await this.redis.hSet(this.userKey(userId), {
+            money: String(user.money + value),
+            pc_money: String(user.pcMoney - value)
+        });
+        return { ok: true, user: await this.getUserById(String(userId)), message: `Withdrew $${value} from the PC.` };
+    }
+
+    // ---- storage helpers --------------------------------------------------
+
+    private uniqueStrings(values:unknown):string[] {
+        if (!Array.isArray(values)) {
+            return typeof values === "string" && values.length > 0 ? [values] : [];
+        }
+        const seen = new Set<string>();
+        for (const value of values) {
+            if (typeof value === "string" && value.length > 0) {
+                seen.add(value);
+            }
+        }
+        return Array.from(seen);
+    }
+
+    private applyBoxStylePatch(box:{ name:string } & StorageBoxStyle, patch:{ name?:string } & StorageBoxStyle) {
+        if (typeof patch.name === "string" && patch.name.trim().length > 0) {
+            box.name = patch.name.trim().slice(0, 20);
+        }
+        const style = this.sanitizeBoxStyle(patch);
+        // Each style field is independently set (valid value) or cleared (the
+        // key is present in the patch but empty/invalid → reset to default).
+        if ("bgColor" in patch) box.bgColor = style.bgColor;
+        if ("bgImage" in patch) box.bgImage = style.bgImage;
+        if ("borderColor" in patch) box.borderColor = style.borderColor;
     }
 
     private normalizePokemonNickname(value:unknown) {

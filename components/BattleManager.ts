@@ -1976,9 +1976,9 @@ export default class BattleManager {
       const spot = (editorData?.fishingSpots ?? []).find(
         (candidate) => candidate.x === facing.x && candidate.y === facing.y
       );
-      const facingTag = this.world.getTerrainTagAtCell(player.currentMapId, facing.x, facing.y);
-      if (!spot && !isSurfableWaterTag(facingTag)) {
-        // Decorative/edge water carries no water terrain tag — not fishable.
+      if (!spot && !this.world.isOpenWaterCell(player.currentMapId, facing.x, facing.y)) {
+        // Decorative water (no water tag) and obstacles drawn over water
+        // (rocks) are not fishable.
         return { ok: false, message: "Aquí no se puede pescar. Mira hacia el agua." };
       }
       if (spot) {
@@ -2156,8 +2156,7 @@ export default class BattleManager {
     const cellSize = this.world.getMapCellSize(player.currentMapId);
     const current = player.getCurrentCell(cellSize);
     const distance = Math.abs(current.x - target.x) + Math.abs(current.y - target.y);
-    const targetTag = this.world.getTerrainTagAtCell(player.currentMapId, target.x, target.y);
-    const targetIsWater = isSurfableWaterTag(targetTag);
+    const targetIsWater = this.world.isOpenWaterCell(player.currentMapId, target.x, target.y);
     const editorData = this.world.getPlayableMapsState()?.editorDataByMapId[player.currentMapId];
     const spot = (editorData?.fishingSpots ?? []).find(
       (candidate) => candidate.x === target.x && candidate.y === target.y
@@ -2699,22 +2698,22 @@ export default class BattleManager {
     };
   }
 
-  public async depositPokemonToBox(userId: number, pokemonId: string, boxId?: string) {
+  public async depositPokemonToBox(userId: number, pokemonIds: string[], boxId?: string) {
     const player = this.world.getPlayerByUserId(userId);
     if (player && this.isPlayerBattling(player.socketId)) {
       return { ok: false as const, message: "You can't use the storage system during a battle." };
     }
 
-    return this.auth.depositPokemonToStorage(userId, pokemonId, boxId);
+    return this.auth.depositPokemonToStorage(userId, pokemonIds, boxId);
   }
 
-  public async withdrawPokemonFromBox(userId: number, pokemonId: string, boxId: string) {
+  public async withdrawPokemonFromBox(userId: number, pokemonIds: string[], boxId: string) {
     const player = this.world.getPlayerByUserId(userId);
     if (player && this.isPlayerBattling(player.socketId)) {
       return { ok: false as const, message: "You can't use the storage system during a battle." };
     }
 
-    return this.auth.withdrawPokemonFromStorage(userId, pokemonId, boxId);
+    return this.auth.withdrawPokemonFromStorage(userId, pokemonIds, boxId);
   }
 
   public async takeHeldItem(userId: number, pokemonId: string) {
@@ -6003,9 +6002,12 @@ export default class BattleManager {
     };
 
     if (side.party.length >= MAX_PARTY_SIZE && typeof side.userId === "number") {
-      // Party full: the catch still succeeds and goes straight to PC storage.
-      const { boxName } = await this.auth.addPokemonToStorage(side.userId, caughtSummary);
-      const storedMessage = `${getPokemonDisplayName(wildPokemon)} was sent to storage (${boxName}).`;
+      // Party full: the catch still succeeds and goes straight to PC storage
+      // (unless storage itself is completely full).
+      const stored = await this.auth.addPokemonToStorage(side.userId, caughtSummary);
+      const storedMessage = stored.ok
+        ? `${getPokemonDisplayName(wildPokemon)} was sent to storage (${stored.boxName}).`
+        : `${getPokemonDisplayName(wildPokemon)} was caught, but ${stored.message}`;
       this.pushEvent(battle, { kind: "message", text: storedMessage }, storedMessage);
       await this.finishBattle(battle, `${getPokemonDisplayName(wildPokemon)} was caught!`, side, opponent);
       return true;

@@ -425,6 +425,41 @@ async function main() {
       log("⚠ no walkable underwater cell found — underwater encounter test skipped");
     }
 
+    // ════ Obstacles drawn over water (rocks/cliffs) block surf + fishing ════
+    // (61,14) is walkable shore; (61,13) has an impassable tile over sea water
+    // — its terrain tag is still "water", but passageTerrainTags marks the
+    // deciding tile as non-water, so every water action must refuse it.
+    log("── water-obstacle (rock) cells ──");
+    {
+      const G = await newClient("G");
+      await seedAndJoin(G, {
+        mapId: MAP, x: 61, y: 14,
+        moves: ["Surf"], inventory: [rod("item-superrod")]
+      });
+      const ROCK = { x: 61, y: 13 };
+
+      G.socket.emit("field:actions", { x: ROCK.x, y: ROCK.y });
+      const rockActions = await waitFor("rock field:actions", () =>
+        G.fieldActions.find((a) => a.x === ROCK.x && a.y === ROCK.y)
+      );
+      if (rockActions.actions.fish.available) fail("fishing offered on a rock-over-water cell");
+      if (rockActions.actions.surf.available) fail("surf offered on a rock-over-water cell");
+
+      G.socket.emit("player:surf", { x: ROCK.x, y: ROCK.y });
+      await waitFor("rock surf rejected", () =>
+        G.fieldErrors.find((e) => e.skill === "surf" && /agua/i.test(e.message))
+      );
+      if (G.surfStates.some((s) => s.surfing === true && s.playerId?.includes(String(G.userId)))) {
+        fail("player mounted a rock-over-water cell");
+      }
+
+      const rockCast = await castAndWait(G, ROCK, "item-superrod");
+      if (rockCast.status !== "error" || !/no se puede pescar/i.test(rockCast.message)) {
+        fail(`rock cast should be rejected: ${JSON.stringify(rockCast)}`);
+      }
+      log("  ✓ rock-over-water cell refuses surf, fishing, and menu availability");
+    }
+
     // ── land-walk must NOT roll water tables: B walks the shore ──
     log("── land walk near water (no water-table encounters) ──");
     {

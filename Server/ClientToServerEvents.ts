@@ -149,17 +149,66 @@ export default interface ClientToServerEvents {
   "pokemon:forget-move": (data: { pokemonId: string; moveName: string }) => void;
 
   /**
-   * Moves a party Pokemon into PC box storage. Omit `boxId` to use the first
-   * box with free space (a new box is created when every box is full). The
-   * last party Pokemon cannot be deposited. Not allowed during a battle.
+   * Moves one or more party Pokemon into PC box storage. Omit `boxId` to use
+   * the first box with free space (a new box is created when every box is
+   * full, up to 15). The last party Pokemon cannot be deposited. Not allowed
+   * during a battle. `pokemonId` is accepted for backward compatibility.
    */
-  "pokemon:box-deposit": (data: { pokemonId: string; boxId?: string }) => void;
+  "pokemon:box-deposit": (data: { pokemonIds?: string[]; pokemonId?: string; boxId?: string }) => void;
 
   /**
-   * Moves a Pokemon from the given PC storage box back into the party.
-   * Fails when the party already has 6 members. Not allowed during a battle.
+   * Moves one or more Pokemon from the given PC storage box back into the
+   * party. Fails when the party would exceed 6. Not allowed during a battle.
    */
-  "pokemon:box-withdraw": (data: { pokemonId: string; boxId: string }) => void;
+  "pokemon:box-withdraw": (data: { pokemonIds?: string[]; pokemonId?: string; boxId: string }) => void;
+
+  /** Moves one or more stored Pokemon into another box (`toBoxId`). */
+  "pokemon:box-move": (data: { pokemonIds: string[]; toBoxId: string }) => void;
+
+  /** Permanently releases ("let go") one or more stored Pokemon. */
+  "pokemon:box-release": (data: { pokemonIds: string[] }) => void;
+
+  /** Adds a new empty venomon box (up to 15). */
+  "pokemon:box-create": () => void;
+
+  /** Renames / restyles a venomon box (colors + background image asset). */
+  "pokemon:box-style": (data: {
+    boxId: string;
+    name?: string;
+    bgColor?: string;
+    bgImage?: string;
+    borderColor?: string;
+  }) => void;
+
+  /** Moves a quantity of a bag item into an item box (auto box when omitted). */
+  "item:box-deposit": (data: { itemId: string; quantity: number; boxId?: string }) => void;
+
+  /** Moves a quantity of an item from an item box back into the bag. */
+  "item:box-withdraw": (data: { itemId: string; quantity: number; boxId: string }) => void;
+
+  /** Moves a quantity of an item from one item box to another. */
+  "item:box-move": (data: { itemId: string; quantity: number; fromBoxId: string; toBoxId: string }) => void;
+
+  /** Permanently discards ("let go") a quantity of an item from a box. */
+  "item:box-release": (data: { itemId: string; quantity: number; boxId: string }) => void;
+
+  /** Adds a new empty item box (up to 15). */
+  "item:box-create": () => void;
+
+  /** Renames / restyles an item box (colors + background image asset). */
+  "item:box-style": (data: {
+    boxId: string;
+    name?: string;
+    bgColor?: string;
+    bgImage?: string;
+    borderColor?: string;
+  }) => void;
+
+  /** Deposits wallet money into the PC bank. */
+  "pc:money-deposit": (data: { amount: number }) => void;
+
+  /** Withdraws money from the PC bank back into the wallet. */
+  "pc:money-withdraw": (data: { amount: number }) => void;
 
   /**
    * Registers a new player account and starts an authenticated socket session.

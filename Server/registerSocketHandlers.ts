@@ -2790,32 +2790,42 @@ function createConnectionHandler(
       socket.emit("auth:info", { message: result.message });
     });
 
+    // Normalizes the batch/legacy id shape ({pokemonIds} or {pokemonId}).
+    const normalizeVenomonIds = (data: { pokemonIds?: unknown; pokemonId?: unknown }) => {
+      if (Array.isArray(data?.pokemonIds)) {
+        return data.pokemonIds.filter((id): id is string => typeof id === "string" && id.length > 0);
+      }
+      return typeof data?.pokemonId === "string" && data.pokemonId.length > 0 ? [data.pokemonId] : [];
+    };
+
+    const emitStorageResult = (
+      result: { ok: true; user: unknown; message: string } | { ok: false; message: string }
+    ) => {
+      if (!result.ok) {
+        socket.emit("auth:error", { message: result.message });
+        return;
+      }
+      socket.emit("auth:session", { authenticated: true, user: (result.user as never) ?? null });
+      socket.emit("auth:info", { message: result.message });
+    };
+
     socket.on("pokemon:box-deposit", async (data) => {
       if (typeof socket.data.userId !== "number") {
         socket.emit("auth:error", { message: "Log in to use the storage system." });
         return;
       }
-
-      if (typeof data?.pokemonId !== "string" || data.pokemonId.length === 0) {
+      const ids = normalizeVenomonIds(data ?? {});
+      if (ids.length === 0) {
         socket.emit("auth:error", { message: "Select a Pokemon to deposit." });
         return;
       }
+      if (!guardTradedAssets("pokemon:box-deposit", { venomonIds: ids })) return;
 
-      if (!guardTradedAssets("pokemon:box-deposit", { venomonIds: [data.pokemonId] })) return;
-
-      const result = await battleManager.depositPokemonToBox(
+      emitStorageResult(await battleManager.depositPokemonToBox(
         socket.data.userId,
-        data.pokemonId,
-        typeof data.boxId === "string" && data.boxId.length > 0 ? data.boxId : undefined
-      );
-
-      if (!result.ok) {
-        socket.emit("auth:error", { message: result.message });
-        return;
-      }
-
-      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
-      socket.emit("auth:info", { message: result.message });
+        ids,
+        typeof data?.boxId === "string" && data.boxId.length > 0 ? data.boxId : undefined
+      ));
     });
 
     socket.on("pokemon:box-withdraw", async (data) => {
@@ -2823,30 +2833,183 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Log in to use the storage system." });
         return;
       }
-
-      if (
-        typeof data?.pokemonId !== "string" || data.pokemonId.length === 0 ||
-        typeof data?.boxId !== "string" || data.boxId.length === 0
-      ) {
+      const ids = normalizeVenomonIds(data ?? {});
+      if (ids.length === 0 || typeof data?.boxId !== "string" || data.boxId.length === 0) {
         socket.emit("auth:error", { message: "Select a Pokemon to withdraw." });
         return;
       }
+      if (!guardTradedAssets("pokemon:box-withdraw", { venomonIds: ids })) return;
 
-      if (!guardTradedAssets("pokemon:box-withdraw", { venomonIds: [data.pokemonId] })) return;
+      emitStorageResult(await battleManager.withdrawPokemonFromBox(socket.data.userId, ids, data.boxId));
+    });
 
-      const result = await battleManager.withdrawPokemonFromBox(
-        socket.data.userId,
-        data.pokemonId,
-        data.boxId
-      );
-
-      if (!result.ok) {
-        socket.emit("auth:error", { message: result.message });
+    socket.on("pokemon:box-move", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
         return;
       }
+      const ids = normalizeVenomonIds(data ?? {});
+      if (ids.length === 0 || typeof data?.toBoxId !== "string" || data.toBoxId.length === 0) {
+        socket.emit("auth:error", { message: "Select a Pokemon to move." });
+        return;
+      }
+      if (!guardTradedAssets("pokemon:box-move", { venomonIds: ids })) return;
 
-      socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
-      socket.emit("auth:info", { message: result.message });
+      emitStorageResult(await auth.movePokemonBetweenBoxes(socket.data.userId, ids, data.toBoxId));
+    });
+
+    socket.on("pokemon:box-release", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+      const ids = normalizeVenomonIds(data ?? {});
+      if (ids.length === 0) {
+        socket.emit("auth:error", { message: "Select a Pokemon to let go." });
+        return;
+      }
+      if (!guardTradedAssets("pokemon:box-release", { venomonIds: ids })) return;
+
+      emitStorageResult(await auth.releasePokemonFromStorage(socket.data.userId, ids));
+    });
+
+    socket.on("pokemon:box-create", async () => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+      emitStorageResult(await auth.createPokemonBox(socket.data.userId));
+    });
+
+    socket.on("pokemon:box-style", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+      if (typeof data?.boxId !== "string" || data.boxId.length === 0) {
+        socket.emit("auth:error", { message: "That storage box does not exist." });
+        return;
+      }
+      emitStorageResult(await auth.setPokemonBoxStyle(socket.data.userId, data.boxId, {
+        name: data.name,
+        bgColor: data.bgColor,
+        bgImage: data.bgImage,
+        borderColor: data.borderColor
+      }));
+    });
+
+    socket.on("item:box-deposit", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+      if (typeof data?.itemId !== "string" || data.itemId.length === 0) {
+        socket.emit("auth:error", { message: "Select an item to store." });
+        return;
+      }
+      emitStorageResult(await auth.depositItemToStorage(
+        socket.data.userId,
+        data.itemId,
+        Number(data.quantity) || 1,
+        typeof data.boxId === "string" && data.boxId.length > 0 ? data.boxId : undefined
+      ));
+    });
+
+    socket.on("item:box-withdraw", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+      if (typeof data?.itemId !== "string" || typeof data?.boxId !== "string" || data.boxId.length === 0) {
+        socket.emit("auth:error", { message: "Select an item to withdraw." });
+        return;
+      }
+      emitStorageResult(await auth.withdrawItemFromStorage(
+        socket.data.userId,
+        data.itemId,
+        Number(data.quantity) || 1,
+        data.boxId
+      ));
+    });
+
+    socket.on("item:box-move", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+      if (
+        typeof data?.itemId !== "string" ||
+        typeof data?.fromBoxId !== "string" ||
+        typeof data?.toBoxId !== "string"
+      ) {
+        socket.emit("auth:error", { message: "Select an item to move." });
+        return;
+      }
+      emitStorageResult(await auth.moveItemBetweenBoxes(
+        socket.data.userId,
+        data.itemId,
+        Number(data.quantity) || 1,
+        data.fromBoxId,
+        data.toBoxId
+      ));
+    });
+
+    socket.on("item:box-release", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+      if (typeof data?.itemId !== "string" || typeof data?.boxId !== "string" || data.boxId.length === 0) {
+        socket.emit("auth:error", { message: "Select an item to throw away." });
+        return;
+      }
+      emitStorageResult(await auth.releaseItemFromStorage(
+        socket.data.userId,
+        data.itemId,
+        Number(data.quantity) || 1,
+        data.boxId
+      ));
+    });
+
+    socket.on("item:box-create", async () => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+      emitStorageResult(await auth.createItemBox(socket.data.userId));
+    });
+
+    socket.on("item:box-style", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the storage system." });
+        return;
+      }
+      if (typeof data?.boxId !== "string" || data.boxId.length === 0) {
+        socket.emit("auth:error", { message: "That item box does not exist." });
+        return;
+      }
+      emitStorageResult(await auth.setItemBoxStyle(socket.data.userId, data.boxId, {
+        name: data.name,
+        bgColor: data.bgColor,
+        bgImage: data.bgImage,
+        borderColor: data.borderColor
+      }));
+    });
+
+    socket.on("pc:money-deposit", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the PC bank." });
+        return;
+      }
+      emitStorageResult(await auth.depositMoneyToPc(socket.data.userId, Number(data?.amount) || 0));
+    });
+
+    socket.on("pc:money-withdraw", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to use the PC bank." });
+        return;
+      }
+      emitStorageResult(await auth.withdrawMoneyFromPc(socket.data.userId, Number(data?.amount) || 0));
     });
 
     socket.on("inventory:take-held-item", async (data) => {

@@ -548,6 +548,8 @@ export type TradeMutationSource =
   | "inventory:teach-move"
   | "pokemon:box-deposit"
   | "pokemon:box-withdraw"
+  | "pokemon:box-move"
+  | "pokemon:box-release"
   | "pokemon:reorder"
   | "pokemon:learn-move"
   | "pokemon:forget-move"
