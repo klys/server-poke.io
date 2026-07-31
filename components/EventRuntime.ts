@@ -51,6 +51,27 @@ import {
   RE_ROCKSMASH_ENCOUNTER,
   RE_SET_TEMP_SWITCH,
   RE_SET_SELF_SWITCH_OTHER,
+  RE_CHOOSE_POKEMON,
+  RE_START_TRADE,
+  RE_CHOOSE_ITEM_LIST,
+  RE_DELETE_ITEM,
+  RE_RECEIVE_ITEM_VAR,
+  RE_CONVERT_ITEM_TO_ITEM,
+  RE_CONVERT_ITEM_TO_POKEMON,
+  RE_SET_VAR_ITEM_NAME,
+  RE_SET_VAR_SPECIES_NAME,
+  RE_ADD_TO_PARTY_VAR,
+  RE_PICK_BERRY,
+  RE_TEXT_ENTRY,
+  RE_GET_POKEMON_EGG,
+  RE_GET_POKEMON_SHADOW,
+  RE_GET_POKEMON_FOREIGN,
+  RE_CHECK_ABLE_VAR,
+  RE_RENAME_TO_SPECIES,
+  RE_RENAME_TO_VAR,
+  RE_VAR_EQ_PKMN_NAME,
+  RE_STRING_VAR_EMPTY_OR_EQ,
+  RE_PLAYER_CELL_COORD,
   matchTrainerBattle,
   recognizeScriptCondition,
   classifyIgnorableCommand,
@@ -58,6 +79,14 @@ import {
   compareNumbers
 } from "./essentialsScriptAdapters";
 import LEGACY_ITEM_INTERNAL_BY_NUMBER from "./legacyItemNumbers";
+
+/** Reverse of the legacy item table: internal name (uppercase) -> numeric id. */
+const LEGACY_ITEM_NUMBER_BY_INTERNAL = new Map<string, number>(
+  Object.entries(LEGACY_ITEM_INTERNAL_BY_NUMBER).map(([number, internal]) => [
+    internal.toUpperCase(),
+    Number(number)
+  ])
+);
 
 type TypedSocketServer = Server<
   ClientToServerEvents,
@@ -212,6 +241,17 @@ type Session = {
   eventCell: { x: number; y: number } | null; // event cell coords (get_character(0).onEvent?)
   placementId: string; // map placement that hosts this event ("" for resumes)
   isTouch: boolean; // started by walking into/onto the event (doors, mats)
+  // Sight-trap push-back: when a Trainer(X) line-of-sight event ends with its
+  // touch page still armed (the gate stayed locked), the player is returned to
+  // this tile — outside the sight corridor — so the trap can never be crossed
+  // by simply closing the dialog and walking on.
+  sightPushCell: { x: number; y: number } | null;
+  startMapId: string;
+  // Session-scoped STRING variables: Essentials events store item/species/
+  // entered names in $game_variables for \v[N] text interpolation (Kurt,
+  // fossil reviver, name rater). Numeric variables persist as usual; these
+  // string values only live for the session that produced them.
+  stringVars: Record<string, string>;
   nodesRun: number; // hang guard against mis-authored label loops
   // Switch/variable/self-switch changes buffer here and only persist at
   // checkpoints (side-effectful nodes and clean session end). An aborted
@@ -236,6 +276,13 @@ export default class EventRuntime {
   private sessions = new Map<number, Session>();
   private pending = new Map<number, Pending>();
   private tokenCounter = 0;
+  private touchCooldownReset: ((userId: number) => void) | null = null;
+  // Touch/sight events that fired while the player was in a battle or another
+  // event; replayed when they are free (see queueMissedTouch).
+  private pendingTouches = new Map<
+    number,
+    { placementId: string; sightPushCell: { x: number; y: number } | null; mapId: string; at: number }
+  >();
   // pbPokemonMart sessions: what each user's currently-open mart sells. The
   // buy/sell socket handlers validate against this (plus the usual placement
   // proximity check), so prices/stock can't be forged client-side.
@@ -270,7 +317,11 @@ export default class EventRuntime {
   }
 
   // -- entry point ---------------------------------------------------------
-  public async startEvent(userId: number, npcPlacementId?: string, options?: { touch?: boolean }) {
+  public async startEvent(
+    userId: number,
+    npcPlacementId?: string,
+    options?: { touch?: boolean; sightPushCell?: { x: number; y: number } | null }
+  ) {
     if (typeof npcPlacementId !== "string" || !npcPlacementId) {
       return { ok: false as const, message: "Choose someone to talk to." };
     }
@@ -356,7 +407,8 @@ export default class EventRuntime {
       npcPlacementId,
       typeof placement.x === "number" && typeof placement.y === "number"
         ? { x: placement.x, y: placement.y }
-        : null
+        : null,
+      options?.sightPushCell ?? null
     );
     return { ok: true as const };
   }
@@ -484,7 +536,48 @@ export default class EventRuntime {
     // Autorun may have flipped switches (e.g. the lab intro's permission switch);
     // refresh the client's copy so conditional NPCs update.
     await this.emitEventState(userId);
+    // A trap/sight event that fired while another event (or a battle that has
+    // since ended) held the player gets its turn now.
+    this.firePendingTouch(userId);
     return { ready: true, ran: ranAny };
+  }
+
+  /**
+   * A touch/sight event that fired while the player was busy (a wild battle
+   * starting on the same step, a running cutscene) is remembered instead of
+   * dropped, and replayed the moment the player is free — a trainer who
+   * spotted you is never skipped because a Zubat got there first.
+   */
+  public queueMissedTouch(
+    userId: number,
+    placementId: string,
+    sightPushCell: { x: number; y: number } | null,
+    mapId: string
+  ) {
+    this.pendingTouches.set(userId, { placementId, sightPushCell, mapId, at: Date.now() });
+  }
+
+  /** Replays the queued touch event if the player is free and still on the map. */
+  public firePendingTouch(userId: number) {
+    const pending = this.pendingTouches.get(userId);
+    if (!pending) {
+      return;
+    }
+    if (this.sessions.has(userId)) {
+      return; // still busy; the next session end tries again
+    }
+    const player = this.world.getPlayerByUserId(userId);
+    if (!player || player.inBattle) {
+      return; // still battling; the battle-end hook tries again
+    }
+    this.pendingTouches.delete(userId);
+    if (Date.now() - pending.at > 5 * 60 * 1000 || player.currentMapId !== pending.mapId) {
+      return; // stale (blackout teleport, map change): the moment has passed
+    }
+    void this.startEvent(userId, pending.placementId, {
+      touch: true,
+      sightPushCell: pending.sightPushCell
+    });
   }
 
   /**
@@ -595,7 +688,8 @@ export default class EventRuntime {
     isAutorun: boolean,
     isTouch = false,
     placementId = "",
-    eventCell: { x: number; y: number } | null = null
+    eventCell: { x: number; y: number } | null = null,
+    sightPushCell: { x: number; y: number } | null = null
   ) {
     const token = ++this.tokenCounter;
     const session: Session = {
@@ -609,6 +703,9 @@ export default class EventRuntime {
       eventCell,
       placementId,
       isTouch,
+      sightPushCell,
+      startMapId: player.currentMapId,
+      stringVars: {},
       nodesRun: 0,
       pendingWrites: emptyEventStateWrites(),
       lastStep: null
@@ -623,6 +720,11 @@ export default class EventRuntime {
       // discarding half-applied state lets the autorun replay next join.
       if (this.sessions.get(userId)?.token === token) {
         await this.flushEventWrites(session);
+        // Sight-trap gate: if the event that spotted the player is STILL an
+        // armed touch page (the guard was not satisfied, the trainer not
+        // beaten), return the player to where they were before crossing the
+        // sight line — closing the dialog must never open the way.
+        await this.applySightPushBackIfArmed(session);
       }
     } finally {
       if (this.sessions.get(userId)?.token === token) {
@@ -663,10 +765,55 @@ export default class EventRuntime {
     }
   }
 
+  /**
+   * Re-selects the event's active page after the session's writes committed;
+   * if it is still an armed touch/sight page, the gate stayed locked and the
+   * spotted player is pushed back out of the sight corridor.
+   */
+  private async applySightPushBackIfArmed(session: Session) {
+    if (!session.sightPushCell) {
+      return;
+    }
+    const state = await this.auth.getEventState(session.userId);
+    const page = this.selectActivePage(session.essentials, session.player, state);
+    if (page && (page.trigger === 1 || page.trigger === 2)) {
+      this.applySightPushBack(session);
+    }
+  }
+
+  /** Returns a sight-spotted player to the tile they were caught from. */
+  private applySightPushBack(session: Session) {
+    const player = session.player;
+    if (
+      !session.sightPushCell ||
+      player.currentMapId !== session.startMapId ||
+      // Never relocate a surfing player: teleport() lands them as walkers and
+      // could snap them out of the water entirely.
+      player.isSurfing
+    ) {
+      return;
+    }
+    player.stopMovement();
+    player.teleport(player.currentMapId, session.sightPushCell.x * 32, session.sightPushCell.y * 32);
+    this.world.players.set(player.socketId, player);
+    // The trap must re-fire immediately if they march straight back in.
+    this.touchCooldownReset?.(session.userId);
+  }
+
+  /** Wired by the socket layer so a push-back clears the touch-event cooldown. */
+  public setTouchCooldownReset(reset: (userId: number) => void) {
+    this.touchCooldownReset = reset;
+  }
+
   public abort(userId: number) {
     const session = this.sessions.get(userId);
     if (session) {
       session.token = -1; // invalidate the running interpreter
+      // An aborted sight-trap session (disconnect mid-dialog, superseded run)
+      // discards its writes, so the gate is by definition still locked: push
+      // the player back out now — otherwise closing the app in front of a
+      // guard and logging back in would leave them past the sight line.
+      this.applySightPushBack(session);
     }
     const pending = this.pending.get(userId);
     if (pending) {
@@ -684,6 +831,7 @@ export default class EventRuntime {
   }
 
   public handleDisconnect(userId: number) {
+    this.pendingTouches.delete(userId);
     this.abort(userId);
   }
 
@@ -755,7 +903,11 @@ export default class EventRuntime {
     {
       switch (node.kind) {
         case "text": {
-          this.emitStep(session, { type: "text", npcName: session.npcName, text: node.text });
+          this.emitStep(session, {
+            type: "text",
+            npcName: session.npcName,
+            text: this.interpolateStringVars(session, node.text)
+          });
           await this.waitAdvance(session.userId);
           break;
         }
@@ -766,7 +918,7 @@ export default class EventRuntime {
           this.emitStep(session, {
             type: "choices",
             npcName: session.npcName,
-            text: node.prompt,
+            text: this.interpolateStringVars(session, node.prompt),
             choices: node.choices,
             ...(starterSpecies ? { portraitPokemonId: `pokemon-${starterSpecies}` } : {})
           });
@@ -993,12 +1145,13 @@ export default class EventRuntime {
   private async grantScriptedItem(
     session: Session,
     ref: { symbol?: string; legacyNumber?: number },
-    announce: "found" | "received" | null
+    announce: "found" | "received" | null,
+    quantity = 1
   ): Promise<boolean> {
     if (!this.battleManager) {
       return false;
     }
-    const grant = await this.battleManager.grantEventItem(session.userId, ref);
+    const grant = await this.battleManager.grantEventItem(session.userId, ref, quantity);
     if (!grant.ok) {
       return false;
     }
@@ -1033,6 +1186,14 @@ export default class EventRuntime {
     const ball = text.match(RE_ITEM_BALL);
     if (ball) {
       return this.grantScriptedItem(session, { symbol: ball[1] }, "found");
+    }
+    const receiveVar = text.match(RE_RECEIVE_ITEM_VAR);
+    if (receiveVar) {
+      // Kurt's finished ball: `pbReceiveItem(pbGet(8))` — the variable holds a
+      // legacy numeric item id written by pbConvertItemToItem.
+      const state = await this.getSessionEventState(session);
+      const legacyNumber = Number(state.variables[String(Number(receiveVar[1]))] ?? 0);
+      return this.grantScriptedItem(session, { legacyNumber }, "received");
     }
     const receive = text.match(RE_RECEIVE_ITEM);
     if (receive) {
@@ -1254,6 +1415,79 @@ export default class EventRuntime {
         // Version-adapter recognizers (item quantities, temp switches,
         // game switches, feature checks...). These are the conditions that
         // gate key-item routes and story doors, so they must be real.
+        // Fossil reviver pickup: `pbAddToParty(pbGet(9),1)` — the variable
+        // still holds the fossil's legacy ITEM number (pbConvertItemToPokemon
+        // keeps it); the species comes from this event's conversion pairs.
+        const addToParty = test.text.match(RE_ADD_TO_PARTY_VAR);
+        if (addToParty) {
+          const legacyNumber = Number(state.variables[String(Number(addToParty[1]))] ?? 0);
+          const species = this.resolveConvertedSpecies(session, legacyNumber);
+          if (!species) {
+            return false;
+          }
+          const level = Math.max(1, Number(addToParty[2] ?? 5) || 5);
+          const result = await this.auth.givePokemonBySpecies(session.userId, species, level, {
+            boxWhenFull: false
+          });
+          if (result.ok) {
+            this.emitStep(session, {
+              type: "info",
+              npcName: session.npcName,
+              text: `¡Has recibido a ${result.pokemonName}!`
+            });
+            await this.waitAdvance(session.userId);
+            await this.refreshSession(session);
+            return true;
+          }
+          if (result.partyFull) {
+            this.emitStep(session, {
+              type: "info",
+              npcName: session.npcName,
+              text: "No tienes espacio en tu equipo. Haz sitio en tu equipo y vuelve más tarde."
+            });
+            await this.waitAdvance(session.userId);
+          }
+          return false;
+        }
+        // Party-member introspection for chooser flows (name rater, trades):
+        // the variable holds a party index written by pbChoosePokemon.
+        const eggQuery = test.text.match(RE_GET_POKEMON_EGG);
+        if (eggQuery) {
+          const pokemon = await this.partyPokemonFromVar(session, Number(eggQuery[1]));
+          return pokemon?.isEgg === true;
+        }
+        if (RE_GET_POKEMON_SHADOW.test(test.text)) {
+          return false; // shadow venomons are not simulated
+        }
+        const foreignQuery = test.text.match(RE_GET_POKEMON_FOREIGN);
+        if (foreignQuery) {
+          const pokemon = await this.partyPokemonFromVar(session, Number(foreignQuery[1]));
+          return Boolean(pokemon?.foreignOt);
+        }
+        const checkAble = test.text.match(RE_CHECK_ABLE_VAR);
+        if (checkAble) {
+          const pokemon = await this.partyPokemonFromVar(session, Number(checkAble[2]));
+          const able = Boolean(pokemon && !pokemon.isEgg && pokemon.hp > 0);
+          return checkAble[1] === "!" ? !able : able;
+        }
+        // Name rater: "kept the same nickname?" compares the entered string
+        // variable against the current-name string variable.
+        const stringCompare = test.text.match(RE_STRING_VAR_EMPTY_OR_EQ);
+        if (stringCompare) {
+          const entered = session.stringVars[String(Number(stringCompare[1]))] ?? "";
+          const current = session.stringVars[String(Number(stringCompare[3]))] ?? "";
+          return entered === "" || entered === current;
+        }
+        // Cutscene positioning checks ($game_player.x==N) — tile coordinates.
+        const coordCheck = test.text.match(RE_PLAYER_CELL_COORD);
+        if (coordCheck) {
+          const player = session.player;
+          const cell =
+            coordCheck[1].toLowerCase() === "x"
+              ? Math.floor((player.x + player.width / 2) / 32)
+              : Math.floor((player.y + player.height / 2) / 32);
+          return cell === Number(coordCheck[2]);
+        }
         const recognized = recognizeScriptCondition(test.text);
         if (recognized) {
           switch (recognized.kind) {
@@ -1741,12 +1975,349 @@ export default class EventRuntime {
       return;
     }
 
+    // -- trade / conversion NPC family (in-game trades, Kurt, fossil
+    // reviver, name rater) --------------------------------------------------
+
+    // pbTextEntry("prompt", min, max, varN): free-text entry (the name rater's
+    // new nickname). Checked before the rename scripts — its combined script
+    // also references pbGetPokemon but must not rename anything.
+    const textEntry = text.match(RE_TEXT_ENTRY);
+    if (textEntry) {
+      const varId = String(Number(textEntry[4]));
+      const maxLength = Math.max(1, Number(textEntry[3]) || 12);
+      let prompt = textEntry[1].replace(/\s*\n\s*/g, " ");
+      const pkmnVar = text.match(/pbGetPokemon\(\s*(\d+)\s*\)/i);
+      if (/#\{species\}/.test(prompt) && pkmnVar) {
+        const pokemon = await this.partyPokemonFromVar(session, Number(pkmnVar[1]));
+        const species = pokemon ? await this.speciesDisplayNameOf(pokemon) : "";
+        prompt = prompt.replace(/#\{species\}/g, species ?? "");
+      }
+      prompt = prompt.replace(/#\{[^}]*\}/g, "");
+      this.emitStep(session, {
+        type: "nameInput",
+        npcName: session.npcName,
+        text: prompt,
+        defaultName: ""
+      });
+      const entered = await this.waitName(session.userId);
+      if (this.sessions.get(session.userId)?.token !== session.token) {
+        return;
+      }
+      session.stringVars[varId] = entered.trim().slice(0, maxLength);
+      return;
+    }
+
+    // Name rater renames: `pkmn=pbGetPokemon(V); pkmn.name=pbGet(W)` (apply
+    // the entered nickname) or `pkmn.name=PBSpecies.getName(...)` (reset to
+    // the species name). The optional trailing `$game_variables[N]=pkmn.name`
+    // feeds the confirmation text's \v[N].
+    const renameToVar = text.match(RE_RENAME_TO_VAR);
+    const renameToSpecies = renameToVar ? null : text.match(RE_RENAME_TO_SPECIES);
+    if (renameToVar || renameToSpecies) {
+      const state = await this.getSessionEventState(session);
+      const indexVar = String(Number((renameToVar ?? renameToSpecies)![1]));
+      const index = Number(state.variables[indexVar] ?? -1);
+      const newName = renameToVar
+        ? session.stringVars[String(Number(renameToVar[2]))] ?? ""
+        : null;
+      if (index >= 0 && (renameToSpecies || newName)) {
+        const applied = await this.auth.renamePartyPokemon(session.userId, index, newName);
+        if (applied) {
+          const varAssign = text.match(RE_VAR_EQ_PKMN_NAME);
+          if (varAssign) {
+            session.stringVars[String(Number(varAssign[1]))] = applied;
+          }
+          await this.refreshSession(session);
+        }
+      }
+      return;
+    }
+
+    // pbChoosePokemon(varN, nameVarN[, proc]): party picker. The proc filter
+    // (trade NPCs) restricts to a species and excludes eggs; without a proc
+    // every party member (eggs included) can be chosen, like the original
+    // party screen. Cancelling stores -1.
+    const choosePokemon = text.match(RE_CHOOSE_POKEMON);
+    if (choosePokemon) {
+      const varId = String(Number(choosePokemon[1]));
+      const nameVarId = String(Number(choosePokemon[2]));
+      const speciesFilter =
+        text.match(/\b\w+\.species\s*==\s*(?:PBSpecies::|:)(\w+)/i)?.[1] ?? null;
+      const excludeEggs = speciesFilter !== null || /!\s*\w+\.egg\?/.test(text);
+      const user = await this.auth.getUserForBattle(session.userId);
+      const eligible: Array<{ index: number; label: string }> = [];
+      (user?.pokemonParty ?? []).forEach((pokemon, index) => {
+        if (excludeEggs && pokemon.isEgg) {
+          return;
+        }
+        if (
+          speciesFilter &&
+          (pokemon.sourcePokemonId ?? "").toLowerCase() !== `pokemon-${speciesFilter.toLowerCase()}`
+        ) {
+          return;
+        }
+        eligible.push({
+          index,
+          label: pokemon.isEgg ? "Huevo" : pokemon.nickname || pokemon.name
+        });
+      });
+      this.emitStep(session, {
+        type: "choices",
+        npcName: session.npcName,
+        text: "Elige un Venomon.",
+        choices: [...eligible.map((entry) => entry.label), "Cancelar"]
+      });
+      const picked = await this.waitChoice(session.userId);
+      if (this.sessions.get(session.userId)?.token !== session.token) {
+        return;
+      }
+      const chosen = picked >= 0 && picked < eligible.length ? eligible[picked] : null;
+      session.pendingWrites.variables[varId] = chosen ? chosen.index : -1;
+      session.stringVars[nameVarId] = chosen ? chosen.label : "";
+      return;
+    }
+
+    // pbStartTrade(pbGet(V), SPECIES, "NICK"[, "OT"]): in-game NPC trade —
+    // the chosen party member leaves, the NPC's venomon (same level, foreign
+    // OT) takes its slot. The event's own text announces the trade.
+    const startTrade = text.match(RE_START_TRADE);
+    if (startTrade) {
+      const state = await this.getSessionEventState(session);
+      const index = Number(state.variables[String(Number(startTrade[1]))] ?? -1);
+      if (index >= 0) {
+        const result = await this.auth.tradePartyPokemon(
+          session.userId,
+          index,
+          startTrade[2],
+          startTrade[3] || null,
+          startTrade[4] || null
+        );
+        if (result.ok) {
+          await this.refreshSession(session);
+        }
+      }
+      return;
+    }
+
+    // pbChooseItemFromList("prompt", varN, :ITEM, ...): pick one of the listed
+    // items the player actually owns. Stores the item's legacy numeric id
+    // (0 = owns none of them, -1 = cancelled), matching the branches events
+    // test right after.
+    const chooseItem = text.match(RE_CHOOSE_ITEM_LIST);
+    if (chooseItem) {
+      const varId = String(Number(chooseItem[2]));
+      const symbols = Array.from(chooseItem[3].matchAll(/:(\w+)/g)).map((match) => match[1]);
+      const owned: Array<{ symbol: string; label: string }> = [];
+      for (const symbol of symbols) {
+        const quantity = this.battleManager
+          ? await this.battleManager.getEventItemQuantity(session.userId, symbol)
+          : 0;
+        if (quantity > 0) {
+          const definition = await this.battleManager!.findEventItemDefinition({ symbol });
+          owned.push({ symbol, label: definition?.name ?? symbol });
+        }
+      }
+      if (owned.length === 0) {
+        session.pendingWrites.variables[varId] = 0;
+        return;
+      }
+      const prompt = chooseItem[1].replace(/<[^>]*>/g, "").replace(/\s*\n\s*/g, " ");
+      this.emitStep(session, {
+        type: "choices",
+        npcName: session.npcName,
+        text: prompt,
+        choices: [...owned.map((entry) => entry.label), "Cancelar"]
+      });
+      const picked = await this.waitChoice(session.userId);
+      if (this.sessions.get(session.userId)?.token !== session.token) {
+        return;
+      }
+      const chosen = picked >= 0 && picked < owned.length ? owned[picked] : null;
+      const legacyNumber = chosen
+        ? LEGACY_ITEM_NUMBER_BY_INTERNAL.get(chosen.symbol.toUpperCase())
+        : undefined;
+      if (chosen && typeof legacyNumber !== "number") {
+        logUnsupportedScript(
+          "command",
+          `pbChooseItemFromList item ${chosen.symbol} has no legacy number`,
+          this.sessionContext(session)
+        );
+      }
+      session.pendingWrites.variables[varId] = chosen ? legacyNumber ?? -1 : -1;
+      return;
+    }
+
+    // $PokemonBag.pbDeleteItem(PBItems::X | pbGet(N)): hand the item over.
+    const deleteItem = text.match(RE_DELETE_ITEM);
+    if (deleteItem) {
+      if (this.battleManager) {
+        const ref = deleteItem[1]
+          ? { symbol: deleteItem[1] }
+          : {
+              legacyNumber: Number(
+                (await this.getSessionEventState(session)).variables[
+                  String(Number(deleteItem[2]))
+                ] ?? 0
+              )
+            };
+        await this.battleManager.removeEventItem(session.userId, ref, 1);
+        await this.refreshSession(session);
+      }
+      return;
+    }
+
+    // pbSet(N, PBItems.getName(pbGet(M))) — item display name into a string
+    // variable for the following \v[N] text.
+    const setItemName = text.match(RE_SET_VAR_ITEM_NAME);
+    if (setItemName) {
+      const target = String(Number(setItemName[1] ?? setItemName[2]));
+      const legacyNumber = Number(
+        (await this.getSessionEventState(session)).variables[String(Number(setItemName[3]))] ?? 0
+      );
+      const definition = this.battleManager
+        ? await this.battleManager.findEventItemDefinition({ legacyNumber })
+        : null;
+      session.stringVars[target] = definition?.name ?? "";
+      return;
+    }
+
+    // pbSet(N, PBSpecies.getName(pbGet(M))) — the variable holds the ITEM the
+    // player handed over; the species is resolved through the event's own
+    // pbConvertItemToPokemon pairs (see below).
+    const setSpeciesName = text.match(RE_SET_VAR_SPECIES_NAME);
+    if (setSpeciesName) {
+      const target = String(Number(setSpeciesName[1] ?? setSpeciesName[2]));
+      const legacyNumber = Number(
+        (await this.getSessionEventState(session)).variables[
+          String(Number(setSpeciesName[3]))
+        ] ?? 0
+      );
+      const species = this.resolveConvertedSpecies(session, legacyNumber);
+      session.stringVars[target] = species
+        ? (await this.auth.getSpeciesDisplayName(species)) ?? species
+        : "";
+      return;
+    }
+
+    // pbConvertItemToItem(varN, [FROM,TO,...]): Kurt — the chosen apricorn's
+    // number becomes the finished ball's number.
+    const convertItem = text.match(RE_CONVERT_ITEM_TO_ITEM);
+    if (convertItem) {
+      const varId = String(Number(convertItem[1]));
+      const current = Number(
+        (await this.getSessionEventState(session)).variables[varId] ?? 0
+      );
+      const currentSymbol = LEGACY_ITEM_INTERNAL_BY_NUMBER[current];
+      const symbols = Array.from(convertItem[2].matchAll(/:(\w+)/g)).map((match) => match[1]);
+      for (let i = 0; i + 1 < symbols.length; i += 2) {
+        if (currentSymbol && symbols[i].toUpperCase() === currentSymbol.toUpperCase()) {
+          const mapped = LEGACY_ITEM_NUMBER_BY_INTERNAL.get(symbols[i + 1].toUpperCase());
+          if (typeof mapped === "number") {
+            session.pendingWrites.variables[varId] = mapped;
+          } else {
+            logUnsupportedScript(
+              "command",
+              `pbConvertItemToItem target ${symbols[i + 1]} has no legacy number`,
+              this.sessionContext(session)
+            );
+          }
+          break;
+        }
+      }
+      return;
+    }
+
+    // pbConvertItemToPokemon(varN, [pairs]): deliberately keeps the ITEM
+    // number in the variable — every later read (PBSpecies.getName,
+    // pbAddToParty) resolves the species through these same pairs, so the
+    // value stays meaningful across sessions ("come back later" NPCs).
+    if (RE_CONVERT_ITEM_TO_POKEMON.test(text)) {
+      return;
+    }
+
+    // pbPickBerry(:BERRY[, qty]): berry trees.
+    const pickBerry = text.match(RE_PICK_BERRY);
+    if (pickBerry) {
+      await this.grantScriptedItem(
+        session,
+        { symbol: pickBerry[1] },
+        "found",
+        Math.max(1, Number(pickBerry[2] ?? 1) || 1)
+      );
+      return;
+    }
+
     // Anything else: cosmetic calls are silently skipped; genuinely unknown
     // scripts are skipped too but recorded so the migration report can list
     // them (a skipped command must never unlock progression by itself).
     if (classifyIgnorableCommand(text) === null) {
       logUnsupportedScript("command", text, this.sessionContext(session));
     }
+  }
+
+  /** Party member indexed by an event variable (pbChoosePokemon result). */
+  private async partyPokemonFromVar(session: Session, variableId: number) {
+    const state = await this.getSessionEventState(session);
+    const index = Number(state.variables[String(variableId)] ?? -1);
+    if (index < 0) {
+      return null;
+    }
+    const user = await this.auth.getUserForBattle(session.userId);
+    return user?.pokemonParty?.[index] ?? null;
+  }
+
+  /** Species display name of a party member (nickname-independent). */
+  private async speciesDisplayNameOf(pokemon: { sourcePokemonId?: string; name: string }) {
+    const internal = (pokemon.sourcePokemonId ?? "").replace(/^pokemon-/i, "");
+    if (!internal) {
+      return pokemon.name;
+    }
+    return (await this.auth.getSpeciesDisplayName(internal)) ?? pokemon.name;
+  }
+
+  /**
+   * Resolves an item's converted species through this event's own
+   * pbConvertItemToPokemon pair list (fossil reviver). The event variable
+   * keeps the ITEM's legacy number; the pairs give ITEM -> SPECIES.
+   */
+  private resolveConvertedSpecies(session: Session, legacyItemNumber: number): string | null {
+    const itemSymbol = LEGACY_ITEM_INTERNAL_BY_NUMBER[legacyItemNumber];
+    if (!itemSymbol) {
+      return null;
+    }
+    for (const page of session.essentials.pages) {
+      const commands = page.commands ?? [];
+      for (let i = 0; i < commands.length; i++) {
+        if (commands[i].code !== 355) {
+          continue;
+        }
+        let joined = String(commands[i].parameters?.[0] ?? "");
+        let j = i + 1;
+        while (j < commands.length && commands[j].code === 655) {
+          joined += `\n${String(commands[j].parameters?.[0] ?? "")}`;
+          j += 1;
+        }
+        const match = joined.match(RE_CONVERT_ITEM_TO_POKEMON);
+        if (!match) {
+          continue;
+        }
+        const symbols = Array.from(match[2].matchAll(/:(\w+)/g)).map((entry) => entry[1]);
+        for (let k = 0; k + 1 < symbols.length; k += 2) {
+          if (symbols[k].toUpperCase() === itemSymbol.toUpperCase()) {
+            return symbols[k + 1];
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /** Replaces \v[N] with session string variables (item/species/entered names). */
+  private interpolateStringVars(session: Session, text: string): string {
+    return text.replace(/\\[vV]\[(\d+)\]/g, (whole, id: string) => {
+      const value = session.stringVars[String(Number(id))];
+      return typeof value === "string" && value !== "" ? value : whole;
+    });
   }
 
   // -- page selection ------------------------------------------------------

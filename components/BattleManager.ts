@@ -1010,6 +1010,16 @@ export default class BattleManager {
     return typeof userId === "number" && Boolean(this.tradeGuard?.(userId));
   }
 
+  /**
+   * True while a wild battle is starting or running for this socket. The
+   * pending flag is set SYNCHRONOUSLY on the encounter-roll step (before the
+   * async battle setup lands), so touch/sight events fired on that same step
+   * can tell "a battle just began" and queue themselves for after it.
+   */
+  public isWildStartPendingOrBattling(socketId: string) {
+    return this.pendingStepChecks.has(socketId) || this.isPlayerBattling(socketId);
+  }
+
   public isPlayerBattling(playerId: string) {
     return this.playerBattleIds.has(playerId);
   }
@@ -3071,11 +3081,15 @@ export default class BattleManager {
     return user?.inventory.find((item) => item.id === definition.id)?.quantity ?? 0;
   }
 
-  public async grantEventItem(
-    userId: number,
-    ref: { symbol?: string; legacyNumber?: number },
-    quantity = 1
-  ): Promise<{ ok: false } | { ok: true; itemName: string }> {
+  /**
+   * Resolves an event-script item reference (Essentials symbol or legacy
+   * pre-v20 numeric id) against the item catalog. Shared by grants, removals
+   * and the choose-item-from-list dialog (which needs display names).
+   */
+  public async findEventItemDefinition(ref: {
+    symbol?: string;
+    legacyNumber?: number;
+  }): Promise<ItemDefinition | null> {
     await this.loadCatalogs();
 
     const symbol =
@@ -3085,20 +3099,58 @@ export default class BattleManager {
         : undefined);
     const lowered = symbol?.trim().toLowerCase();
     if (!lowered) {
-      return { ok: false };
+      return null;
     }
 
-    const definition = this.cachedItemDefinitions.find(
-      (candidate) =>
-        candidate.essentialsId.toLowerCase() === lowered ||
-        candidate.id === `item-${lowered}`
+    return (
+      this.cachedItemDefinitions.find(
+        (candidate) =>
+          candidate.essentialsId.toLowerCase() === lowered ||
+          candidate.id === `item-${lowered}`
+      ) ?? null
     );
+  }
+
+  public async grantEventItem(
+    userId: number,
+    ref: { symbol?: string; legacyNumber?: number },
+    quantity = 1
+  ): Promise<{ ok: false } | { ok: true; itemName: string }> {
+    const definition = await this.findEventItemDefinition(ref);
     const user = await this.auth.getUserForBattle(userId);
     if (!definition || !user) {
       return { ok: false };
     }
 
     const inventory = this.addInventoryQuantity(user.inventory, definition, quantity);
+    await this.auth.saveInventory(userId, inventory);
+    return { ok: true, itemName: definition.name };
+  }
+
+  /**
+   * Removes items handed to an NPC by an event script ($PokemonBag
+   * .pbDeleteItem): Kurt taking an apricorn, the fossil reviver taking the
+   * fossil, the move tutor taking a Heart Scale.
+   */
+  public async removeEventItem(
+    userId: number,
+    ref: { symbol?: string; legacyNumber?: number },
+    quantity = 1
+  ): Promise<{ ok: false } | { ok: true; itemName: string }> {
+    const definition = await this.findEventItemDefinition(ref);
+    const user = await this.auth.getUserForBattle(userId);
+    if (!definition || !user) {
+      return { ok: false };
+    }
+
+    const removeQuantity = Math.max(1, Math.round(quantity));
+    const inventory = user.inventory
+      .map((item) =>
+        item.id === definition.id
+          ? { ...item, quantity: item.quantity - removeQuantity }
+          : item
+      )
+      .filter((item) => item.quantity > 0);
     await this.auth.saveInventory(userId, inventory);
     return { ok: true, itemName: definition.name };
   }
@@ -3184,6 +3236,11 @@ export default class BattleManager {
       })
       .finally(() => {
         this.pendingStepChecks.delete(player.socketId);
+        // If the battle never materialized, release anything that queued
+        // behind the pending flag (a trap event fired on the same step).
+        if (!this.isPlayerBattling(player.socketId)) {
+          this.world.notifyPlayerLeftBattle(player);
+        }
       });
   }
 

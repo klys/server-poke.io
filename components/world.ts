@@ -62,12 +62,16 @@ export default class World {
     battleManager: BattleManager | null;
     groundItems: Map<string, GroundItem>;
     /** Per-snapshot cache of NPC collision rectangles by map. */
-    private npcBlockerCache = new WeakMap<object, Map<string, Array<{ id:string; x:number; y:number; name:string | null; essentials:EssentialsEventRecord | null }>>>();
-    /** Fires trigger-1/2 (touch) events; wired to the event runtime. */
-    private eventTouchHandler:((player:Player, placementId:string) => void) | null = null;
+    private npcBlockerCache = new WeakMap<object, Map<string, Array<{ id:string; x:number; y:number; name:string | null; sightRange:number; essentials:EssentialsEventRecord | null }>>>();
+    /** Fires trigger-1/2 (touch) events; wired to the event runtime. The
+     * optional third argument is the tile a sight-spotted player must be
+     * returned to when the event ends still armed (locked quest gates). */
+    private eventTouchHandler:((player:Player, placementId:string, sightPushCell?:{ x:number; y:number } | null) => void) | null = null;
     /** True while the player is inside a running event (dialog/cutscene):
      * movement is frozen like RPG Maker, so sight-traps actually hold. */
     private eventMovementLockChecker:((player:Player) => boolean) | null = null;
+    /** Fires queued trap events when a battle releases the player. */
+    private playerLeftBattleHandler:((player:Player) => void) | null = null;
     private locationPersistHandler:((player:Player) => void) | null = null;
     private portalHandler:((player:Player, portal:MapEditorPortalPlacement) => void) | null = null;
     groundItemStore: GroundItemStore | null;
@@ -667,12 +671,21 @@ export default class World {
             : { ...EMPTY_EVENT_PLAYER_STATE, tempSwitches: player.tempSwitches };
     }
 
-    setEventTouchHandler(handler:(player:Player, placementId:string) => void) {
+    setEventTouchHandler(handler:(player:Player, placementId:string, sightPushCell?:{ x:number; y:number } | null) => void) {
         this.eventTouchHandler = handler;
     }
 
     setEventMovementLockChecker(checker:(player:Player) => boolean) {
         this.eventMovementLockChecker = checker;
+    }
+
+    setPlayerLeftBattleHandler(handler:(player:Player) => void) {
+        this.playerLeftBattleHandler = handler;
+    }
+
+    /** Called by Player.leaveBattle: replays trap events queued during battle. */
+    notifyPlayerLeftBattle(player:Player) {
+        this.playerLeftBattleHandler?.(player);
     }
 
     /** Movement freeze during a running event session (RMXP interpreter lock). */
@@ -829,6 +842,15 @@ export default class World {
             return;
         }
         player.lastTouchCellKey = key;
+        // Previous-tile tracking for sight-trap push-back: only an ordinary
+        // adjacent step counts — after a teleport there is no "previous" tile.
+        const cameFrom = player.currentCell;
+        const adjacentStep =
+            cameFrom !== null &&
+            cameFrom.mapId === player.currentMapId &&
+            Math.max(Math.abs(cameFrom.x - cellX), Math.abs(cameFrom.y - cellY)) === 1;
+        player.previousCell = adjacentStep ? cameFrom : null;
+        player.currentCell = { mapId: player.currentMapId, x: cellX, y: cellY };
         // Cells crossed during the post-teleport lock never fire: the key is
         // already updated above, so they won't fire retroactively either.
         if (Date.now() < player.touchLockUntil) {
@@ -863,8 +885,6 @@ export default class World {
                 return;
             }
         }
-
-        this.handleTrainerSightStep(player, cellX, cellY);
     }
 
     /**
@@ -873,32 +893,33 @@ export default class World {
      * itself (pbEventCanReachPlayer?), which is how trainer ambushes and
      * road-block guards work. Only touch-trigger pages (1/2) fire — the
      * post-defeat / quest-satisfied pages of these events are Action Button
-     * (trigger 0), so beaten trainers stop spotting automatically. Every tile
-     * between the two must be walkable, exactly like the original (trainers
-     * cannot see through walls, trees or other NPCs).
+     * (trigger 0), so beaten trainers stop spotting automatically. Sight stops
+     * at the first unwalkable tile, exactly like the original (trainers cannot
+     * see through walls, trees or other NPCs).
+     *
+     * Unlike the tile-stepped original, players here move in pixels and can
+     * cut corners diagonally, so the check runs on every movement node and
+     * detects the player's rectangle overlapping the sight corridor (at least
+     * half a tile across it, same alignment rule as doors) — a sight line can
+     * never be hopped over.
      */
-    private handleTrainerSightStep(player:Player, cellX:number, cellY:number) {
-        if (!this.eventTouchHandler) {
+    private handleTrainerSightCheck(player:Player) {
+        if (!this.eventTouchHandler || Date.now() < player.touchLockUntil) {
             return;
         }
+        const playerCellX = Math.floor((player.x + player.width / 2) / 32);
+        const playerCellY = Math.floor((player.y + player.height / 2) / 32);
         for (const blocker of this.getNpcBlockers(player.currentMapId)) {
-            if (!blocker.essentials || !blocker.name) {
-                continue;
-            }
-            const match = /trainer\s*\(\s*(\d+)\s*\)/i.exec(blocker.name);
-            if (!match) {
-                continue;
-            }
-            const range = Math.min(Number(match[1]), 10);
-            if (range <= 0) {
+            if (blocker.sightRange <= 0 || !blocker.essentials) {
                 continue;
             }
             const eventCellX = blocker.x / 32;
             const eventCellY = blocker.y / 32;
-            // The player must be exactly on the row/column the NPC faces.
-            const facingHorizontal = cellY === eventCellY && cellX !== eventCellX;
-            const facingVertical = cellX === eventCellX && cellY !== eventCellY;
-            if (!facingHorizontal && !facingVertical) {
+            // Cheap pre-filter before touching page selection.
+            if (
+                Math.abs(playerCellX - eventCellX) > blocker.sightRange + 1 ||
+                Math.abs(playerCellY - eventCellY) > blocker.sightRange + 1
+            ) {
                 continue;
             }
             const page = selectConditionMetPage(
@@ -912,26 +933,105 @@ export default class World {
             const direction = page.graphic?.direction;
             const dx = direction === 6 ? 1 : direction === 4 ? -1 : 0;
             const dy = direction === 2 ? 1 : direction === 8 ? -1 : 0;
-            if ((dx !== 0) !== facingHorizontal) {
-                continue; // player is beside/behind the NPC, not in front
-            }
-            const distance = dx !== 0 ? (cellX - eventCellX) * dx : (cellY - eventCellY) * dy;
-            if (distance < 1 || distance > range) {
+            if (dx === 0 && dy === 0) {
                 continue;
             }
-            let lineOfSight = true;
-            for (let step = 1; step < distance; step++) {
-                if (this.isCellBlockedForSight(player, eventCellX + dx * step, eventCellY + dy * step)) {
-                    lineOfSight = false;
+            // Corridor of visible tiles: in front of the NPC until the first
+            // wall/solid event, at most sightRange tiles.
+            let visibleTiles = 0;
+            while (visibleTiles < blocker.sightRange) {
+                const nextX = eventCellX + dx * (visibleTiles + 1);
+                const nextY = eventCellY + dy * (visibleTiles + 1);
+                if (this.isCellBlockedForSight(player, nextX, nextY)) {
                     break;
                 }
+                visibleTiles += 1;
             }
-            if (!lineOfSight) {
+            if (visibleTiles < 1) {
                 continue;
             }
-            this.eventTouchHandler(player, blocker.id);
+            const corridor = {
+                x: Math.min(eventCellX + dx, eventCellX + dx * visibleTiles) * 32,
+                y: Math.min(eventCellY + dy, eventCellY + dy * visibleTiles) * 32,
+                width: (dx !== 0 ? visibleTiles : 1) * 32,
+                height: (dy !== 0 ? visibleTiles : 1) * 32
+            };
+            const overlapX = Math.min(player.x + player.width, corridor.x + corridor.width) - Math.max(player.x, corridor.x);
+            const overlapY = Math.min(player.y + player.height, corridor.y + corridor.height) - Math.max(player.y, corridor.y);
+            if (overlapX <= 0 || overlapY <= 0) {
+                continue;
+            }
+            // Across the corridor the player must overlap at least half a tile
+            // (grazing its edge while walking alongside is not "in sight").
+            if ((dx !== 0 ? overlapY : overlapX) < 16) {
+                continue;
+            }
+            const pushCell = this.resolveSightPushBackCell(
+                player,
+                { x: eventCellX, y: eventCellY },
+                dx,
+                dy,
+                blocker.sightRange,
+                visibleTiles
+            );
+            this.eventTouchHandler(player, blocker.id, pushCell);
             return;
         }
+    }
+
+    /**
+     * Where a sight-trapped player is returned to if the event ends still
+     * armed: their own tile when already outside the corridor (caught at its
+     * edge), else the tile they came from, else the first tile beyond the
+     * corridor's far end. Null when no safe tile exists (open-ended traps
+     * simply re-fire on the next step instead).
+     */
+    private resolveSightPushBackCell(
+        player:Player,
+        eventCell:{ x:number; y:number },
+        dx:number,
+        dy:number,
+        range:number,
+        visibleTiles:number
+    ): { x:number; y:number } | null {
+        const inCorridor = (cell:{ x:number; y:number }) => {
+            const alongAxis = dx !== 0 ? cell.y === eventCell.y : cell.x === eventCell.x;
+            if (!alongAxis) {
+                return false;
+            }
+            const distance = dx !== 0 ? (cell.x - eventCell.x) * dx : (cell.y - eventCell.y) * dy;
+            return distance >= 0 && distance <= range; // includes the NPC's own tile
+        };
+        const bounds = this.getMapBounds(player.currentMapId);
+        const usable = (cell:{ x:number; y:number } | null): cell is { x:number; y:number } => {
+            if (!cell || inCorridor(cell)) {
+                return false;
+            }
+            if (cell.x < 0 || cell.y < 0 || (cell.x + 1) * 32 > bounds.width || (cell.y + 1) * 32 > bounds.height) {
+                return false;
+            }
+            return !this.isCellBlockedForSight(player, cell.x, cell.y);
+        };
+
+        const sameMapCell = (cell:{ mapId:string; x:number; y:number } | null) =>
+            cell && cell.mapId === player.currentMapId ? { x: cell.x, y: cell.y } : null;
+        const own = sameMapCell(player.currentCell);
+        if (usable(own)) {
+            return own;
+        }
+        const previous = sameMapCell(player.previousCell);
+        if (usable(previous)) {
+            return previous;
+        }
+        // Beyond the corridor's far end — only reachable when sight ran its
+        // full range (a wall-truncated corridor has no far side to stand on).
+        if (visibleTiles === range) {
+            const beyond = { x: eventCell.x + dx * (range + 1), y: eventCell.y + dy * (range + 1) };
+            if (usable(beyond)) {
+                return beyond;
+            }
+        }
+        return null;
     }
 
     /**
@@ -973,7 +1073,7 @@ export default class World {
     private getNpcBlockers(mapId:string) {
         const state = this.playableMapsState;
         if (!state) {
-            return [] as Array<{ id:string; x:number; y:number; name:string | null; essentials:EssentialsEventRecord | null }>;
+            return [] as Array<{ id:string; x:number; y:number; name:string | null; sightRange:number; essentials:EssentialsEventRecord | null }>;
         }
 
         let byMap = this.npcBlockerCache.get(state);
@@ -995,6 +1095,9 @@ export default class World {
                     continue;
                 }
                 const name = typeof placement.name === "string" ? placement.name : null;
+                // Essentials "Trainer(X)" naming: line-of-sight range in tiles.
+                const sightMatch = name ? /trainer\s*\(\s*(\d+)\s*\)/i.exec(name) : null;
+                const sightRange = sightMatch ? Math.min(Number(sightMatch[1]), 10) : 0;
                 if (placement.essentialsEvent) {
                     // Conditional blocker; page visibility is resolved per player.
                     blockers.push({
@@ -1002,10 +1105,11 @@ export default class World {
                         x: placement.x * 32,
                         y: placement.y * 32,
                         name,
+                        sightRange,
                         essentials: placement.essentialsEvent
                     });
                 } else if (placement.previewImageSrc) {
-                    blockers.push({ id: placement.id, x: placement.x * 32, y: placement.y * 32, name, essentials: null });
+                    blockers.push({ id: placement.id, x: placement.x * 32, y: placement.y * 32, name, sightRange: 0, essentials: null });
                 }
             }
             byMap.set(mapId, blockers);
@@ -1031,6 +1135,7 @@ export default class World {
         this.battleManager?.handleEggStep(player);
         void this.handleGroundItemPickup(player);
         this.handleTouchEventStep(player);
+        this.handleTrainerSightCheck(player);
     }
 
     getPlayableMapsState() {

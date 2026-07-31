@@ -46,6 +46,12 @@ export default class Player {
     /** Last cell a standing-touch check ran for (touch events fire on cell
      * entry, and teleports seed this so arrivals don't instantly re-fire). */
     lastTouchCellKey:string = "";
+    /** Tile the player currently stands on (center-based), for touch/sight tracking. */
+    currentCell:{ mapId:string; x:number; y:number } | null = null;
+    /** Tile the player stood on before the current one (only when reached by a
+     * normal adjacent step — teleports clear it). Sight-trap push-back returns
+     * the player here so a locked gate can never be crossed. */
+    previousCell:{ mapId:string; x:number; y:number } | null = null;
     /** Touch triggers (standing AND bump) are suppressed until this time.
      * Set on teleport so a held movement key can't immediately bump the
      * paired door at the destination and warp the player straight back. */
@@ -445,6 +451,10 @@ export default class Player {
         // Seed the touch cell so landing on a touch event (door mats, cave
         // mouths) doesn't instantly fire it back — classic transfer behavior.
         this.lastTouchCellKey = `${mapId}:${Math.floor((this.x + this.width / 2) / 32)}:${Math.floor((this.y + this.height / 2) / 32)}`;
+        // Teleports break step continuity: there is no "previous tile" to
+        // push back to until the player walks again.
+        this.currentCell = { mapId, x: Math.floor((this.x + this.width / 2) / 32), y: Math.floor((this.y + this.height / 2) / 32) };
+        this.previousCell = null;
         // Also lock bump-touch for a moment: exiting a building lands the
         // player next to the (solid) entrance door, and a still-held arrow key
         // would otherwise bump it on the very next tick and warp them back in.
@@ -488,6 +498,8 @@ export default class Player {
 
     public leaveBattle() {
         this.inBattle = false;
+        // A trap/sight event that fired during the battle replays now.
+        this.world.notifyPlayerLeftBattle(this);
     }
 
     /**

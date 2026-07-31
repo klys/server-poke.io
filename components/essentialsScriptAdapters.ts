@@ -77,7 +77,9 @@ export const RE_HAS_BADGE = /\$(?:Trainer|player)\.badges\[\s*(\d+)\s*\]/i;
 export const RE_HEAL = /pbHealAll|pbHealParty|Recover All/i;
 export const RE_CHANGE_PLAYER = /pbChangePlayer\(\s*(\d)\s*\)/i;
 // v3.1.1 trainer battles; v21 uses TrainerBattle.start (see adapter below).
-export const RE_TRAINER_BATTLE = /pbTrainerBattle\(\s*PBTrainers::(\w+)\s*,\s*"([^"]+)"/i;
+// Both constant spellings appear in the data (PBTrainers::X and :X — the
+// rival battle on the SS Ancla uses the symbol form).
+export const RE_TRAINER_BATTLE = /pbTrainerBattle\(\s*(?:PBTrainers::|:)(\w+)\s*,\s*"([^"]+)"/i;
 export const RE_TRAINER_BATTLE_V21 = /TrainerBattle\.start\(\s*:(\w+)\s*,\s*"([^"]+)"/i;
 export const RE_WILD_BATTLE = /pbWildBattle\(\s*(?:PBSpecies::|:)(\w+)\s*,\s*(\d+)/i;
 export const RE_TRAINER_NAME = /pbTrainerName/i;
@@ -92,6 +94,33 @@ export const RE_CUT = /pbCut\b/i;
 export const RE_ROCKSMASH_COND = /pbRockSmash(?!Random)/i;
 export const RE_ERASE_EVENT = /pbEraseThisEvent/i;
 export const RE_ROCKSMASH_ENCOUNTER = /pbRockSmashRandomEncounter/i;
+
+// Trade / item-conversion NPC family: in-game trades ("Intercambio básico"),
+// the fossil reviver (Genetista), Kurt's apricorn balls, the name rater.
+// Numeric item/variable values use the legacy pre-v20 item numbering
+// (legacyItemNumbers.ts); species conversions keep the ITEM number in the
+// variable and resolve the species through the event's own conversion pairs.
+export const RE_CHOOSE_POKEMON = /(?:Kernel\.)?pbChoosePokemon\(\s*(\d+)\s*,\s*(\d+)/i;
+export const RE_START_TRADE = /(?:Kernel\.)?pbStartTrade\(\s*pbGet\(\s*(\d+)\s*\)\s*,\s*(?:PBSpecies::|:)(\w+)\s*,\s*"([^"]*)"(?:\s*,\s*"([^"]*)")?/i;
+export const RE_CHOOSE_ITEM_LIST = /(?:Kernel\.)?pbChooseItemFromList\(\s*(?:_I\(\s*)?"([\s\S]*?)"\s*\)?\s*,\s*(\d+)\s*,([\s\S]*?)\)/i;
+export const RE_DELETE_ITEM = /\$PokemonBag\.pbDeleteItem\(\s*(?:(?:PBItems::|:)(\w+)|pbGet\(\s*(\d+)\s*\))/i;
+export const RE_RECEIVE_ITEM_VAR = /pbReceive(?:Item)?\(\s*pbGet\(\s*(\d+)\s*\)/i;
+export const RE_CONVERT_ITEM_TO_ITEM = /pbConvertItemToItem\(\s*(\d+)\s*,\s*\[([\s\S]*?)\]/i;
+export const RE_CONVERT_ITEM_TO_POKEMON = /pbConvertItemToPokemon\(\s*(\d+)\s*,\s*\[([\s\S]*?)\]/i;
+export const RE_SET_VAR_ITEM_NAME = /(?:pbSet\(\s*(\d+)\s*,|\$game_variables\[\s*(\d+)\s*\]\s*=)\s*PBItems\.getName\(\s*pbGet\(\s*(\d+)\s*\)/i;
+export const RE_SET_VAR_SPECIES_NAME = /(?:pbSet\(\s*(\d+)\s*,|\$game_variables\[\s*(\d+)\s*\]\s*=)\s*PBSpecies\.getName\(\s*pbGet\(\s*(\d+)\s*\)/i;
+export const RE_ADD_TO_PARTY_VAR = /(?:Kernel\.)?pbAddToParty\(\s*pbGet\(\s*(\d+)\s*\)\s*(?:,\s*(\d+))?/i;
+export const RE_PICK_BERRY = /(?:Kernel\.)?pbPickBerry\(\s*:(\w+)\s*(?:,\s*(\d+))?/i;
+export const RE_TEXT_ENTRY = /pbTextEntry\(\s*"([\s\S]*?)"\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)/i;
+export const RE_GET_POKEMON_EGG = /pbGetPokemon\(\s*(\d+)\s*\)\.egg\?/i;
+export const RE_GET_POKEMON_SHADOW = /pbGetPokemon\(\s*(\d+)\s*\)\.isShadow\?/i;
+export const RE_GET_POKEMON_FOREIGN = /pbGetPokemon\(\s*(\d+)\s*\)\.isForeign\?/i;
+export const RE_CHECK_ABLE_VAR = /^(!?)\s*(?:Kernel\.)?pbCheckAble\(\s*pbGet\(\s*(\d+)\s*\)\s*\)$/i;
+export const RE_RENAME_TO_SPECIES = /pkmn\s*=\s*pbGetPokemon\(\s*(\d+)\s*\)[\s\S]*pkmn\.name\s*=\s*PBSpecies\.getName\(/i;
+export const RE_RENAME_TO_VAR = /pkmn\s*=\s*pbGetPokemon\(\s*(\d+)\s*\)[\s\S]*pkmn\.name\s*=\s*pbGet\(\s*(\d+)\s*\)/i;
+export const RE_VAR_EQ_PKMN_NAME = /\$game_variables\[\s*(\d+)\s*\]\s*=\s*pkmn\.name/i;
+export const RE_STRING_VAR_EMPTY_OR_EQ = /^\$game_variables\[\s*(\d+)\s*\]\s*==\s*""\s*\|\|\s*\$game_variables\[\s*(\d+)\s*\]\s*==\s*pbGet\(\s*(\d+)\s*\)$/i;
+export const RE_PLAYER_CELL_COORD = /^\$game_player\.(x|y)\s*==\s*(\d+)$/i;
 
 // Essentials temp switches (per-event, session-scoped) and cross-event self
 // switches — the Venova door/cutscene templates depend on both.
@@ -204,6 +233,23 @@ export const venovaAdventureAdapter: EssentialsScriptAdapter = {
     if (/pbPhoneBattleCount|pbPhoneRegistered\?/i.test(trimmed)) {
       return { kind: "alwaysFalse", reason: "phone-not-simulated" };
     }
+    // Pokegear is not simulated (no gear overlay online).
+    if (/^\$Trainer\.pokegear$/i.test(trimmed)) {
+      return { kind: "alwaysFalse", reason: "pokegear-not-simulated" };
+    }
+    // Every online player has the dex (CanaimaDex), so "!$Trainer.pokedex"
+    // (the "you don't have a dex yet" branch) is never true.
+    if (/^!\$Trainer\.pokedex$/i.test(trimmed)) {
+      return { kind: "alwaysFalse", reason: "pokedex-always-owned" };
+    }
+    // Move relearner screens are not simulated in events yet; the "has moves
+    // to remember" branches stay hidden so the NPC politely declines.
+    if (/pbHasRelearnableMove\?|pbRelearnMoveScreen/i.test(trimmed)) {
+      return { kind: "alwaysFalse", reason: "move-relearn-not-simulated" };
+    }
+    if (/pbDayCareGetLevelGain/i.test(trimmed)) {
+      return { kind: "alwaysFalse", reason: "daycare-level-gain-not-simulated" };
+    }
 
     return null;
   }
@@ -269,7 +315,14 @@ const IGNORABLE_COMMANDS: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /pbMoveRoute|pbTurnTowardPlayer|pbMoveTowardPlayer/i, reason: "scripted-move-route" },
   { pattern: /pbChooseNonEggPokemon|pbChoosePokemon/i, reason: "party-picker-not-simulated" },
   { pattern: /pbFadeOutIn|pbSceneStandby/i, reason: "scene-transition" },
-  { pattern: /^\s*p(?:rint)?\s+/i, reason: "debug-print" }
+  { pattern: /^\s*p(?:rint)?\s+/i, reason: "debug-print" },
+  // Kurt's "come back tomorrow" timestamp; the online NPC finishes instantly.
+  { pattern: /^pbSetEventTime$/i, reason: "event-time-cooldown" },
+  { pattern: /pbPhoneIncrement|pbTrainerCheck\(/i, reason: "phone-not-simulated" },
+  { pattern: /\$Trainer\.pokegear\s*=|\$Trainer\.mysterygiftaccess\s*=|pbNextMysteryGiftID/i, reason: "feature-not-simulated" },
+  // Ruby local-variable staging lines that carry no effect on their own
+  // (multi-line scripts that DO act are matched before classification).
+  { pattern: /^\s*\w+\s*=\s*(?:\$Trainer\.lastParty|\$Trainer\.pokemonParty\[\d+\]|pbGetPokemon\(\s*\d+\s*\)|pbGet\(\s*\d+\s*\))\s*$/i, reason: "script-variable-staging" }
 ];
 
 /** Reason label when the script command is safely ignorable, else null. */
@@ -308,7 +361,15 @@ const HANDLED_CONDITION_PATTERNS: RegExp[] = [
   RE_NUMBADGES,
   RE_HAS_BADGE,
   RE_CUT,
-  RE_ROCKSMASH_COND
+  RE_ROCKSMASH_COND,
+  RE_RECEIVE_ITEM_VAR,
+  RE_ADD_TO_PARTY_VAR,
+  RE_GET_POKEMON_EGG,
+  RE_GET_POKEMON_SHADOW,
+  RE_GET_POKEMON_FOREIGN,
+  RE_CHECK_ABLE_VAR,
+  RE_STRING_VAR_EMPTY_OR_EQ,
+  RE_PLAYER_CELL_COORD
 ];
 
 /** True when EventRuntime.evaluate() has a real handler for this script test. */
@@ -347,7 +408,20 @@ const HANDLED_COMMAND_PATTERNS: RegExp[] = [
   RE_SET_POKECENTER,
   RE_SE_PLAY,
   RE_PB_WAIT,
-  RE_BUTTON_SCREEN
+  RE_BUTTON_SCREEN,
+  RE_CHOOSE_POKEMON,
+  RE_START_TRADE,
+  RE_CHOOSE_ITEM_LIST,
+  RE_DELETE_ITEM,
+  RE_RECEIVE_ITEM_VAR,
+  RE_CONVERT_ITEM_TO_ITEM,
+  RE_CONVERT_ITEM_TO_POKEMON,
+  RE_SET_VAR_ITEM_NAME,
+  RE_SET_VAR_SPECIES_NAME,
+  RE_PICK_BERRY,
+  RE_TEXT_ENTRY,
+  RE_RENAME_TO_SPECIES,
+  RE_RENAME_TO_VAR
 ];
 
 /** True when EventRuntime.applyScript() handles (or safely ignores) this script. */

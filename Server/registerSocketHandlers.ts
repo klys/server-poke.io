@@ -3511,9 +3511,20 @@ export default function registerSocketHandlers(
     // Map transfers also feed friends presence (same-map action gating).
     socialManager.handlePlayerMapChanged(player);
   });
-  world.setEventTouchHandler((player, placementId) => {
+  world.setEventTouchHandler((player, placementId, sightPushCell) => {
     const userId = player.userId;
-    if (typeof userId !== "number" || player.inBattle || eventRuntime.isRunning(userId)) {
+    if (typeof userId !== "number") {
+      return;
+    }
+    if (
+      player.inBattle ||
+      battleManager.isWildStartPendingOrBattling(player.socketId) ||
+      eventRuntime.isRunning(userId)
+    ) {
+      // Busy (a wild battle started on this very step, or a cutscene is
+      // playing): remember the trap instead of dropping it — it replays the
+      // moment the player is free, so quest gates are never skipped.
+      eventRuntime.queueMissedTouch(userId, placementId, sightPushCell ?? null, player.currentMapId);
       return;
     }
     const last = touchCooldowns.get(userId);
@@ -3522,7 +3533,16 @@ export default function registerSocketHandlers(
       return;
     }
     touchCooldowns.set(userId, { placementId, at: now });
-    void eventRuntime.startEvent(userId, placementId, { touch: true });
+    void eventRuntime.startEvent(userId, placementId, { touch: true, sightPushCell: sightPushCell ?? null });
+  });
+  // A sight-trap push-back clears the cooldown: marching straight back into
+  // the corridor must re-fire the trap, not slip through a cooldown window.
+  eventRuntime.setTouchCooldownReset((userId) => touchCooldowns.delete(userId));
+  // Battle over: replay any trap event that fired while it ran.
+  world.setPlayerLeftBattleHandler((player) => {
+    if (typeof player.userId === "number") {
+      eventRuntime.firePendingTouch(player.userId);
+    }
   });
   // RMXP interpreter lock: while an event session runs (dialog, trainer spot,
   // cutscene) the player cannot move, so line-of-sight traps actually hold.

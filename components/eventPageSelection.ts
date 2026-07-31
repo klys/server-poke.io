@@ -113,7 +113,7 @@ const RE_COOLDOWN = /^(?:Kernel\.)?(?:cooledDown\?|cooledDownDays\?)\(\s*\d+\s*\
 // Feature checks for systems the online engine intentionally does not run;
 // evaluating them false keeps their pages hidden, exactly like the original
 // when outside those modes.
-const RE_ALWAYS_FALSE = /^(?:Kernel\.)?(?:pbInSafari\?|pbInBugContest\?|pbBugContestUndecided\?|pbContest\?)$/;
+const RE_ALWAYS_FALSE = /^(?:Kernel\.)?(?:pbInSafari\?|pbInBugContest\?|pbBugContestUndecided\?|pbContest\?|pbNextMysteryGiftID\s*>\s*0)$/;
 
 /**
  * Evaluates one Essentials script-switch expression for a page condition.

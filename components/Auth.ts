@@ -248,6 +248,12 @@ export interface PokemonSummary {
      */
     isEgg?:boolean;
     eggStepsToHatch?:number;
+    /**
+     * Original trainer of a venomon received in an in-game NPC trade
+     * (pbStartTrade). Present = "foreign": the name rater refuses to rename
+     * it, exactly like the original games.
+     */
+    foreignOt?:string;
     // Read-only enrichment for admin/UX surfaces (see InventoryItem.iconSrc).
     iconImageSrc?:string;
     frontImageSrc?:string;
@@ -2269,6 +2275,98 @@ export default class Auth {
         // Otherwise send to PC storage so nothing is lost.
         await this.addPokemonToStorage(userId, summary);
         return { ok: true, pokemonName: resolved.name, boxed: true };
+    }
+
+    /** Display name of a species by Essentials internal name (Venova rename-aware). */
+    public async getSpeciesDisplayName(internalName:string):Promise<string | null> {
+        const resolved = await this.readPokemonProfileById(`pokemon-${String(internalName).toUpperCase()}`);
+        return resolved?.name ?? null;
+    }
+
+    /**
+     * In-game NPC trade (pbStartTrade): swaps the party member at partyIndex
+     * for a freshly generated venomon of the given species at the SAME level,
+     * carrying the NPC trainer's nickname and OT — like trading with an NPC in
+     * the original games. The traded venomon leaves the game.
+     */
+    public async tradePartyPokemon(
+        userId:number,
+        partyIndex:number,
+        internalName:string,
+        nickname:string | null,
+        otName:string | null
+    ):Promise<{ ok:true; receivedName:string; tradedName:string } | { ok:false }> {
+        const user = await this.getUserById(String(userId));
+        const party = Array.isArray(user?.pokemonParty) ? [...user.pokemonParty] : [];
+        const outgoing = party[partyIndex];
+        if (!outgoing || outgoing.isEgg) {
+            return { ok: false };
+        }
+
+        const built = await this.buildSpeciesSummary(internalName, outgoing.level);
+        if (!built) {
+            return { ok: false };
+        }
+        const incoming:PokemonSummary = {
+            ...built.summary,
+            foreignOt: otName?.trim() || "?"
+        };
+        if (nickname && nickname.trim()) {
+            incoming.name = nickname.trim();
+            incoming.nickname = nickname.trim();
+        }
+
+        party[partyIndex] = incoming;
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
+        });
+        this.markPartyChanged(userId);
+        return {
+            ok: true,
+            receivedName: incoming.name,
+            tradedName: outgoing.nickname || outgoing.name
+        };
+    }
+
+    /**
+     * Renames a party member (the name rater). `name` null resets the
+     * venomon back to its species name.
+     */
+    public async renamePartyPokemon(
+        userId:number,
+        partyIndex:number,
+        name:string | null
+    ):Promise<string | null> {
+        const user = await this.getUserById(String(userId));
+        const party = Array.isArray(user?.pokemonParty) ? [...user.pokemonParty] : [];
+        const pokemon = party[partyIndex];
+        if (!pokemon || pokemon.isEgg) {
+            return null;
+        }
+
+        let applied:string;
+        if (name && name.trim()) {
+            applied = name.trim().slice(0, 20);
+            party[partyIndex] = { ...pokemon, name: applied, nickname: applied };
+        } else {
+            const speciesInternal = (pokemon.sourcePokemonId ?? "").replace(/^pokemon-/i, "");
+            const speciesName = speciesInternal
+                ? await this.getSpeciesDisplayName(speciesInternal)
+                : null;
+            if (!speciesName) {
+                return null;
+            }
+            applied = speciesName;
+            const reset = { ...pokemon, name: speciesName };
+            delete reset.nickname;
+            party[partyIndex] = reset;
+        }
+
+        await this.redis.hSet(this.userKey(userId), {
+            pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
+        });
+        this.markPartyChanged(userId);
+        return applied;
     }
 
     /**
