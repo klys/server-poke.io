@@ -82,10 +82,15 @@ interface PlayableMapsSyncRequestPayload {
 }
 
 export default interface ClientToServerEvents {
+  // Latency probe for the client's HUD: the server acks immediately and the
+  // client measures the round-trip time. Works pre-auth.
+  "net:ping": (ack: () => void) => void;
   addPlayer: (data?: {
     token?: string;
   }) => void;
   "player:teleport": (data: { mapId: string; x: number; y: number }) => void;
+  /** Hold-to-run intent (Running Shoes). Server validates shoe ownership. */
+  "player:run": (data: { running: boolean }) => void;
   "player:fly": (data: { mapId: string }) => void;
   // Field skills used out of battle by facing/standing on the relevant terrain.
   // player:surf optionally carries an adjacent water cell (from the water

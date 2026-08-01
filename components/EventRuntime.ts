@@ -30,6 +30,7 @@ import {
   RE_ITEM_BALL_VAR,
   RE_STORE_ITEM,
   RE_POKEDEX,
+  RE_RUNNING_SHOES,
   RE_AWARD_BADGE,
   RE_RECEIVE_BADGE,
   RE_NUMBADGES,
@@ -1832,6 +1833,27 @@ export default class EventRuntime {
 
     if (RE_POKEDEX.test(text)) {
       await this.auth.setEventSwitches(session.userId, 999, 999, true); // pokedex-owned marker
+      return;
+    }
+
+    // `$PokemonGlobal.runningShoes=true` (Mamá's "Zapatos Nike" gift): the
+    // original flips a bare flag; here the flag IS the RUNNINGSHOES quest
+    // item, which also gates the run key server-side. The event's own Show
+    // Text announces the gift, so the grant itself stays silent.
+    const runningShoes = text.match(RE_RUNNING_SHOES);
+    if (runningShoes) {
+      const enable = runningShoes[1].toLowerCase() === "true";
+      if (enable) {
+        const owned =
+          (await this.battleManager?.getEventItemQuantity(session.userId, "RUNNINGSHOES")) ?? 0;
+        if (owned <= 0) {
+          await this.grantScriptedItem(session, { symbol: "RUNNINGSHOES" }, null);
+        }
+      } else if (this.battleManager) {
+        await this.battleManager.removeEventItem(session.userId, { symbol: "RUNNINGSHOES" });
+        session.player.setRunning(false);
+        await this.refreshSession(session);
+      }
       return;
     }
 

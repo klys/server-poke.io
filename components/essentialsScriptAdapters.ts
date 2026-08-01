@@ -70,6 +70,9 @@ export const RE_ITEM_BALL = /pbItemBall\(\s*(?:PBItems::|:)(\w+)/i;
 export const RE_ITEM_BALL_VAR = /pbItemBall\(\s*pbGet\(\s*(\d+)\s*\)/i;
 export const RE_STORE_ITEM = /pbStoreItem\(\s*(?:PBItems::|:)(\w+)/i;
 export const RE_POKEDEX = /\$Trainer\.pokedex\s*=\s*true/i;
+// Venova grants running via a bare flag ("Mamá" on Map014: "Zapatos Nike");
+// the engine models it as the RUNNINGSHOES quest item so it shows in the bag.
+export const RE_RUNNING_SHOES = /\$PokemonGlobal\.runningShoes\s*=\s*(true|false)/i;
 export const RE_AWARD_BADGE = /\$(?:Trainer|player)\.badges\[\s*(\d+)\s*\]\s*=\s*true/i;
 export const RE_RECEIVE_BADGE = /pbReceiveBadge\(\s*(\d+)\s*\)/i;
 export const RE_NUMBADGES = /\$(?:Trainer|player)\.(?:numbadges|badge_count)\s*(>=|<=|==|!=|>|<)\s*(\d+)/i;

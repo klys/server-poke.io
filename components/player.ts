@@ -14,10 +14,12 @@ export default class Player {
     width:number;
     height:number;
     speed:number;
-    /** Path nodes consumed per movement tick. 1 = walking, >1 = cycling. */
+    /** Path nodes consumed per movement tick. 1 = walking, >1 = running/cycling. */
     speedMultiplier:number = 1;
     /** True while the Bicycle is out (drives speedMultiplier and the sprite). */
     cycling:boolean = false;
+    /** True while the run key is held with the Running Shoes in the bag. */
+    running:boolean = false;
     /** True while Surf is active: water-tagged solid cells become passable. */
     isSurfing:boolean = false;
     socketId:string;
@@ -138,10 +140,28 @@ export default class Player {
     /** Bicycle speed while cycling (path nodes consumed per movement tick). */
     static readonly CYCLE_SPEED_MULTIPLIER = 2;
 
+    /** Running Shoes speed (Essentials: running is 2x walking). */
+    static readonly RUN_SPEED_MULTIPLIER = 2;
+
     /** Toggles/sets the Bicycle. Cycling doubles movement speed. */
     setCycling(on: boolean) {
         this.cycling = on;
-        this.speedMultiplier = on ? Player.CYCLE_SPEED_MULTIPLIER : 1;
+        this.refreshSpeedMultiplier();
+    }
+
+    /** Sets the Running Shoes run state (hold-to-run key on the client). */
+    setRunning(on: boolean) {
+        this.running = on;
+        this.refreshSpeedMultiplier();
+    }
+
+    /** Bicycle wins over running (Essentials blocks running while biking). */
+    private refreshSpeedMultiplier() {
+        this.speedMultiplier = this.cycling
+            ? Player.CYCLE_SPEED_MULTIPLIER
+            : this.running
+                ? Player.RUN_SPEED_MULTIPLIER
+                : 1;
     }
 
     /** The cell the player currently occupies (its collision-box centre). */

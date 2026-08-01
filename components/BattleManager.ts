@@ -529,6 +529,44 @@ type ItemDefinition = {
   };
 };
 
+/**
+ * The original game never defines a RUNNINGSHOES item — running is a bare
+ * `$PokemonGlobal.runningShoes` flag flipped by Mamá's gift event. The engine
+ * models that flag as a quest item (visible in the bag, gates the run key),
+ * so the definition is synthesized here instead of living in the catalog.
+ */
+const RUNNING_SHOES_DEFINITION: ItemDefinition = {
+  id: "item-runningshoes",
+  name: "Zapatos Nike",
+  essentialsId: "RUNNINGSHOES",
+  price: 0,
+  type: "quest",
+  category: "quest",
+  description:
+    "Los zapatos deportivos que te regaló mamá. Mantén pulsada la tecla de correr para ir más rápido.",
+  iconSrc: "",
+  skillId: "",
+  skillName: "",
+  moveInternal: "",
+  machineKind: null,
+  effectKind: "",
+  useCondition: "",
+  isPokeball: false,
+  pokeballBonusRatio: 0,
+  curesStatuses: null,
+  curesConfusion: false,
+  heldEffect: null,
+  heldBonus: null,
+  statModifiers: {
+    hp: 0,
+    attack: 0,
+    defense: 0,
+    specialAttack: 0,
+    specialDefense: 0,
+    speed: 0
+  }
+};
+
 type NpcStoreDefinition = {
   itemId: string;
   itemName: string;
@@ -1722,6 +1760,15 @@ export default class BattleManager {
         };
       }
 
+      case "running-shoes":
+        // Passive key item: running happens by holding the run key, not by
+        // "using" the shoes — so Use just reminds the player how it works.
+        return {
+          ok: true,
+          message:
+            "Mantén pulsada la tecla de correr mientras caminas para correr (configúrala en Ajustes → Controles)."
+        };
+
       case "poke-radar": {
         if (!player) {
           return { ok: false, message: "Enter the world before using the Poke Radar." };
@@ -2775,6 +2822,12 @@ export default class BattleManager {
 
     if (throwQuantity > item.quantity) {
       return { ok: false, message: "You do not have that many to throw away." };
+    }
+
+    if (itemDefinition.essentialsId === RUNNING_SHOES_DEFINITION.essentialsId) {
+      // Mamá's gift only fires once (self switch A) — tossing the shoes would
+      // permanently lock the player out of running. Key items can't be tossed.
+      return { ok: false, message: "Es demasiado importante para tirarlo." };
     }
 
     const nextInventory = this.removeInventoryQuantity(user.inventory, item.id, throwQuantity);
@@ -9753,6 +9806,13 @@ export default class BattleManager {
     this.cachedItemDefinitions = (itemsPayload?.state.items ?? [])
       .map(this.toItemDefinition)
       .filter((item): item is ItemDefinition => Boolean(item));
+    if (
+      !this.cachedItemDefinitions.some(
+        (item) => item.essentialsId === RUNNING_SHOES_DEFINITION.essentialsId
+      )
+    ) {
+      this.cachedItemDefinitions.push(RUNNING_SHOES_DEFINITION);
+    }
     this.cachedNpcDefinitions = new Map(
       (npcsPayload?.state.items ?? [])
         .map(this.toNpcDefinition)

@@ -281,7 +281,7 @@ export default interface ServerToClientEvents {
   // A used bag key item asks the client to open a window / toggle a mode
   // (e.g. Town Map -> open the world map). No party state changed.
   "inventory:action": (data: {
-    type: "town-map" | "bicycle" | "dowsing" | "fishing" | "poke-radar" | "generic";
+    type: "town-map" | "bicycle" | "running-shoes" | "dowsing" | "fishing" | "poke-radar" | "generic";
   }) => void;
   // Outcome of a click-to-fish cast. "bite" is followed by a battle:state; the
   // client keeps the casting animation until this arrives, then shows the text.

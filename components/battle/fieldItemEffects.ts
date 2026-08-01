@@ -124,6 +124,7 @@ const WAKE_FLUTE_ITEMS = new Set(["POKEFLUTE", "BLUEFLUTE"]);
 export type FieldItemKeyAction =
   | "town-map"
   | "bicycle"
+  | "running-shoes"
   | "dowsing"
   | "fishing"
   | "poke-radar"
@@ -143,6 +144,7 @@ const KEY_ITEM_ACTIONS: Record<string, FieldItemKeyAction> = {
   TOWNMAP: "town-map",
   POKERADAR: "poke-radar",
   BICYCLE: "bicycle",
+  RUNNINGSHOES: "running-shoes",
   ITEMFINDER: "dowsing",
   DOWSINGMACHINE: "dowsing",
   OLDROD: "fishing",

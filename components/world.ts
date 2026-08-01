@@ -407,6 +407,11 @@ export default class World {
             return;
         }
         player.isSurfing = surfing;
+        if (surfing) {
+            // Essentials blocks running while surfing (pbCanRun?); the run
+            // key must be re-pressed after dismounting.
+            player.setRunning(false);
+        }
         this.persistPlayerLocation(player);
         this.broadcastSurfState(player);
     }

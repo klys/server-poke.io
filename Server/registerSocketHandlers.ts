@@ -643,6 +643,15 @@ function createConnectionHandler(
       console.error("Unable to hydrate socket auth state:", error);
     });
 
+    // Latency probe for the client HUD: ack right away so the client can
+    // measure round-trip time. Deliberately unauthenticated — the HUD shows
+    // latency from the login screen onward.
+    socket.on("net:ping", (ack) => {
+      if (typeof ack === "function") {
+        ack();
+      }
+    });
+
     /**
      * Asset-reservation gate. Anything that could change an item, a Venomon or
      * the player's money must pass through here first: if a live trade has the
@@ -2259,6 +2268,34 @@ function createConnectionHandler(
 
       player.stopMovement();
       world.players.set(player.socketId, player);
+    });
+
+    // Hold-to-run (Running Shoes). Speed stays fully server-authoritative:
+    // this only flips the multiplier the movement tick consumes, and only
+    // when the shoes are actually in the bag — a client emitting this
+    // without them keeps walking, like holding the run key in Essentials
+    // before Mamá's gift.
+    socket.on("player:run", async (data) => {
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player) return;
+
+      if (!data?.running) {
+        player.setRunning(false);
+        return;
+      }
+      // Essentials pbCanRun?: no running while surfing (surf speed already
+      // matches run speed) or on the Bicycle.
+      if (player.isSurfing || player.cycling) return;
+      if (typeof socket.data.userId !== "number") return;
+
+      const shoes = await battleManager.getEventItemQuantity(socket.data.userId, "RUNNINGSHOES");
+      if (shoes <= 0) return;
+
+      // Re-check: the async inventory read may resolve after a surf mount
+      // or after the key was already released.
+      const current = world.getPlayerBySocket(socket.id);
+      if (!current || current.isSurfing || current.cycling) return;
+      current.setRunning(true);
     });
 
     socket.on("player:teleport", (data) => {
