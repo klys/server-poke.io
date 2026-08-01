@@ -28,6 +28,7 @@ import SocialManager from "../components/SocialManager";
 import TradeManager from "../components/TradeManager";
 import { TradeError, type TradeMutationSource } from "../components/trade/tradeTypes";
 import World from "../components/world";
+import MaintenanceRunner from "../components/MaintenanceRunner";
 import PokecraftApiClient, {
   PokecraftApiError,
   type ApiKeyScope,
@@ -335,6 +336,11 @@ export function isAllowedClientTeleport(
       Math.hypot(portal.x * 32 + 16 - centerX, portal.y * 32 + 16 - centerY) <= 96
   );
 }
+
+// Maintenance actions runner (admin panel "Maintenance" tab). Created in
+// registerSocketHandlers where the redis client is available; the connection
+// handler only reads it.
+let maintenanceRunner:MaintenanceRunner | null = null;
 
 function requireAdminAccess(socket:ServerSocket) {
   return requirePermission(
@@ -2020,6 +2026,65 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("admin:maintenance:list", async () => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+        if (!requireAdminAccess(socket) || !maintenanceRunner) {
+          return;
+        }
+        socket.emit("admin:maintenance:list", {
+          actions: await maintenanceRunner.listActions(),
+          running: maintenanceRunner.running
+        });
+      } catch (error) {
+        console.error("Unable to list maintenance actions:", error);
+        socket.emit("admin:error", { message: "Unable to load maintenance actions right now." });
+      }
+    });
+
+    socket.on("admin:maintenance:run", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+        if (!requireAdminAccess(socket) || !maintenanceRunner) {
+          return;
+        }
+        const actionId = typeof data?.id === "string" ? data.id : "";
+        const dryRun = data?.dryRun === true;
+        const result = maintenanceRunner.run(
+          actionId,
+          { dryRun, requestedBy: `user:${socket.data.userId ?? "?"}` },
+          (line) => socket.emit("admin:maintenance:log", { id: actionId, line }),
+          (outcome) => {
+            socket.emit("admin:maintenance:done", {
+              id: actionId,
+              ok: outcome.ok,
+              exitCode: outcome.exitCode
+            });
+            // Push the refreshed list (last-run stamps) without a re-request.
+            void maintenanceRunner
+              ?.listActions()
+              .then((actions) =>
+                socket.emit("admin:maintenance:list", {
+                  actions,
+                  running: maintenanceRunner?.running ?? null
+                })
+              )
+              .catch(() => undefined);
+          }
+        );
+        if (!result.started) {
+          socket.emit("admin:error", { message: result.message });
+        }
+      } catch (error) {
+        console.error("Unable to run maintenance action:", error);
+        socket.emit("admin:error", { message: "Unable to run that maintenance action right now." });
+      }
+    });
+
     socket.on("admin:apikeys:list", async () => {
       try {
         if (!socket.data.authenticated && readSocketToken(socket)) {
@@ -3643,6 +3708,7 @@ export default function registerSocketHandlers(
 ) {
   const battleManager = new BattleManager(io, world, auth, designerSectionStore);
   world.setBattleManager(battleManager);
+  maintenanceRunner = new MaintenanceRunner(redis);
   const eventRuntime = new EventRuntime(io, world, auth);
   const socialManager = new SocialManager(io, world, auth, battleManager, eventRuntime);
   const tradeManager = new TradeManager(

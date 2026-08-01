@@ -392,6 +392,8 @@ export default interface ClientToServerEvents {
   "admin:presence:subscribe": () => void;
   "admin:presence:unsubscribe": () => void;
   "admin:roles:list": () => void;
+  "admin:maintenance:list": () => void;
+  "admin:maintenance:run": (data: { id: string; dryRun?: boolean }) => void;
   "admin:role:update": (data: {
     roleKey: UserRoleKey;
     description?: string;

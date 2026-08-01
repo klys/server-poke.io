@@ -35,6 +35,7 @@ import type {
   PlayableMapsVersionPayload
 } from "../components/PlayableMapsStore";
 import type { ApiKeySummary } from "../components/PokecraftApiClient";
+import type { MaintenanceActionStatus } from "../components/MaintenanceRunner";
 
 export type EventStatePayload = {
   switches: Record<string, boolean>;
@@ -445,6 +446,9 @@ export default interface ServerToClientEvents {
   /** Real-time set of user ids currently online, pushed to subscribed admins. */
   "admin:presence:state": (data: { onlineUserIds: number[] }) => void;
   "admin:roles:list": (data: { roles: RoleDefinitionWithCount[] }) => void;
+  "admin:maintenance:list": (data: { actions: MaintenanceActionStatus[]; running: string | null }) => void;
+  "admin:maintenance:log": (data: { id: string; line: string }) => void;
+  "admin:maintenance:done": (data: { id: string; ok: boolean; exitCode: number | null }) => void;
   "admin:apikeys:list": (data: { keys: ApiKeySummary[] }) => void;
   /** One-time reveal of a freshly minted key's plaintext secret. */
   "admin:apikeys:created": (data: { key: string; meta: ApiKeySummary }) => void;
