@@ -1,5 +1,11 @@
 # AGENTS.md
 
+Workspace-level guidance (full-stack bring-up, cross-repo contract workflow,
+skills index) lives in `../AGENTS.md`. Skills: `server-poke.io:verify` (build
+gate + progression suite + E2E socket drivers) and
+`server-poke.io:essentials-data` (imported game-data pipeline) are defined in
+this repo; `run-stack`, `contract-sync`, and `redis-data` at the workspace root.
+
 ## Client-Server Contract
 
 In case of changes that require server side refactor use contracts.json to find the other side that require to be updated.

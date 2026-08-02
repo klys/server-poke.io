@@ -10,6 +10,8 @@ COPY index.ts ./
 COPY Server ./Server
 COPY components ./components
 COPY emails ./emails
+# Maintenance-tab tools run compiled (dist/tools/*.js) in production.
+COPY tools ./tools
 
 RUN npm run build
 
@@ -28,6 +30,8 @@ RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
 
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/emails ./emails
+# Bundled data for the "Repair Essentials Events" maintenance action.
+COPY migration-data/rxdata_json ./migration-data/rxdata_json
 
 EXPOSE 3001
 

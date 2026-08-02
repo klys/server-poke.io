@@ -2,8 +2,11 @@
  * Admin-panel maintenance actions: a fixed whitelist of the repair/diagnostic
  * tools in tools/, runnable from the frontend "Maintenance" tab so applying
  * them on production no longer needs SSH/docker access. Each action spawns
- * the existing CLI tool as a child process (same ts-node the server runs on)
- * and streams its output back to the requesting admin socket.
+ * the existing CLI tool as a child process and streams its output back to
+ * the requesting admin socket. In dev (running under ts-node) the .ts source
+ * runs via ts-node; when the server runs compiled (docker: node dist/index.js)
+ * the tsc-emitted dist/tools/*.js runs under plain node — the runtime image
+ * has neither the .ts sources nor ts-node.
  *
  * The rxdata_json dump the event repair needs ships with the server in
  * migration-data/rxdata_json, so the action is self-contained on any deploy.
@@ -13,7 +16,10 @@ import { existsSync } from "fs";
 import path from "path";
 import type { RedisClientType } from "redis";
 
-const SERVER_ROOT = path.join(__dirname, "..");
+// Compiled: <root>/dist/components/MaintenanceRunner.js. Dev (ts-node keeps
+// .ts filenames): <root>/components/MaintenanceRunner.ts.
+const IS_COMPILED = __filename.endsWith(".js");
+const SERVER_ROOT = IS_COMPILED ? path.join(__dirname, "..", "..") : path.join(__dirname, "..");
 const RXDATA_DIR = path.join(SERVER_ROOT, "migration-data", "rxdata_json");
 const LAST_RUN_KEY = "admin:maintenance:last-run";
 const RUN_TIMEOUT_MS = 15 * 60 * 1000;
@@ -90,6 +96,13 @@ export const MAINTENANCE_ACTIONS: MaintenanceActionDefinition[] = [
   }
 ];
 
+/** Absolute path of the file this action actually executes on this deploy. */
+function runnableScriptPath(action: MaintenanceActionDefinition): string {
+  return IS_COMPILED
+    ? path.join(SERVER_ROOT, "dist", action.script.replace(/\.ts$/, ".js"))
+    : path.join(SERVER_ROOT, action.script);
+}
+
 export default class MaintenanceRunner {
   private redis: RedisClientType;
   private runningActionId: string | null = null;
@@ -105,7 +118,8 @@ export default class MaintenanceRunner {
   public async listActions(): Promise<MaintenanceActionStatus[]> {
     const lastRuns = await this.redis.hGetAll(LAST_RUN_KEY).catch(() => ({} as Record<string, string>));
     return MAINTENANCE_ACTIONS.map((action) => {
-      const missing = action.requiresPath && !existsSync(action.requiresPath);
+      const missingData = action.requiresPath && !existsSync(action.requiresPath);
+      const missingScript = !existsSync(runnableScriptPath(action));
       let lastRun: MaintenanceLastRun | null = null;
       try {
         lastRun = lastRuns[action.id] ? (JSON.parse(lastRuns[action.id]) as MaintenanceLastRun) : null;
@@ -118,10 +132,12 @@ export default class MaintenanceRunner {
         description: action.description,
         dangerous: action.dangerous,
         supportsDryRun: action.supportsDryRun,
-        available: !missing,
-        unavailableReason: missing
+        available: !missingData && !missingScript,
+        unavailableReason: missingData
           ? `Missing bundled data: ${path.relative(SERVER_ROOT, action.requiresPath as string)}`
-          : null,
+          : missingScript
+            ? `Tool not shipped on this deploy: ${path.relative(SERVER_ROOT, runnableScriptPath(action))}`
+            : null,
         lastRun
       };
     });
@@ -145,16 +161,22 @@ export default class MaintenanceRunner {
     if (action.requiresPath && !existsSync(action.requiresPath)) {
       return { started: false, message: "This action's bundled data is missing on this server." };
     }
+    const scriptPath = runnableScriptPath(action);
+    if (!existsSync(scriptPath)) {
+      return { started: false, message: "This action's tool is not shipped on this deploy." };
+    }
     if (this.runningActionId) {
       return { started: false, message: `Another action (${this.runningActionId}) is still running.` };
     }
 
     const dryRun = options.dryRun && action.supportsDryRun;
-    const args = ["ts-node", action.script, ...action.args, ...(dryRun ? ["--dry-run"] : [])];
+    const toolArgs = [...action.args, ...(dryRun ? ["--dry-run"] : [])];
+    const command = IS_COMPILED ? process.execPath : "npx";
+    const args = IS_COMPILED ? [scriptPath, ...toolArgs] : ["ts-node", action.script, ...toolArgs];
     this.runningActionId = action.id;
-    onLine(`$ npx ${args.join(" ")}`);
+    onLine(`$ ${IS_COMPILED ? "node" : "npx"} ${args.join(" ")}`);
 
-    const child = spawn("npx", args, {
+    const child = spawn(command, args, {
       cwd: SERVER_ROOT,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"]
