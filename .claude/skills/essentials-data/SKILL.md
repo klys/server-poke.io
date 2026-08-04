@@ -20,9 +20,10 @@ populate, audit, and repair it.
   manual edits to non-imported records are preserved. A running server picks
   up changes on the next map sync; restart the server (or save any map in the
   designer) to broadcast immediately.
-- Some tools hardcode the old `/home/klys/Dev/pokecraft/...` path — check the
-  constants at the top before running (this repo now lives at
-  `/home/junior-jimenez/Dev/pokecraft/server-poke.io`).
+- Some tools hardcode absolute workspace paths (e.g.
+  `/home/klys/Dev/pokecraft/...`) — the workspace has moved between machines
+  before, so check the constants at the top of a tool against the actual
+  checkout location before running.
 - Docs: `ESSENTIALS_PROGRESSION.md` (how progression/events work — read this
   before touching event logic), `migration-report.md` (last audit results).
 
