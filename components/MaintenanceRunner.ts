@@ -85,6 +85,16 @@ export const MAINTENANCE_ACTIONS: MaintenanceActionDefinition[] = [
     args: []
   },
   {
+    id: "migrate-accounts-to-characters",
+    name: "Migrate Accounts to Characters",
+    description:
+      "One-time schema v4 split: moves each legacy account's gameplay state onto its default character hash, stamps shared-box asset ownership, and converts PC money into owned deposits. Idempotent — already-migrated accounts are skipped (the server also migrates lazily on login).",
+    dangerous: true,
+    supportsDryRun: true,
+    script: "tools/migrateAccountsToCharacters.ts",
+    args: []
+  },
+  {
     id: "essentials-migration-report",
     name: "Essentials Migration Report",
     description:

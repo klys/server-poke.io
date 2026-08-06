@@ -74,6 +74,9 @@ interface Client {
   userId: number;
   token: string;
   userKey: string;
+  /** Active character (account/character split): gameplay state lives here. */
+  characterId: number;
+  charKey: string;
   fishingResults: any[];
   fieldErrors: any[];
   surfStates: any[];
@@ -96,6 +99,7 @@ async function main() {
     if (server && !server.killed) { server.kill("SIGTERM"); await sleep(800); if (!server.killed) server.kill("SIGKILL"); }
     if (redis?.isOpen) {
       for (const id of testUserIds) { try { await redis.del(`auth:user:${id}`); } catch {} }
+      for (const c of clients) { try { if (c.charKey) await redis.del(c.charKey); } catch {} }
       await redis.quit();
     }
   };
@@ -103,7 +107,7 @@ async function main() {
   const newClient = async (label: string): Promise<Client> => {
     const socket = io(`http://localhost:${PORT}`, { transports: ["websocket"], forceNew: true });
     const c: Client = {
-      socket, userId: 0, token: "", userKey: "",
+      socket, userId: 0, token: "", userKey: "", characterId: 0, charKey: "",
       fishingResults: [], fieldErrors: [], surfStates: [], fieldActions: [],
       battleStates: [], addPlayers: [], poses: [], myPlayerId: null
     };
@@ -140,6 +144,8 @@ async function main() {
     c.userId = Number(session.user.id);
     c.token = session.token;
     c.userKey = `auth:user:${c.userId}`;
+    c.characterId = Number(session.user.characterId ?? c.userId);
+    c.charKey = `auth:character:${c.characterId}`;
     testUserIds.push(c.userId);
     clients.push(c);
     log(`  [${label}] registered #${c.userId}`);
@@ -151,14 +157,18 @@ async function main() {
     moves: string[]; inventory?: Array<{ id: string; name: string; category: string; quantity: number }>;
     surfing?: boolean;
   }) => {
-    await redis!.hSet(c.userKey, {
+    // Post account/character split: gameplay fields live on the character
+    // hash; the shared PC box stays on the account hash.
+    await redis!.hSet(c.charKey, {
       last_map_id: opts.mapId,
       last_x: String(opts.x * 32),
       last_y: String(opts.y * 32),
       last_surfing: opts.surfing ? "1" : "0",
       pokemon_party: JSON.stringify([mon("m1", opts.moves)]),
-      pokemon_box: JSON.stringify({ boxes: [] }),
       inventory: JSON.stringify(opts.inventory ?? [])
+    });
+    await redis!.hSet(c.userKey, {
+      pokemon_box: JSON.stringify({ boxes: [] })
     });
     c.socket.emit("addPlayer", { token: c.token });
     await waitFor("myPlayer", () => c.myPlayerId);
@@ -261,7 +271,7 @@ async function main() {
     log("  ✓ rejected: needs a rod");
 
     // Give every rod + a surf mon; re-query availability.
-    await redis.hSet(A.userKey, {
+    await redis.hSet(A.charKey, {
       inventory: JSON.stringify(ALL_RODS),
       pokemon_party: JSON.stringify([mon("m1", ["Surf", "Buceo"])])
     });
@@ -306,7 +316,7 @@ async function main() {
     log("── reconnect while surfing ──");
     A.socket.disconnect();
     await sleep(1200); // let the disconnect handler persist location+surfing
-    const surfSaved = await redis.hGet(A.userKey, "last_surfing");
+    const surfSaved = await redis.hGet(A.charKey, "last_surfing");
     if (surfSaved !== "1") fail(`last_surfing not persisted (got ${surfSaved})`);
     const A2 = io(`http://localhost:${PORT}`, { transports: ["websocket"], forceNew: true });
     const a2Players: any[] = [];

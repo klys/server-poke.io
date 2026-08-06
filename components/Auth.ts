@@ -556,8 +556,35 @@ export const MAX_CHARACTERS_PER_ACCOUNT = Math.max(
     Math.round(Number(process.env.MAX_CHARACTERS_PER_ACCOUNT ?? 6))
 );
 /** Soft-deleted characters stay restorable this long before being purged. */
-const CHARACTER_RECOVERY_MS =
-    Math.max(0, Number(process.env.CHARACTER_RECOVERY_DAYS ?? 30)) * 24 * 60 * 60 * 1000;
+const CHARACTER_RECOVERY_DAYS_DEFAULT = Math.max(0, Number(process.env.CHARACTER_RECOVERY_DAYS ?? 30));
+const SKIN_CHANGE_PRICE_DEFAULT = Math.max(0, Math.round(Number(process.env.SKIN_CHANGE_PRICE ?? 300)));
+
+/**
+ * Operator-tunable global game settings, editable from the admin panel and
+ * stored in Redis (`settings:global`). The env-derived constants above are
+ * only the DEFAULTS for fresh databases; runtime reads go through
+ * getGlobalSettings so changes apply without a redeploy.
+ */
+export interface GlobalGameSettings {
+    /** Max non-deleted characters one account may have. */
+    maxCharactersPerAccount:number;
+    /** Gym medals the active character needs to use siblings' shared-box assets. */
+    crossCharacterStorageMinMedals:number;
+    /** Days a soft-deleted character stays restorable before it is purged. */
+    characterRecoveryDays:number;
+    /** Price of a paid character-skin change. */
+    skinChangePrice:number;
+    /** Wallet money a brand-new account/character starts with. */
+    startingMoney:number;
+}
+
+export const DEFAULT_GLOBAL_SETTINGS:GlobalGameSettings = {
+    maxCharactersPerAccount: MAX_CHARACTERS_PER_ACCOUNT,
+    crossCharacterStorageMinMedals: CROSS_CHARACTER_STORAGE_MIN_MEDALS,
+    characterRecoveryDays: CHARACTER_RECOVERY_DAYS_DEFAULT,
+    skinChangePrice: SKIN_CHANGE_PRICE_DEFAULT,
+    startingMoney: DEFAULT_MONEY
+};
 /** Same rule as account registration names (intro rename allows more). */
 const CHARACTER_NAME_PATTERN = /^[A-Za-z]{2,30}$/;
 /**
@@ -758,6 +785,54 @@ export default class Auth {
         return `auth:character:${characterId}`;
     }
 
+    // ---- global game settings (admin-tunable, Redis-backed) ----
+
+    private globalSettingsKey() {
+        return "settings:global";
+    }
+
+    private globalSettingsCache:{ settings:GlobalGameSettings; expiresAt:number } | null = null;
+
+    private sanitizeGlobalSettings(raw:unknown):GlobalGameSettings {
+        const source = (raw && typeof raw === "object" ? raw : {}) as Partial<Record<keyof GlobalGameSettings, unknown>>;
+        const int = (value:unknown, fallback:number, min:number, max:number) => {
+            const parsed = Math.round(Number(value));
+            return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+        };
+        return {
+            maxCharactersPerAccount: int(source.maxCharactersPerAccount, DEFAULT_GLOBAL_SETTINGS.maxCharactersPerAccount, 1, 20),
+            crossCharacterStorageMinMedals: int(source.crossCharacterStorageMinMedals, DEFAULT_GLOBAL_SETTINGS.crossCharacterStorageMinMedals, 0, 64),
+            characterRecoveryDays: int(source.characterRecoveryDays, DEFAULT_GLOBAL_SETTINGS.characterRecoveryDays, 0, 365),
+            skinChangePrice: int(source.skinChangePrice, DEFAULT_GLOBAL_SETTINGS.skinChangePrice, 0, MAX_MONEY_BALANCE),
+            startingMoney: int(source.startingMoney, DEFAULT_GLOBAL_SETTINGS.startingMoney, 0, MAX_MONEY_BALANCE)
+        };
+    }
+
+    public async getGlobalSettings():Promise<GlobalGameSettings> {
+        if (this.globalSettingsCache && Date.now() < this.globalSettingsCache.expiresAt) {
+            return this.globalSettingsCache.settings;
+        }
+        let settings = { ...DEFAULT_GLOBAL_SETTINGS };
+        try {
+            const raw = await this.redis.get(this.globalSettingsKey());
+            if (raw) {
+                settings = this.sanitizeGlobalSettings(JSON.parse(raw));
+            }
+        } catch {
+            // Malformed stored settings: fall back to defaults.
+        }
+        this.globalSettingsCache = { settings, expiresAt: Date.now() + 15_000 };
+        return settings;
+    }
+
+    public async updateGlobalSettings(updates:Partial<GlobalGameSettings>):Promise<GlobalGameSettings> {
+        const current = await this.getGlobalSettings();
+        const next = this.sanitizeGlobalSettings({ ...current, ...updates });
+        await this.redis.set(this.globalSettingsKey(), JSON.stringify(next));
+        this.globalSettingsCache = { settings: next, expiresAt: Date.now() + 15_000 };
+        return next;
+    }
+
     /** accountId -> active characterId (write-through cache; see selectCharacter). */
     private readonly activeCharacterByAccount = new Map<number, number>();
 
@@ -943,9 +1018,10 @@ export default class Auth {
         if (!CHARACTER_NAME_PATTERN.test(name)) {
             return { ok: false, message: "Character names use letters only (2-30 characters)." };
         }
+        const settings = await this.getGlobalSettings();
         const existing = await this.getCharacterSummariesRaw(await this.getCharacterIds(accountId));
-        if (existing.filter((character) => !character.deletedAt).length >= MAX_CHARACTERS_PER_ACCOUNT) {
-            return { ok: false, message: `You can have up to ${MAX_CHARACTERS_PER_ACCOUNT} characters.` };
+        if (existing.filter((character) => !character.deletedAt).length >= settings.maxCharactersPerAccount) {
+            return { ok: false, message: `You can have up to ${settings.maxCharactersPerAccount} characters.` };
         }
         const characterId = await this.redis.incr(this.userIdSequenceKey());
         const nowIso = new Date().toISOString();
@@ -956,7 +1032,7 @@ export default class Auth {
             trainer_gender: "",
             character_skin_id: "",
             trainer_card_color: "",
-            money: String(DEFAULT_MONEY),
+            money: String(settings.startingMoney),
             inventory: JSON.stringify(DEFAULT_INVENTORY),
             pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
             battle_history: JSON.stringify(DEFAULT_BATTLE_HISTORY),
@@ -1067,6 +1143,8 @@ export default class Auth {
      * never transfer to another character.
      */
     private async finalizeExpiredCharacterDeletions(accountId:number) {
+        const recoveryMs =
+            (await this.getGlobalSettings()).characterRecoveryDays * 24 * 60 * 60 * 1000;
         const ids = await this.getCharacterIds(accountId);
         for (const characterId of ids) {
             const [deletedAt, purgedAt, moneyRaw] = await this.redis.hmGet(
@@ -1077,7 +1155,7 @@ export default class Auth {
                 continue;
             }
             const deletedMs = Date.parse(deletedAt);
-            if (!Number.isFinite(deletedMs) || Date.now() - deletedMs < CHARACTER_RECOVERY_MS) {
+            if (!Number.isFinite(deletedMs) || Date.now() - deletedMs < recoveryMs) {
                 continue;
             }
             const frozenMoney = this.parseMoney(moneyRaw ?? undefined, 0);
@@ -2904,7 +2982,7 @@ export default class Auth {
         const party = Array.isArray(user.pokemonParty) ? [...user.pokemonParty] : [];
         if (party.length < MAX_POKEMON_PARTY_SIZE) {
             party.push(summary);
-            await this.redis.hSet(this.userKey(userId), {
+            await this.redis.hSet(await this.activeCharacterKey(userId), {
                 pokemon_party: JSON.stringify(party)
             });
             this.markPartyChanged(userId);
@@ -2966,7 +3044,7 @@ export default class Auth {
         }
 
         party[partyIndex] = incoming;
-        await this.redis.hSet(this.userKey(userId), {
+        await this.redis.hSet(await this.activeCharacterKey(userId), {
             pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
         });
         this.markPartyChanged(userId);
@@ -3011,7 +3089,7 @@ export default class Auth {
             party[partyIndex] = reset;
         }
 
-        await this.redis.hSet(this.userKey(userId), {
+        await this.redis.hSet(await this.activeCharacterKey(userId), {
             pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
         });
         this.markPartyChanged(userId);
@@ -3051,7 +3129,7 @@ export default class Auth {
             eggStepsToHatch: built.hatchSteps
         };
         party.push(egg);
-        await this.redis.hSet(this.userKey(userId), {
+        await this.redis.hSet(await this.activeCharacterKey(userId), {
             pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
         });
         this.eggPresenceByUserId.set(userId, true);
@@ -3099,7 +3177,7 @@ export default class Auth {
             }
         }
 
-        await this.redis.hSet(this.userKey(userId), {
+        await this.redis.hSet(await this.activeCharacterKey(userId), {
             pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
         });
         this.eggPresenceByUserId.set(userId, stillHasEgg);
@@ -3284,6 +3362,7 @@ export default class Auth {
         const normalizedEmail = email.toLowerCase();
         const usernameKey = this.usernameIndexKey(normalizedUsername);
         const emailKey = this.emailIndexKey(normalizedEmail);
+        const startingMoney = (await this.getGlobalSettings()).startingMoney;
 
         for (let attempt = 0; attempt < 5; attempt += 1) {
             await this.redis.watch([usernameKey, emailKey]);
@@ -3327,7 +3406,7 @@ export default class Auth {
                     trainer_gender: "",
                     character_skin_id: "",
                     trainer_card_color: "",
-                    money: String(DEFAULT_MONEY),
+                    money: String(startingMoney),
                     inventory: JSON.stringify(DEFAULT_INVENTORY),
                     pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
                     battle_history: JSON.stringify(DEFAULT_BATTLE_HISTORY),
@@ -3346,7 +3425,7 @@ export default class Auth {
                     characterSkinId: "",
                     trainerGender: "",
                     badges: [],
-                    money: DEFAULT_MONEY,
+                    money: startingMoney,
                     partyCount: 0,
                     lastMapId: null,
                     createdAt,
@@ -3377,7 +3456,7 @@ export default class Auth {
                     badges: [],
                     visitedTowns: [],
                     trainerCardColor: "",
-                    money: DEFAULT_MONEY,
+                    money: startingMoney,
                     battleHistory: DEFAULT_BATTLE_HISTORY,
                     role,
                     permissions: role === "admin"
@@ -4250,12 +4329,16 @@ export default class Auth {
     // box APIs only accept party venomons, bag items, and wallet money.
 
     public async getStorageAccessContext(accountId:number) {
-        const characterId = await this.getActiveCharacterId(accountId);
+        const [characterId, settings] = await Promise.all([
+            this.getActiveCharacterId(accountId),
+            this.getGlobalSettings()
+        ]);
         const badges = this.parseBadges(await this.redis.hGet(this.characterKey(characterId), "badges"));
         return {
             characterId,
             medalCount: badges.length,
-            canAccessOthersAssets: badges.length >= CROSS_CHARACTER_STORAGE_MIN_MEDALS
+            minMedals: settings.crossCharacterStorageMinMedals,
+            canAccessOthersAssets: badges.length >= settings.crossCharacterStorageMinMedals
         };
     }
 
@@ -4291,9 +4374,8 @@ export default class Auth {
         return asset;
     }
 
-    private crossCharacterDeniedMessage() {
-        const n = CROSS_CHARACTER_STORAGE_MIN_MEDALS;
-        return `You need ${n} gym medal${n === 1 ? "" : "s"} to use assets stored by your other characters.`;
+    private crossCharacterDeniedMessage(minMedals:number = CROSS_CHARACTER_STORAGE_MIN_MEDALS) {
+        return `You need ${minMedals} gym medal${minMedals === 1 ? "" : "s"} to use assets stored by your other characters.`;
     }
 
     public async getPokemonStorage(userId:number):Promise<PokemonStorageBox[]> {
@@ -4468,7 +4550,7 @@ export default class Auth {
                 this.assetOwnerId(stored, context.characterId) !== context.characterId &&
                 !context.canAccessOthersAssets
             ) {
-                return { ok: false, message: this.crossCharacterDeniedMessage() };
+                return { ok: false, message: this.crossCharacterDeniedMessage(context.minMedals) };
             }
             // Ownership transfers to the withdrawing character (it now holds
             // the venomon in its party).
@@ -4528,7 +4610,7 @@ export default class Auth {
                         this.assetOwnerId(box.pokemon[i], context.characterId) !== context.characterId &&
                         !context.canAccessOthersAssets
                     ) {
-                        return { ok: false, message: this.crossCharacterDeniedMessage() };
+                        return { ok: false, message: this.crossCharacterDeniedMessage(context.minMedals) };
                     }
                     moving.unshift(box.pokemon[i]);
                     box.pokemon.splice(i, 1);
@@ -4578,7 +4660,7 @@ export default class Auth {
                         this.assetOwnerId(box.pokemon[i], context.characterId) !== context.characterId &&
                         !context.canAccessOthersAssets
                     ) {
-                        return { ok: false, message: this.crossCharacterDeniedMessage() };
+                        return { ok: false, message: this.crossCharacterDeniedMessage(context.minMedals) };
                     }
                     released.unshift(box.pokemon[i]);
                     box.pokemon.splice(i, 1);
@@ -4779,7 +4861,7 @@ export default class Auth {
             this.assetOwnerId(stack, context.characterId) !== context.characterId &&
             !context.canAccessOthersAssets
         ) {
-            return { ok: false, message: this.crossCharacterDeniedMessage() };
+            return { ok: false, message: this.crossCharacterDeniedMessage(context.minMedals) };
         }
         const moved = Math.min(amount, stack.quantity);
         stack.quantity -= moved;
@@ -4844,7 +4926,7 @@ export default class Auth {
         }
         const stackOwner = this.assetOwnerId(stack, context.characterId);
         if (stackOwner !== context.characterId && !context.canAccessOthersAssets) {
-            return { ok: false, message: this.crossCharacterDeniedMessage() };
+            return { ok: false, message: this.crossCharacterDeniedMessage(context.minMedals) };
         }
         // Moving between boxes keeps the original owner, so merge only into a
         // stack with the SAME owner.
@@ -4896,7 +4978,7 @@ export default class Auth {
             this.assetOwnerId(stack, context.characterId) !== context.characterId &&
             !context.canAccessOthersAssets
         ) {
-            return { ok: false, message: this.crossCharacterDeniedMessage() };
+            return { ok: false, message: this.crossCharacterDeniedMessage(context.minMedals) };
         }
         const removed = Math.min(amount, stack.quantity);
         const name = stack.name;
@@ -5116,7 +5198,7 @@ export default class Auth {
         if (owner !== characterId) {
             const context = await this.getStorageAccessContext(userId);
             if (!context.canAccessOthersAssets) {
-                return { ok: false, message: this.crossCharacterDeniedMessage() };
+                return { ok: false, message: this.crossCharacterDeniedMessage(context.minMedals) };
             }
             const ids = await this.getCharacterIds(userId);
             if (!ids.includes(owner)) {

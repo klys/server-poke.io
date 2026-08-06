@@ -28,6 +28,11 @@ const CUT_NPC_ID = "npc-e2e-cut-test";
 const CUT_EVENT_ID = 9098;
 const CUT_ESS_MAP = 43;
 const ERASED_KEY = `${CUT_ESS_MAP}:${CUT_EVENT_ID}:ERASED`;
+// EventRuntime.startEvent silently drops interacts from more than ~3 tiles
+// away (anti-forge reach gate), so the injected NPC is pinned right next to
+// the seeded spawn cell. Both cells are open on map 043's collision grid.
+const CUT_STAND = { x: 1, y: 1 };
+const CUT_NPC_CELL = { x: 2, y: 1 };
 
 // A walkable land cell on the ocean route map-294, facing water to its left.
 const SURF_MAP = "map-essentials-294";
@@ -88,6 +93,7 @@ async function main() {
   let mapsBackup: string | null = null;
   let probeBackup: string | null = null;
   let testUserId: number | null = null;
+  let testCharacterId: number | null = null;
 
   const cleanup = async () => {
     log("── cleanup ──");
@@ -96,6 +102,7 @@ async function main() {
     if (redis?.isOpen) {
       if (mapsBackup !== null) { await redis.set(MAPS_KEY, mapsBackup); if (probeBackup !== null) await redis.set(PROBE_KEY, probeBackup); else await redis.del(PROBE_KEY); log("restored maps blob"); }
       if (testUserId !== null) { try { await redis.del(`auth:user:${testUserId}`); } catch {} }
+      if (testCharacterId !== null) { try { await redis.del(`auth:character:${testCharacterId}`); } catch {} }
       await redis.quit();
     }
   };
@@ -116,7 +123,7 @@ async function main() {
     if (!mapEd?.npcs?.length) fail(`${CUT_MAP} has no npcs to clone`);
     const template = mapEd.npcs.find((n: any) => n.essentialsEvent) ?? mapEd.npcs[0];
     const testNpc = JSON.parse(JSON.stringify(template));
-    Object.assign(testNpc, { id: CUT_NPC_ID, npcId: "essentials-event-e2e-cut", name: "E2E Cut Tree", eventId: CUT_EVENT_ID, eventPageIndex: 0, interactable: true, essentialsEvent: cutEvent() });
+    Object.assign(testNpc, { id: CUT_NPC_ID, npcId: "essentials-event-e2e-cut", name: "E2E Cut Tree", eventId: CUT_EVENT_ID, eventPageIndex: 0, interactable: true, x: CUT_NPC_CELL.x, y: CUT_NPC_CELL.y, essentialsEvent: cutEvent() });
     mapEd.npcs = mapEd.npcs.filter((n: any) => n.id !== CUT_NPC_ID);
     mapEd.npcs.push(testNpc);
     await redis.set(MAPS_KEY, JSON.stringify(payload));
@@ -147,18 +154,23 @@ async function main() {
     const session = await waitFor("register session", () => (lastSession?.authenticated && lastSession?.user?.id ? lastSession : null));
     testUserId = Number(session.user.id);
     const userKey = `auth:user:${testUserId}`;
-    log(`registered #${testUserId}`);
+    // Account/character split: gameplay fields live on the character hash.
+    testCharacterId = Number(session.user.characterId ?? testUserId);
+    const charKey = `auth:character:${testCharacterId}`;
+    log(`registered #${testUserId} (character #${testCharacterId})`);
 
     // Party WITHOUT Corte for the first Cut test.
+    await redis.hSet(charKey, {
+      last_map_id: CUT_MAP, last_x: String(CUT_STAND.x * 32), last_y: String(CUT_STAND.y * 32),
+      pokemon_party: JSON.stringify([surfMon("m1", ["Salpicadura"])])
+    });
     await redis.hSet(userKey, {
-      last_map_id: CUT_MAP, last_x: "50", last_y: "41",
-      pokemon_party: JSON.stringify([surfMon("m1", ["Salpicadura"])]),
       pokemon_box: JSON.stringify({ boxes: [] })
     });
     socket.emit("addPlayer", { token: session.token });
     await new Promise((r) => setTimeout(r, 1200));
 
-    const readSelfSwitches = async () => (await redis!.hGet(userKey, "event_self_switches")) || "";
+    const readSelfSwitches = async () => (await redis!.hGet(charKey, "event_self_switches")) || "";
 
     // ── CUT A: no Corte → hint, not erased ──
     log("── CUT A: no Corte ──");
@@ -172,17 +184,33 @@ async function main() {
 
     // ── CUT B: with Corte → erased ──
     log("── CUT B: with Corte ──");
-    await redis.hSet(userKey, { pokemon_party: JSON.stringify([surfMon("m1", ["Corte"])]) });
+    await redis.hSet(charKey, { pokemon_party: JSON.stringify([surfMon("m1", ["Corte"])]) });
     steps.length = 0;
     socket.emit("event:interact", { npcPlacementId: CUT_NPC_ID });
     await waitFor("erased self-switch", async () => (await readSelfSwitches()).includes(ERASED_KEY));
     log("  ✓ tree erased (ERASED self-switch set)");
 
-    // ── SURF: teleport to the ocean route, face water ──
+    // ── SURF: relocate to the ocean route, face water ──
+    // player:teleport now only honors legitimate shapes (edge crossings,
+    // portals) for non-admins, so an arbitrary jump is rejected. Reseed the
+    // saved location on the character hash and rejoin instead.
     log("── SURF ──");
-    await redis.hSet(userKey, { pokemon_party: JSON.stringify([surfMon("m1", ["Salpicadura"])]) });
-    socket.emit("player:teleport", { mapId: SURF_MAP, x: SURF_LAND.x * 32, y: SURF_LAND.y * 32 });
-    await new Promise((r) => setTimeout(r, 1000));
+    socket.disconnect();
+    await new Promise((r) => setTimeout(r, 1200)); // let the disconnect handler persist
+    await redis.hSet(charKey, {
+      pokemon_party: JSON.stringify([surfMon("m1", ["Salpicadura"])]),
+      last_map_id: SURF_MAP,
+      last_x: String(SURF_LAND.x * 32),
+      last_y: String(SURF_LAND.y * 32),
+      last_surfing: "0"
+    });
+    socket = io(`http://localhost:${PORT}`, { transports: ["websocket"], forceNew: true });
+    socket.on("event:step", (s: any) => steps.push(s));
+    socket.on("player:field-skill-error", (e: any) => { fieldError = e; log("  field-skill-error →", JSON.stringify(e)); });
+    socket.on("player:surf-state", (s: any) => { surfState = s; log("  surf-state →", JSON.stringify(s)); });
+    await waitFor("reconnect", () => socket!.connected);
+    socket.emit("addPlayer", { token: session.token });
+    await new Promise((r) => setTimeout(r, 1200));
     // Face the water (bump-left sets the facing without moving onto water).
     socket.emit("move", { x: 0, y: SURF_LAND.y * 32 });
     await new Promise((r) => setTimeout(r, 500));
@@ -197,7 +225,7 @@ async function main() {
     log("  ✓ surf refused without a Surf Venomon");
 
     // Teach a Surf move → surf succeeds.
-    await redis.hSet(userKey, { pokemon_party: JSON.stringify([surfMon("m1", ["Surf"])]) });
+    await redis.hSet(charKey, { pokemon_party: JSON.stringify([surfMon("m1", ["Surf"])]) });
     surfState = null; fieldError = null;
     socket.emit("player:surf");
     const surfed = await waitFor("surf-state on", () => (surfState && surfState.surfing ? surfState : (fieldError ? { err: fieldError } : null)));
@@ -206,7 +234,7 @@ async function main() {
 
     // ── DIVE gate: surfing over non-deep water needs deep water ──
     log("── DIVE gate ──");
-    await redis.hSet(userKey, { pokemon_party: JSON.stringify([surfMon("m1", ["Surf", "Buceo"])]) });
+    await redis.hSet(charKey, { pokemon_party: JSON.stringify([surfMon("m1", ["Surf", "Buceo"])]) });
     fieldError = null;
     socket.emit("player:dive");
     await waitFor("dive gate error", () => (fieldError && fieldError.skill === "dive" ? fieldError : null));

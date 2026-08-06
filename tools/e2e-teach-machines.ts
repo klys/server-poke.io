@@ -74,6 +74,7 @@ async function main() {
   let redis: RedisClientType | null = null;
   let socket: Socket | null = null;
   let testUserId: number | null = null;
+  let testCharacterId: number | null = null;
 
   const cleanup = async () => {
     log("── cleanup ──");
@@ -85,6 +86,7 @@ async function main() {
     }
     if (redis?.isOpen) {
       if (testUserId !== null) { try { await redis.del(`auth:user:${testUserId}`); } catch {} }
+      if (testCharacterId !== null) { try { await redis.del(`auth:character:${testCharacterId}`); } catch {} }
       await redis.quit();
     }
   };
@@ -123,9 +125,12 @@ async function main() {
     socket.emit("auth:register", { name: "Tester", username: uname, email: `${uname}@example.com`, password: "Aa1!aaaa" });
     const session = await waitFor("auth:session after register", () => (lastSession?.authenticated && lastSession?.user?.id ? lastSession : null));
     testUserId = Number(session.user.id);
-    log(`registered user #${testUserId}`);
+    // Account/character split: gameplay fields live on the character hash.
+    testCharacterId = Number(session.user.characterId ?? testUserId);
+    log(`registered user #${testUserId} (character #${testCharacterId})`);
 
     const userKey = `auth:user:${testUserId}`;
+    const charKey = `auth:character:${testCharacterId}`;
     const party = [
       mon("p_cut", "pokemon-BULBASAUR", ["Placaje", "Gruñido"]),
       mon("p_cut2", "pokemon-BULBASAUR", ["Placaje"]),
@@ -137,16 +142,18 @@ async function main() {
       { id: "item-hm01", name: "MO01", category: "moves", quantity: 1, description: "MO Corte" },
       { id: "item-tm01", name: "MT01", category: "moves", quantity: 1, description: "MT HoneClaws" }
     ];
-    await redis.hSet(userKey, {
+    await redis.hSet(charKey, {
       last_map_id: TEST_MAP, last_x: "50", last_y: "41",
       pokemon_party: JSON.stringify(party),
-      inventory: JSON.stringify(inventory),
+      inventory: JSON.stringify(inventory)
+    });
+    await redis.hSet(userKey, {
       pokemon_box: JSON.stringify({ boxes: [] })
     });
     log("seeded party + inventory");
 
-    const readParty = async () => JSON.parse((await redis!.hGet(userKey, "pokemon_party")) || "[]");
-    const readInv = async () => JSON.parse((await redis!.hGet(userKey, "inventory")) || "[]");
+    const readParty = async () => JSON.parse((await redis!.hGet(charKey, "pokemon_party")) || "[]");
+    const readInv = async () => JSON.parse((await redis!.hGet(charKey, "inventory")) || "[]");
     const qtyOf = (inv: any[], id: string) => inv.find((i) => i.id === id)?.quantity ?? 0;
     const movesOf = (pty: any[], id: string) => (pty.find((p) => p.id === id)?.moves ?? []) as string[];
     const ci = (arr: string[], sub: string) => arr.some((m) => m.toLowerCase() === sub.toLowerCase());

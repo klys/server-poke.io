@@ -416,6 +416,21 @@ export default interface ClientToServerEvents {
   "admin:roles:list": () => void;
   "admin:maintenance:list": () => void;
   "admin:maintenance:run": (data: { id: string; dryRun?: boolean }) => void;
+
+  /** Requests the operator-tunable global game settings (admin.access). */
+  "admin:settings:get": () => void;
+  /**
+   * Updates one or more global game settings (admin.access). Values are
+   * sanitized/clamped server-side; the full effective set is echoed back via
+   * `admin:settings-data`.
+   */
+  "admin:settings:update": (data: {
+    maxCharactersPerAccount?: number;
+    crossCharacterStorageMinMedals?: number;
+    characterRecoveryDays?: number;
+    skinChangePrice?: number;
+    startingMoney?: number;
+  }) => void;
   "admin:role:update": (data: {
     roleKey: UserRoleKey;
     description?: string;

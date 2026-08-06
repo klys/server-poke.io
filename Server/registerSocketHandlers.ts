@@ -1,7 +1,7 @@
 import type { RedisClientType } from "redis";
 import { type Server, type Socket } from "socket.io";
 import Auth, {
-  MAX_CHARACTERS_PER_ACCOUNT,
+  DEFAULT_GLOBAL_SETTINGS,
   type AuthenticatedUser,
   type RolePermission,
   type UserRoleKey
@@ -2090,6 +2090,41 @@ function createConnectionHandler(
       }
     });
 
+    socket.on("admin:settings:get", async () => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+        socket.emit("admin:settings-data", {
+          settings: await auth.getGlobalSettings(),
+          defaults: DEFAULT_GLOBAL_SETTINGS
+        });
+      } catch (error) {
+        console.error("Unable to load global settings:", error);
+        socket.emit("admin:error", { message: "Unable to load global settings right now." });
+      }
+    });
+
+    socket.on("admin:settings:update", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+        const settings = await auth.updateGlobalSettings(data ?? {});
+        socket.emit("admin:settings-data", { settings, defaults: DEFAULT_GLOBAL_SETTINGS });
+        socket.emit("auth:info", { message: "Global settings updated." });
+      } catch (error) {
+        console.error("Unable to update global settings:", error);
+        socket.emit("admin:error", { message: "Unable to update global settings right now." });
+      }
+    });
+
     socket.on("admin:apikeys:list", async () => {
       try {
         if (!socket.data.authenticated && readSocketToken(socket)) {
@@ -2688,7 +2723,7 @@ function createConnectionHandler(
     // skin on the very first (onboarding) pick; every later change is bought
     // here so the money is actually deducted and validated server-side.
     socket.on("player:set-skin", async (data) => {
-      const SKIN_PRICE = 300;
+      const SKIN_PRICE = (await auth.getGlobalSettings()).skinChangePrice;
       try {
         if (typeof socket.data.userId !== "number") {
           socket.emit("auth:error", { message: "Log in to change your skin." });
@@ -3456,14 +3491,19 @@ function createConnectionHandler(
     };
 
     const refreshCharacterSession = async () => {
+      // Sockets authenticated through the handshake may never have
+      // socket.data.token set — readSocketToken covers both sources. An
+      // unauthenticated refresh here would bounce the client to the login
+      // screen, so bail out instead of emitting a logged-out session.
       const session = await sanitizeAuthSessionInventory(
-        await auth.resolveSession(socket.data.token),
+        await auth.resolveSession(readSocketToken(socket)),
         auth,
         designerSectionStore
       );
-      if (session.authenticated && session.user) {
-        applySocketAuth(socket.data, session.user);
+      if (!session.authenticated || !session.user) {
+        return;
       }
+      applySocketAuth(socket.data, session.user);
       socket.emit("auth:session", session);
     };
 
@@ -3473,7 +3513,7 @@ function createConnectionHandler(
       socket.emit("character:list-data", {
         characters: await auth.listCharacters(userId),
         activeCharacterId: await auth.getActiveCharacterId(userId),
-        maxCharacters: MAX_CHARACTERS_PER_ACCOUNT
+        maxCharacters: (await auth.getGlobalSettings()).maxCharactersPerAccount
       });
     });
 

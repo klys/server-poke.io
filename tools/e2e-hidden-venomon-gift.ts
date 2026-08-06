@@ -42,6 +42,11 @@ const PROBE_KEY = `${MAPS_KEY}:probe`;
 const TEST_MAP = "map-essentials-043";
 const TEST_NPC_ID = "npc-e2e-gift-test";
 const TEST_EVENT_ID = 9099; // unique so its self-switch prefix can't clash
+// EventRuntime.startEvent silently drops interacts from more than ~3 tiles
+// away (anti-forge reach gate), so the injected NPC is pinned right next to
+// the seeded spawn cell. Both cells are open on map 043's collision grid.
+const STAND_CELL = { x: 1, y: 1 };
+const NPC_CELL = { x: 2, y: 1 };
 const GIFT_SPECIES = "BULBASAUR"; // a starter — guaranteed to resolve in redis
 const GIFT_LEVEL = 7;
 
@@ -133,6 +138,7 @@ async function main() {
   let mapsBackup: string | null = null;
   let probeBackup: string | null = null;
   let testUserId: number | null = null;
+  let testCharacterId: number | null = null;
 
   const cleanup = async () => {
     log("── cleanup ──");
@@ -153,6 +159,10 @@ async function main() {
         if (testUserId !== null) {
           await redis.del(`auth:user:${testUserId}`);
           log(`deleted test user auth:user:${testUserId}`);
+        }
+        if (testCharacterId !== null) {
+          await redis.del(`auth:character:${testCharacterId}`);
+          log(`deleted test character auth:character:${testCharacterId}`);
         }
       } catch (e) {
         console.error("cleanup redis error:", e);
@@ -206,6 +216,8 @@ async function main() {
     testNpc.eventId = TEST_EVENT_ID;
     testNpc.eventPageIndex = 0;
     testNpc.interactable = true;
+    testNpc.x = NPC_CELL.x;
+    testNpc.y = NPC_CELL.y;
     testNpc.essentialsEvent = giftEvent();
     // Drop any prior copy from an interrupted run, then add ours.
     mapEd.npcs = mapEd.npcs.filter((n: any) => n.id !== TEST_NPC_ID);
@@ -251,16 +263,21 @@ async function main() {
       lastSession?.authenticated && lastSession?.user?.id ? lastSession : null
     );
     testUserId = Number(session.user.id);
-    log(`registered user #${testUserId} (${uname})`);
+    // Account/character split: gameplay fields live on the character hash.
+    testCharacterId = Number(session.user.characterId ?? testUserId);
+    log(`registered user #${testUserId} (${uname}, character #${testCharacterId})`);
 
     // --- 5. seed FULL party + location ------------------------------------
     const userKey = `auth:user:${testUserId}`;
+    const charKey = `auth:character:${testCharacterId}`;
     const fullParty = Array.from({ length: 6 }, (_, i) => filler(i));
-    await redis.hSet(userKey, {
+    await redis.hSet(charKey, {
       last_map_id: TEST_MAP,
-      last_x: "50",
-      last_y: "41",
-      pokemon_party: JSON.stringify(fullParty),
+      last_x: String(STAND_CELL.x * 32),
+      last_y: String(STAND_CELL.y * 32),
+      pokemon_party: JSON.stringify(fullParty)
+    });
+    await redis.hSet(userKey, {
       pokemon_box: JSON.stringify({ boxes: [] })
     });
     log("seeded full 6-slot party + location on", TEST_MAP);
@@ -273,8 +290,8 @@ async function main() {
     await new Promise((r) => setTimeout(r, 1500));
 
     const selfSwitchKey = `${TEST_EVENT_ID}`; // just for logging clarity
-    const readParty = async () => JSON.parse((await redis!.hGet(userKey, "pokemon_party")) || "[]");
-    const readEventState = async () => (await redis!.hGet(userKey, "event_self_switches")) || "(none)";
+    const readParty = async () => JSON.parse((await redis!.hGet(charKey, "pokemon_party")) || "[]");
+    const readEventState = async () => (await redis!.hGet(charKey, "event_self_switches")) || "(none)";
 
     // ===================================================================
     // TEST A — party full → refuse + "come back later", nothing granted
@@ -300,7 +317,7 @@ async function main() {
     // ===================================================================
     log("── TEST B: one empty slot ──");
     const fiveParty = fullParty.slice(0, 5);
-    await redis.hSet(userKey, { pokemon_party: JSON.stringify(fiveParty) });
+    await redis.hSet(charKey, { pokemon_party: JSON.stringify(fiveParty) });
     log("  freed a slot (party now 5)");
 
     steps.length = 0;

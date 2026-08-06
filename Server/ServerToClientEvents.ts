@@ -516,6 +516,23 @@ export default interface ServerToClientEvents {
   "admin:maintenance:list": (data: { actions: MaintenanceActionStatus[]; running: string | null }) => void;
   "admin:maintenance:log": (data: { id: string; line: string }) => void;
   "admin:maintenance:done": (data: { id: string; ok: boolean; exitCode: number | null }) => void;
+  /** Effective global game settings + the env-derived defaults, admin-only. */
+  "admin:settings-data": (data: {
+    settings: {
+      maxCharactersPerAccount: number;
+      crossCharacterStorageMinMedals: number;
+      characterRecoveryDays: number;
+      skinChangePrice: number;
+      startingMoney: number;
+    };
+    defaults: {
+      maxCharactersPerAccount: number;
+      crossCharacterStorageMinMedals: number;
+      characterRecoveryDays: number;
+      skinChangePrice: number;
+      startingMoney: number;
+    };
+  }) => void;
   "admin:apikeys:list": (data: { keys: ApiKeySummary[] }) => void;
   /** One-time reveal of a freshly minted key's plaintext secret. */
   "admin:apikeys:created": (data: { key: string; meta: ApiKeySummary }) => void;

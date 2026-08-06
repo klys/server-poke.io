@@ -136,6 +136,7 @@ const charKeyOf = (characterId: number) => `auth:character:${characterId}`;
 async function main() {
   let server: ChildProcess | null = null;
   let redis: RedisClientType | null = null;
+  let restorePinnedSettings: (() => Promise<void>) | null = null;
   const clients: Client[] = [];
   const keysToClean = new Set<string>();
 
@@ -154,6 +155,11 @@ async function main() {
       if (!server.killed) server.kill("SIGKILL");
     }
     if (redis?.isOpen) {
+      try {
+        await restorePinnedSettings?.();
+      } catch {
+        /* best effort */
+      }
       for (const key of keysToClean) {
         try {
           await redis.del(key);
@@ -289,6 +295,20 @@ async function main() {
       return (await redis!.ping()) === "PONG";
     });
     log("redis reachable");
+
+    // The medal gate is admin-tunable (settings:global) — pin it to 1 for
+    // this run and restore whatever the operator had configured afterwards.
+    const previousGlobalSettings = await redis.get("settings:global");
+    const pinnedSettings = { ...(previousGlobalSettings ? JSON.parse(previousGlobalSettings) : {}) };
+    pinnedSettings.crossCharacterStorageMinMedals = 1;
+    await redis.set("settings:global", JSON.stringify(pinnedSettings));
+    restorePinnedSettings = async () => {
+      if (previousGlobalSettings === null) {
+        await redis!.del("settings:global");
+      } else {
+        await redis!.set("settings:global", previousGlobalSettings);
+      }
+    };
 
     log(`starting server on :${PORT} …`);
     server = spawn(`${SERVER_DIR}/node_modules/.bin/ts-node`, ["index.ts"], {
