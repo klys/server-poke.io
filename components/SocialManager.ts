@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import type { Server } from "socket.io";
 import type Auth from "./Auth";
-import type { SocialPrefs, SocialUserSummary } from "./Auth";
+import type { BlockedAccountEntry, SocialPrefs, SocialUserSummary } from "./Auth";
 import type BattleManager from "./BattleManager";
 import type EventRuntime from "./EventRuntime";
 import { resolveInitialSpawnFromPlayableMapsState } from "./PlayableMapsState";
@@ -23,6 +23,11 @@ export interface FriendEntry extends SocialUserSummary {
   online: boolean;
   mapId?: string;
   playerId?: string;
+  /** Active character shown to friends (null when hidden by privacy prefs). */
+  activeCharacterId: number | null;
+  activeCharacterName: string | null;
+  /** Last-seen timestamp shown while offline (null when hidden by prefs). */
+  lastSeenAt: string | null;
 }
 
 export interface FriendsStatePayload {
@@ -30,6 +35,8 @@ export interface FriendsStatePayload {
   incoming: Array<SocialUserSummary & { createdAt: string }>;
   outgoing: Array<SocialUserSummary & { createdAt: string }>;
   prefs: SocialPrefs;
+  /** Account-level block list: every character of these accounts is blocked. */
+  blocked: BlockedAccountEntry[];
 }
 
 export interface ChatMessagePayload {
@@ -39,6 +46,11 @@ export interface ChatMessagePayload {
   fromUserId?: number;
   fromUsername?: string;
   fromName?: string;
+  /** Account/character identity of the sender, stated explicitly. */
+  fromAccountId?: number;
+  fromAccountName?: string;
+  fromCharacterId?: number;
+  fromCharacterName?: string;
   toUsername?: string;
   text: string;
   at: string;
@@ -121,6 +133,7 @@ export default class SocialManager {
     try {
       this.cancelPendingForUser(userId);
       this.leaveAllChats(userId);
+      await this.auth.touchLastSeen(userId);
       await this.notifyFriendsPresence(userId);
     } catch (error) {
       console.error("social: unable to run leave hooks:", error);
@@ -143,9 +156,18 @@ export default class SocialManager {
     await this.pushFriendsState(userId);
   }
 
-  public async requestFriend(userId: number, rawUsername: string) {
+  /**
+   * Sends a friend request. The target may be named by account name or, when
+   * initiated through a visible character (trainer card), by account id — a
+   * character always resolves to its owning account, so the request and the
+   * eventual friendship are account-to-account.
+   */
+  public async requestFriend(userId: number, rawUsername: string, targetAccountId?: number) {
     const me = await this.auth.getSocialUserSummary(userId);
-    const target = await this.auth.findSocialUserByUsername(rawUsername);
+    const target =
+      Number.isInteger(targetAccountId) && (targetAccountId as number) > 0
+        ? await this.auth.getSocialUserSummary(targetAccountId as number)
+        : await this.auth.findSocialUserByUsername(rawUsername);
     if (!me) {
       return;
     }
@@ -154,7 +176,14 @@ export default class SocialManager {
       return;
     }
     if (target.userId === userId) {
+      // Also covers "another character owned by the same account": characters
+      // resolve to their account before this comparison.
       this.emitToUser(userId, "friends:error", { message: "You cannot befriend yourself." });
+      return;
+    }
+    if (await this.auth.isBlockedEitherWay(userId, target.userId)) {
+      // Same message as an unknown name: a block must not be discoverable.
+      this.emitToUser(userId, "friends:error", { message: "No trainer goes by that name." });
       return;
     }
     if (await this.auth.areFriends(userId, target.userId)) {
@@ -199,6 +228,11 @@ export default class SocialManager {
 
     await this.auth.removeFriendRequest(fromUserId, userId);
     if (accepted) {
+      if (await this.auth.isBlockedEitherWay(userId, fromUserId)) {
+        this.emitToUser(userId, "friends:error", { message: "That friend request is no longer pending." });
+        await this.pushFriendsState(userId);
+        return;
+      }
       await this.auth.addFriendPair(userId, fromUserId);
       const me = await this.auth.getSocialUserSummary(userId);
       if (me) {
@@ -206,6 +240,31 @@ export default class SocialManager {
       }
     }
     await Promise.all([this.pushFriendsState(userId), this.pushFriendsState(fromUserId)]);
+  }
+
+  // ---- account-level blocking ----
+
+  public async blockAccount(userId: number, targetAccountId: number) {
+    const result = await this.auth.blockAccount(userId, Number(targetAccountId));
+    if (!result.ok) {
+      this.emitToUser(userId, "friends:error", { message: result.message });
+      return;
+    }
+    // The other side's friends list loses this account; both sides refresh.
+    this.emitToUser(Number(targetAccountId), "friends:removed", { userId });
+    await Promise.all([
+      this.pushFriendsState(userId),
+      this.pushFriendsState(Number(targetAccountId))
+    ]);
+  }
+
+  public async unblockAccount(userId: number, targetAccountId: number) {
+    const changed = await this.auth.unblockAccount(userId, Number(targetAccountId));
+    if (!changed) {
+      this.emitToUser(userId, "friends:error", { message: "That account is not blocked." });
+      return;
+    }
+    await this.pushFriendsState(userId);
   }
 
   /** Cancels a friend request the user sent earlier. */
@@ -364,10 +423,41 @@ export default class SocialManager {
       fromUserId: userId,
       fromUsername: player.username || "",
       fromName: player.name || player.username || "Trainer",
+      fromAccountId: userId,
+      fromAccountName: player.username || "",
+      fromCharacterId: player.characterId ?? undefined,
+      fromCharacterName: player.name || player.username || "Trainer",
       text,
       at: new Date().toISOString()
     };
-    this.world.emitToMap(player.currentMapId, "chat:message", payload);
+    await this.emitToMapRespectingBlocks(player.currentMapId, userId, payload);
+  }
+
+  /**
+   * Map-chat delivery that honors account blocks in both directions: a
+   * blocked account's characters neither reach nor hear the blocker.
+   */
+  private async emitToMapRespectingBlocks(
+    mapId: string,
+    senderUserId: number,
+    payload: ChatMessagePayload
+  ) {
+    const recipients: Player[] = [];
+    for (const candidate of this.world.players.values()) {
+      if (candidate.currentMapId === mapId) {
+        recipients.push(candidate);
+      }
+    }
+    await Promise.all(
+      recipients.map(async (recipient) => {
+        if (typeof recipient.userId === "number" && recipient.userId !== senderUserId) {
+          if (await this.auth.isBlockedEitherWay(senderUserId, recipient.userId)) {
+            return;
+          }
+        }
+        this.emitToSocket(recipient.socketId, "chat:message", payload);
+      })
+    );
   }
 
   private async handleChatCommand(
@@ -447,12 +537,21 @@ export default class SocialManager {
       this.emitToUser(fromUserId, "chat:error", { message: "You cannot whisper to yourself." });
       return;
     }
+    if (await this.auth.isBlockedEitherWay(fromUserId, target.userId)) {
+      // Indistinguishable from the target being offline.
+      this.emitToUser(fromUserId, "chat:error", { message: `${targetName} is not online.` });
+      return;
+    }
     const payload: ChatMessagePayload = {
       id: crypto.randomUUID(),
       channel: "whisper",
       fromUserId,
       fromUsername: fromPlayer.username || "",
       fromName: fromPlayer.name || fromPlayer.username || "Trainer",
+      fromAccountId: fromUserId,
+      fromAccountName: fromPlayer.username || "",
+      fromCharacterId: fromPlayer.characterId ?? undefined,
+      fromCharacterName: fromPlayer.name || fromPlayer.username || "Trainer",
       toUsername: target.username || target.name || "",
       text: message,
       at: new Date().toISOString()
@@ -542,6 +641,10 @@ export default class SocialManager {
     );
     if (alreadyInvited) {
       this.emitToUser(userId, "chat:error", { message: "That trainer was already invited." });
+      return;
+    }
+    if (await this.auth.isBlockedEitherWay(userId, targetUserId)) {
+      this.emitToUser(userId, "chat:error", { message: "That trainer is not online right now." });
       return;
     }
     const targetPrefs = await this.auth.getSocialPrefs(targetUserId);
@@ -635,10 +738,18 @@ export default class SocialManager {
       fromUserId: userId,
       fromUsername: from.username,
       fromName: from.name,
+      fromAccountId: from.accountId,
+      fromAccountName: from.accountName,
+      fromCharacterId: from.characterId,
+      fromCharacterName: from.characterName,
       text,
       at: new Date().toISOString()
     };
     for (const memberUserId of chat.memberUserIds) {
+      // Blocks that happened after the chat formed still silence both ways.
+      if (memberUserId !== userId && (await this.auth.isBlockedEitherWay(userId, memberUserId))) {
+        continue;
+      }
       this.emitToUser(memberUserId, "chat:private-message", payload);
     }
   }
@@ -660,27 +771,49 @@ export default class SocialManager {
   // ---- internals ----
 
   private async pushFriendsState(userId: number) {
-    const [friendIds, incoming, outgoing, prefs] = await Promise.all([
+    const [friendIds, incoming, outgoing, prefs, blocked] = await Promise.all([
       this.auth.getFriendIds(userId),
       this.auth.getIncomingFriendRequests(userId),
       this.auth.getOutgoingFriendRequests(userId),
-      this.auth.getSocialPrefs(userId)
+      this.auth.getSocialPrefs(userId),
+      this.auth.getBlockedAccountEntries(userId)
     ]);
     const friends: FriendEntry[] = [];
     for (const friendId of friendIds) {
-      const summary = await this.auth.getSocialUserSummary(friendId);
-      if (!summary) {
-        continue;
+      const entry = await this.buildFriendEntry(friendId);
+      if (entry) {
+        friends.push(entry);
       }
-      const online = this.world.getPlayerByUserId(friendId);
-      friends.push({
-        ...summary,
-        online: Boolean(online),
-        mapId: online?.currentMapId,
-        playerId: online?.socketId
-      });
     }
-    this.emitToUser(userId, "friends:state", { friends, incoming, outgoing, prefs });
+    this.emitToUser(userId, "friends:state", { friends, incoming, outgoing, prefs, blocked });
+  }
+
+  /**
+   * One friend row, filtered through THAT friend's privacy prefs: online
+   * status, active character, current map, and last-seen are each shown only
+   * when the friend allows it.
+   */
+  private async buildFriendEntry(friendId: number): Promise<FriendEntry | null> {
+    const summary = await this.auth.getSocialUserSummary(friendId);
+    if (!summary) {
+      return null;
+    }
+    const prefs = await this.auth.getSocialPrefs(friendId);
+    const online = prefs.showOnlineStatus ? this.world.getPlayerByUserId(friendId) : undefined;
+    const showCharacter = prefs.showActiveCharacter;
+    return {
+      ...summary,
+      // The character-facing display fields obey the same privacy switch.
+      name: showCharacter ? summary.name : summary.username,
+      characterName: showCharacter ? summary.characterName : "",
+      characterSkinId: showCharacter ? summary.characterSkinId : "",
+      online: Boolean(online),
+      mapId: prefs.showCurrentMap ? online?.currentMapId : undefined,
+      playerId: online?.socketId,
+      activeCharacterId: online && showCharacter ? summary.characterId : null,
+      activeCharacterName: showCharacter ? summary.characterName : null,
+      lastSeenAt: !online && prefs.showLastSeen ? await this.auth.getLastSeenAt(friendId) : null
+    };
   }
 
   /** Sends a light presence update about `userId` to their online friends. */
@@ -689,12 +822,22 @@ export default class SocialManager {
     if (friendIds.length === 0) {
       return;
     }
-    const player = this.world.getPlayerByUserId(userId);
+    const [summary, prefs] = await Promise.all([
+      this.auth.getSocialUserSummary(userId),
+      this.auth.getSocialPrefs(userId)
+    ]);
+    const player = prefs.showOnlineStatus ? this.world.getPlayerByUserId(userId) : undefined;
+    const showCharacter = prefs.showActiveCharacter;
     const payload = {
       userId,
+      accountId: userId,
+      accountName: summary?.accountName ?? "",
       online: Boolean(player),
-      mapId: player?.currentMapId,
-      playerId: player?.socketId
+      mapId: prefs.showCurrentMap ? player?.currentMapId : undefined,
+      playerId: player?.socketId,
+      activeCharacterId: player && showCharacter ? summary?.characterId ?? null : null,
+      activeCharacterName: showCharacter ? summary?.characterName ?? null : null,
+      lastSeenAt: !player && prefs.showLastSeen ? await this.auth.getLastSeenAt(userId) : null
     };
     for (const friendId of friendIds) {
       if (this.world.getPlayerByUserId(friendId)) {

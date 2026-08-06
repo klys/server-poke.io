@@ -27,6 +27,8 @@ export default class Player {
     userId:number | null;
     username:string;
     name:string;
+    /** Immutable id of the character this session is playing (null = guest). */
+    characterId:number | null;
     profileImage:string;
     description:string;
     characterSkinId:string;
@@ -87,6 +89,7 @@ export default class Player {
         trainerProfile?: {
             username?: string;
             name?: string;
+            characterId?: number;
             profileImage?: string;
             description?: string;
             characterSkinId?: string;
@@ -104,6 +107,7 @@ export default class Player {
         this.userId = userId;
         this.username = trainerProfile?.username ?? "";
         this.name = trainerProfile?.name ?? "";
+        this.characterId = trainerProfile?.characterId ?? null;
         this.profileImage = trainerProfile?.profileImage ?? "";
         this.description = trainerProfile?.description ?? "";
         this.characterSkinId = trainerProfile?.characterSkinId ?? "";
@@ -444,6 +448,13 @@ export default class Player {
             id:this.id,
             username:this.username,
             name:this.name,
+            // Public dual identity: the permanent account handle and the
+            // character being played. `username`/`name` above carry the same
+            // values for older consumers.
+            accountId:this.userId,
+            accountName:this.username,
+            characterId:this.characterId,
+            characterName:this.name,
             profileImage:this.profileImage,
             description:this.description,
             characterSkinId:this.characterSkinId,

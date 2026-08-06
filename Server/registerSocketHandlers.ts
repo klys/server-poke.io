@@ -1,6 +1,7 @@
 import type { RedisClientType } from "redis";
 import { type Server, type Socket } from "socket.io";
 import Auth, {
+  MAX_CHARACTERS_PER_ACCOUNT,
   type AuthenticatedUser,
   type RolePermission,
   type UserRoleKey
@@ -43,6 +44,8 @@ export interface SocketData {
   userId?: number;
   username?: string;
   email?: string;
+  /** Active character of this session (resolved at addPlayer / select). */
+  characterId?: number;
   role?: UserRoleKey;
   permissions?: RolePermission[];
   /** Client platform from the handshake: "android" | "ios" | "electron" | "web". */
@@ -81,6 +84,7 @@ function applySocketAuth(socketData:SocketData, user:AuthenticatedUser | null) {
     delete socketData.userId;
     delete socketData.username;
     delete socketData.email;
+    delete socketData.characterId;
     delete socketData.role;
     delete socketData.permissions;
     return;
@@ -89,6 +93,7 @@ function applySocketAuth(socketData:SocketData, user:AuthenticatedUser | null) {
   socketData.userId = user.id;
   socketData.username = user.username;
   socketData.email = user.email;
+  socketData.characterId = user.characterId;
   socketData.role = user.role;
   socketData.permissions = user.permissions;
 }
@@ -2283,12 +2288,16 @@ function createConnectionHandler(
           ? {
               username: session.user.username,
               name: session.user.name,
+              characterId: session.user.characterId,
               profileImage: session.user.profileImage,
               description: session.user.description,
               characterSkinId: session.user.characterSkinId
             }
           : undefined
       );
+      if (session.user) {
+        socket.data.characterId = session.user.characterId;
+      }
 
       if (playerRegistration.player) {
         socket.emit("myPlayer", { playerId: playerRegistration.player.socketId });
@@ -2635,7 +2644,23 @@ function createConnectionHandler(
       world.shotProjectil(data.mouse_x,data.mouse_y, socket.id);
     });
 
-    socket.on("battle:challenge-player", (data) => {
+    socket.on("battle:challenge-player", async (data) => {
+      // Account-level blocks: no character of a blocked account can be
+      // challenged, and selecting another character cannot bypass it.
+      const challenger = world.getPlayerBySocket(socket.id);
+      const targetPlayer = data?.targetPlayerId
+        ? world.players.get(String(data.targetPlayerId))
+        : undefined;
+      if (
+        challenger &&
+        targetPlayer &&
+        typeof challenger.userId === "number" &&
+        typeof targetPlayer.userId === "number" &&
+        (await auth.isBlockedEitherWay(challenger.userId, targetPlayer.userId))
+      ) {
+        socket.emit("battle:error", { message: "That trainer is not available." });
+        return;
+      }
       battleManager.requestChallenge(socket.id, data);
     });
 
@@ -2755,6 +2780,10 @@ function createConnectionHandler(
           userId: typeof player.userId === "number" ? player.userId : null,
           name: player.name,
           username: player.username,
+          accountId: typeof player.userId === "number" ? player.userId : null,
+          accountName: player.username,
+          characterId: player.characterId,
+          characterName: player.name,
           description: player.description,
           characterSkinId: player.characterSkinId,
           trainerCardColor,
@@ -3111,7 +3140,13 @@ function createConnectionHandler(
         socket.emit("auth:error", { message: "Log in to use the PC bank." });
         return;
       }
-      emitStorageResult(await auth.withdrawMoneyFromPc(socket.data.userId, Number(data?.amount) || 0));
+      const ownerCharacterId =
+        Number.isInteger(Number(data?.ownerCharacterId)) && Number(data?.ownerCharacterId) > 0
+          ? Number(data?.ownerCharacterId)
+          : undefined;
+      emitStorageResult(
+        await auth.withdrawMoneyFromPc(socket.data.userId, Number(data?.amount) || 0, ownerCharacterId)
+      );
     });
 
     socket.on("inventory:take-held-item", async (data) => {
@@ -3389,7 +3424,135 @@ function createConnectionHandler(
     socket.on("friends:request", async (data) => {
       const userId = requireSocialUserId("friends:error");
       if (userId === null) return;
-      await socialManager.requestFriend(userId, String(data?.username ?? ""));
+      const accountId =
+        Number.isInteger(Number(data?.accountId)) && Number(data?.accountId) > 0
+          ? Number(data?.accountId)
+          : undefined;
+      await socialManager.requestFriend(userId, String(data?.username ?? ""), accountId);
+    });
+
+    socket.on("friends:block", async (data) => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.blockAccount(userId, Number(data?.accountId));
+    });
+
+    socket.on("friends:unblock", async (data) => {
+      const userId = requireSocialUserId("friends:error");
+      if (userId === null) return;
+      await socialManager.unblockAccount(userId, Number(data?.accountId));
+    });
+
+    // ---- Account characters (character:*) ----
+    // Character ids are the only accepted keys; every successful mutation is
+    // followed by a fresh auth:session so the client state stays authoritative.
+
+    const requireCharacterUserId = () => {
+      if (typeof socket.data.userId === "number") {
+        return socket.data.userId;
+      }
+      socket.emit("character:error", { message: "Log in to manage characters." });
+      return null;
+    };
+
+    const refreshCharacterSession = async () => {
+      const session = await sanitizeAuthSessionInventory(
+        await auth.resolveSession(socket.data.token),
+        auth,
+        designerSectionStore
+      );
+      if (session.authenticated && session.user) {
+        applySocketAuth(socket.data, session.user);
+      }
+      socket.emit("auth:session", session);
+    };
+
+    socket.on("character:list", async () => {
+      const userId = requireCharacterUserId();
+      if (userId === null) return;
+      socket.emit("character:list-data", {
+        characters: await auth.listCharacters(userId),
+        activeCharacterId: await auth.getActiveCharacterId(userId),
+        maxCharacters: MAX_CHARACTERS_PER_ACCOUNT
+      });
+    });
+
+    socket.on("character:create", async (data) => {
+      const userId = requireCharacterUserId();
+      if (userId === null) return;
+      const result = await auth.createCharacter(userId, String(data?.name ?? ""));
+      if (!result.ok) {
+        socket.emit("character:error", { message: result.message });
+        return;
+      }
+      socket.emit("character:changed", {
+        action: "created",
+        characterId: result.character.characterId
+      });
+      await refreshCharacterSession();
+    });
+
+    socket.on("character:select", async (data) => {
+      const userId = requireCharacterUserId();
+      if (userId === null) return;
+      const characterId = Number(data?.characterId);
+      const player = world.getPlayerByUserId(userId);
+      if (player && (player.inBattle || battleManager.isPlayerBattling(player.socketId))) {
+        socket.emit("character:error", { message: "You cannot switch characters during a battle." });
+        return;
+      }
+      if (tradeManager.isTrading(userId)) {
+        socket.emit("character:error", { message: "You cannot switch characters during a trade." });
+        return;
+      }
+      // Persist the outgoing character's position before the active pointer
+      // moves (savePlayerLocation resolves the still-active character).
+      if (player) {
+        await auth.savePlayerLocation(userId, {
+          mapId: player.currentMapId,
+          x: player.x,
+          y: player.y,
+          surfing: player.isSurfing
+        });
+      }
+      const result = await auth.selectCharacter(userId, characterId);
+      if (!result.ok) {
+        socket.emit("character:error", { message: result.message });
+        return;
+      }
+      // Drop the world entity so the next addPlayer joins as the new
+      // character (position, name, skin) — the client re-joins after this.
+      world.removePlayerByUserId(userId);
+      socket.data.characterId = characterId;
+      void socialManager.handlePlayerLeft(userId);
+      socket.emit("character:changed", { action: "selected", characterId });
+      await refreshCharacterSession();
+    });
+
+    socket.on("character:delete", async (data) => {
+      const userId = requireCharacterUserId();
+      if (userId === null) return;
+      const characterId = Number(data?.characterId);
+      const result = await auth.softDeleteCharacter(userId, characterId);
+      if (!result.ok) {
+        socket.emit("character:error", { message: result.message });
+        return;
+      }
+      socket.emit("character:changed", { action: "deleted", characterId });
+      await refreshCharacterSession();
+    });
+
+    socket.on("character:restore", async (data) => {
+      const userId = requireCharacterUserId();
+      if (userId === null) return;
+      const characterId = Number(data?.characterId);
+      const result = await auth.restoreCharacter(userId, characterId);
+      if (!result.ok) {
+        socket.emit("character:error", { message: result.message });
+        return;
+      }
+      socket.emit("character:changed", { action: "restored", characterId });
+      await refreshCharacterSession();
     });
 
     socket.on("friends:respond", async (data) => {

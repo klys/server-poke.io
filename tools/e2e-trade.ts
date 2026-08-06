@@ -122,6 +122,9 @@ interface Client {
   userId: number;
   token: string;
   userKey: string;
+  /** Active character (account/character split): party/inventory/money live here. */
+  characterId: number;
+  charKey: string;
   myPlayerId: string | null;
   state: any | null;
   results: any[];
@@ -157,6 +160,13 @@ async function main() {
       for (const id of testUserIds) {
         try {
           await redis.del(`auth:user:${id}`);
+        } catch {
+          /* best effort */
+        }
+      }
+      for (const c of clients) {
+        try {
+          if (c.charKey) await redis.del(c.charKey);
         } catch {
           /* best effort */
         }
@@ -225,6 +235,8 @@ async function main() {
       userId: 0,
       token: "",
       userKey: "",
+      characterId: 0,
+      charKey: "",
       myPlayerId: null,
       state: null,
       results: [],
@@ -277,6 +289,8 @@ async function main() {
     c.userId = Number(session.user.id);
     c.token = session.token;
     c.userKey = `auth:user:${c.userId}`;
+    c.characterId = Number(session.user.characterId ?? c.userId);
+    c.charKey = `auth:character:${c.characterId}`;
     testUserIds.push(c.userId);
     clients.push(c);
     log(`  [${label}] registered #${c.userId}`);
@@ -287,14 +301,18 @@ async function main() {
     c: Client,
     opts: { party: unknown[]; boxes?: unknown[]; inventory: unknown[]; money: number }
   ) => {
-    await redis!.hSet(c.userKey, {
+    // Post account/character split: gameplay state sits on the character
+    // hash; the shared PC box stays on the account hash.
+    await redis!.hSet(c.charKey, {
       last_map_id: TEST_MAP,
       last_x: String(50 * 32),
       last_y: String(41 * 32),
       pokemon_party: JSON.stringify(opts.party),
-      pokemon_box: JSON.stringify({ boxes: opts.boxes ?? [] }),
       inventory: JSON.stringify(opts.inventory),
       money: String(opts.money)
+    });
+    await redis!.hSet(c.userKey, {
+      pokemon_box: JSON.stringify({ boxes: opts.boxes ?? [] })
     });
     c.socket.emit("addPlayer", { token: c.token });
     await waitFor(`${c.label} myPlayer`, () => c.myPlayerId);
@@ -357,12 +375,12 @@ async function main() {
 
   // --- helpers ------------------------------------------------------------
   const readAccount = async (c: Client) => {
-    const [inventory, party, box, money] = await redis!.hmGet(c.userKey, [
+    const [inventory, party, money] = await redis!.hmGet(c.charKey, [
       "inventory",
       "pokemon_party",
-      "pokemon_box",
       "money"
     ]);
+    const box = await redis!.hGet(c.userKey, "pokemon_box");
     return {
       inventory: JSON.parse(inventory || "[]") as Array<{ id: string; quantity: number }>,
       party: JSON.parse(party || "[]") as Array<{ id: string }>,

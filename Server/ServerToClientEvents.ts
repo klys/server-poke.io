@@ -103,6 +103,16 @@ interface PlayerData {
   id: number;
   username?: string;
   name?: string;
+  /**
+   * Public dual identity: the permanent account handle (`accountName`, same
+   * value as `username`) and the character being played (`characterName`,
+   * same value as `name`). Ids are immutable; names are display-only and must
+   * never be used as authorization keys.
+   */
+  accountId?: number | null;
+  accountName?: string;
+  characterId?: number | null;
+  characterName?: string;
   profileImage?: string;
   description?: string;
   characterSkinId?: string;
@@ -149,6 +159,39 @@ interface AuthUserData {
   emailVerified: boolean;
   profileImage: string;
   description: string;
+  /** Account identity: immutable id + permanent handle (= id/username). */
+  accountId: number;
+  accountName: string;
+  /** The currently selected character; gameplay fields below belong to it. */
+  characterId: number;
+  characterName: string;
+  /** Every character the account owns (including soft-deleted ones). */
+  characters: Array<{
+    characterId: number;
+    characterName: string;
+    characterSkinId: string;
+    trainerGender: string;
+    badges: number[];
+    money: number;
+    partyCount: number;
+    lastMapId: string | null;
+    createdAt: string;
+    lastPlayedAt: string;
+    deletedAt: string | null;
+  }>;
+  /**
+   * Account-box currency, one aggregate per owning character. `pcMoney`
+   * below is the ACTIVE character's own total (legacy alias).
+   */
+  sharedMoneyDeposits: Array<{
+    accountId: number;
+    ownerCharacterId: number;
+    ownerCharacterName: string;
+    amount: number;
+    depositedByCharacterId: number;
+    depositedAt: string;
+    updatedAt: string;
+  }>;
   trainerGender: string;
   characterSkinId: string;
   money: number;
@@ -228,6 +271,11 @@ interface TrainerCardData {
   userId: number | null;
   name: string;
   username: string;
+  /** Explicit dual identity (same values as userId/username/name). */
+  accountId: number | null;
+  accountName: string;
+  characterId: number | null;
+  characterName: string;
   description: string;
   characterSkinId: string;
   trainerCardColor: string;
@@ -362,6 +410,25 @@ export default interface ServerToClientEvents {
    */
   "auth:account-deleted": (data: { message: string }) => void;
 
+  // ---- Account characters (character:*) -----------------------------------
+  // An account owns up to MAX_CHARACTERS_PER_ACCOUNT characters; gameplay
+  // state (party, money, badges, progression) belongs to exactly one of them.
+  // Every mutation is followed by a fresh `auth:session` so the client's
+  // single source of truth stays authoritative.
+
+  /** The account's characters (also embedded in AuthUserData.characters). */
+  "character:list-data": (data: {
+    characters: AuthUserData["characters"];
+    activeCharacterId: number;
+    maxCharacters: number;
+  }) => void;
+  /** A character was created/selected/deleted/restored successfully. */
+  "character:changed": (data: {
+    action: "created" | "selected" | "deleted" | "restored";
+    characterId: number;
+  }) => void;
+  "character:error": (data: { message: string }) => void;
+
   /**
    * Full authoritative designer section snapshot loaded from Redis.
    * The same event is used for the initial hydration and for live rebroadcasts after edits.
@@ -472,15 +539,22 @@ export default interface ServerToClientEvents {
   }) => void;
   "moderation:error": (data: { message: string }) => void;
 
-  /** Full friends snapshot: list (with presence), pending requests, prefs. */
+  /** Full friends snapshot: list (with presence), pending requests, prefs,
+   * and the account-level block list. */
   "friends:state": (data: FriendsStatePayload) => void;
   "friends:error": (data: { message: string }) => void;
-  /** Presence tick about one friend (connect/disconnect/map change). */
+  /** Presence tick about one friend (connect/disconnect/map change/character
+   * switch). Character/map/last-seen fields honor the friend's privacy prefs. */
   "friends:presence": (data: {
     userId: number;
+    accountId: number;
+    accountName: string;
     online: boolean;
     mapId?: string;
     playerId?: string;
+    activeCharacterId: number | null;
+    activeCharacterName: string | null;
+    lastSeenAt: string | null;
   }) => void;
   /** Someone sent you a friend request — feeds the notification center. */
   "friends:request-received": (data: { from: SocialUserSummary }) => void;
@@ -523,6 +597,10 @@ export default interface ServerToClientEvents {
     fromUserId: number;
     fromUsername: string;
     fromName: string;
+    fromAccountId?: number;
+    fromAccountName?: string;
+    fromCharacterId?: number;
+    fromCharacterName?: string;
     text: string;
     at: string;
   }) => void;
@@ -544,6 +622,10 @@ export default interface ServerToClientEvents {
       displayName: string;
       characterSkinId: string;
       newAccount: boolean;
+      accountId: number;
+      accountName: string;
+      characterId: number;
+      characterName: string;
     };
     expiresAt: number;
   }) => void;

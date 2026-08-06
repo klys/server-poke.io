@@ -209,11 +209,17 @@ export default interface ClientToServerEvents {
     borderColor?: string;
   }) => void;
 
-  /** Deposits wallet money into the PC bank. */
+  /** Deposits wallet money into the account box (owned by the active character). */
   "pc:money-deposit": (data: { amount: number }) => void;
 
-  /** Withdraws money from the PC bank back into the wallet. */
-  "pc:money-withdraw": (data: { amount: number }) => void;
+  /**
+   * Withdraws money from the account box back into the wallet.
+   * `ownerCharacterId` picks whose deposit to draw from (defaults to the
+   * active character's own); a sibling character's deposit requires the
+   * cross-character gym-medal gate. Partial amounts are supported — only the
+   * withdrawn amount changes ownership.
+   */
+  "pc:money-withdraw": (data: { amount: number; ownerCharacterId?: number }) => void;
 
   /**
    * Registers a new player account and starts an authenticated socket session.
@@ -305,6 +311,22 @@ export default interface ClientToServerEvents {
    * - `nickname`: letters only, max 10, no spaces, no blocked insults
    */
   "auth:choose-starter": (data: AuthChooseStarterPayload) => void;
+
+  // ---- Account characters (character:*) -----------------------------------
+  // Character ids are immutable and are the only accepted keys; character
+  // names are display values. Every action answers with `character:changed`
+  // (or `character:error`) plus a refreshed `auth:session`.
+
+  /** Requests the character list (`character:list-data`). */
+  "character:list": () => void;
+  /** Creates a new character (letters-only name, 2-30 chars) and selects it. */
+  "character:create": (data: { name: string }) => void;
+  /** Switches the session to another (non-deleted) character the account owns. */
+  "character:select": (data: { characterId: number }) => void;
+  /** Soft-deletes a character (not the active one; recoverable for a while). */
+  "character:delete": (data: { characterId: number }) => void;
+  /** Restores a soft-deleted character within the recovery window. */
+  "character:restore": (data: { characterId: number }) => void;
 
   /**
    * Joins a collaborative designer section channel.
@@ -411,8 +433,12 @@ export default interface ClientToServerEvents {
   /** Requests a fresh friends:state snapshot (list + pending requests + prefs). */
   "friends:list": () => void;
 
-  /** Sends (or auto-accepts a mutual) friend request by exact username. */
-  "friends:request": (data: { username: string }) => void;
+  /**
+   * Sends (or auto-accepts a mutual) friend request. Target by exact account
+   * name OR by account id (e.g. from a trainer card — the visible character
+   * resolves to its owning account; the friendship is account-to-account).
+   */
+  "friends:request": (data: { username?: string; accountId?: number }) => void;
 
   /** Accepts/declines a pending incoming friend request from `userId`. */
   "friends:respond": (data: { userId: number; accepted: boolean }) => void;
@@ -422,6 +448,16 @@ export default interface ClientToServerEvents {
 
   /** Removes an existing friend (both directions). */
   "friends:remove": (data: { userId: number }) => void;
+
+  /**
+   * Blocks an entire account: every character it owns can no longer chat,
+   * whisper, friend-request, trade with, or challenge you (and vice versa).
+   * Any existing friendship and pending requests are severed.
+   */
+  "friends:block": (data: { accountId: number }) => void;
+
+  /** Removes an account from the block list. */
+  "friends:unblock": (data: { accountId: number }) => void;
 
   /** Updates the social config toggles shown in the Friends window. */
   "friends:set-prefs": (data: Partial<SocialPrefs>) => void;

@@ -28,7 +28,11 @@ export default class DBInit {
                 await this.redis.connect();
             }
 
-            await this.redis.set("auth:meta:schema-version", "3");
+            // v4: account/character split — gameplay fields live on
+            // auth:character:{id} hashes; legacy accounts migrate lazily on
+            // first read (Auth.migrateAccountHash) or in batch via
+            // tools/migrateAccountsToCharacters.ts.
+            await this.redis.set("auth:meta:schema-version", "4");
             await this.redis.setNX("auth:meta:initialized-at", new Date().toISOString());
             await this.redis.setNX("auth:user:id:sequence", "0");
 

@@ -10209,7 +10209,9 @@ export default class BattleManager {
       isAi: false,
       playerId: player.socketId,
       userId: user.id,
-      trainerName: user.username || user.name || "Trainer",
+      // Character name first: it's the in-world identity; the account handle
+      // is a fallback for accounts whose character has no name yet.
+      trainerName: user.name || user.username || "Trainer",
       money: user.money,
       inventory: user.inventory.map((item) => ({ ...item })),
       party,

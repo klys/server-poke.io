@@ -1,12 +1,15 @@
 /**
  * Atomic trade execution.
  *
- * This game keeps all mutable player state in a single Redis hash per account
- * (`auth:user:{id}`), so "one transaction" means: read both accounts, build
- * the complete post-trade state for both in memory, then commit all eight
- * fields through one Lua script. Redis runs a script atomically, so the commit
- * is all-or-nothing by construction — there is no window in which one player
- * has been debited and the other not yet credited.
+ * Mutable player state spans two Redis hashes per side since the account/
+ * character split: the ACTIVE character's hash (`auth:character:{id}`) holds
+ * `inventory`, `pokemon_party`, and `money`, while the account hash
+ * (`auth:user:{id}`) holds the shared `pokemon_box`. "One transaction" still
+ * means: read all four hashes, build the complete post-trade state for both
+ * sides in memory, then commit every field through one Lua script. Redis runs
+ * a script atomically, so the commit is all-or-nothing by construction —
+ * there is no window in which one player has been debited and the other not
+ * yet credited.
  *
  * Concurrency is handled with compare-and-swap rather than locks: the script
  * re-checks a fingerprint of every field it is about to overwrite against what
@@ -47,8 +50,11 @@ function sha1(value: string): string {
   return crypto.createHash("sha1").update(value).digest("hex");
 }
 
+// KEYS: 1 = character A, 2 = account A, 3 = character B, 4 = account B,
+// 5 = completion marker. Field 3 (pokemon_box) lives on the account hash;
+// the other three live on the character hash.
 const COMMIT_SCRIPT = `
-local marker = redis.call('GET', KEYS[3])
+local marker = redis.call('GET', KEYS[5])
 if marker then
   return cjson.encode({ status = 'ALREADY_COMPLETED', at = marker })
 end
@@ -56,7 +62,8 @@ end
 local fields = {'inventory', 'pokemon_party', 'pokemon_box', 'money'}
 
 for i = 1, 4 do
-  local current = redis.call('HGET', KEYS[1], fields[i])
+  local key = (i == 3) and KEYS[2] or KEYS[1]
+  local current = redis.call('HGET', key, fields[i])
   if current == false then current = '' end
   if redis.sha1hex(current) ~= ARGV[3 + i] then
     return cjson.encode({ status = 'CONFLICT', side = 'A', field = fields[i] })
@@ -64,7 +71,8 @@ for i = 1, 4 do
 end
 
 for i = 1, 4 do
-  local current = redis.call('HGET', KEYS[2], fields[i])
+  local key = (i == 3) and KEYS[4] or KEYS[3]
+  local current = redis.call('HGET', key, fields[i])
   if current == false then current = '' end
   if redis.sha1hex(current) ~= ARGV[7 + i] then
     return cjson.encode({ status = 'CONFLICT', side = 'B', field = fields[i] })
@@ -72,13 +80,15 @@ for i = 1, 4 do
 end
 
 for i = 1, 4 do
-  redis.call('HSET', KEYS[1], fields[i], ARGV[11 + i])
+  local key = (i == 3) and KEYS[2] or KEYS[1]
+  redis.call('HSET', key, fields[i], ARGV[11 + i])
 end
 for i = 1, 4 do
-  redis.call('HSET', KEYS[2], fields[i], ARGV[15 + i])
+  local key = (i == 3) and KEYS[4] or KEYS[3]
+  redis.call('HSET', key, fields[i], ARGV[15 + i])
 end
 
-redis.call('SET', KEYS[3], ARGV[2], 'EX', tonumber(ARGV[3]))
+redis.call('SET', KEYS[5], ARGV[2], 'EX', tonumber(ARGV[3]))
 return cjson.encode({ status = 'OK' })
 `;
 
@@ -107,14 +117,25 @@ export interface TradeExecutionResult {
   detail?: string;
 }
 
+/** Which character is trading for a side, and its shared-box access rights. */
+export interface TradeSideContext {
+  characterId: number;
+  /** Active character meets the cross-character storage medal requirement. */
+  canAccessOthersAssets: boolean;
+}
+
 export default class TradeExecutor {
   constructor(
     private readonly redis: RedisClientType,
     private readonly config: TradeConfig
   ) {}
 
-  private userKey(userId: number) {
+  private accountKey(userId: number) {
     return `auth:user:${userId}`;
+  }
+
+  private characterKey(characterId: number) {
+    return `auth:character:${characterId}`;
   }
 
   private completionKey(tradeId: string) {
@@ -122,18 +143,16 @@ export default class TradeExecutor {
   }
 
   /** Reads the four trade-relevant fields exactly as stored. */
-  private async readFields(userId: number): Promise<AccountFields> {
-    const values = await this.redis.hmGet(this.userKey(userId), [
-      "inventory",
-      "pokemon_party",
-      "pokemon_box",
-      "money"
+  private async readFields(userId: number, characterId: number): Promise<AccountFields> {
+    const [characterValues, boxValue] = await Promise.all([
+      this.redis.hmGet(this.characterKey(characterId), ["inventory", "pokemon_party", "money"]),
+      this.redis.hGet(this.accountKey(userId), "pokemon_box")
     ]);
     return {
-      inventory: values[0] ?? "",
-      pokemon_party: values[1] ?? "",
-      pokemon_box: values[2] ?? "",
-      money: values[3] ?? ""
+      inventory: characterValues[0] ?? "",
+      pokemon_party: characterValues[1] ?? "",
+      pokemon_box: boxValue ?? "",
+      money: characterValues[2] ?? ""
     };
   }
 
@@ -152,18 +171,19 @@ export default class TradeExecutor {
   public async execute(
     snapshot: TradeSnapshot,
     userIds: Record<TradeSideKey, number>,
-    offers: Record<TradeSideKey, TradeOffer>
+    offers: Record<TradeSideKey, TradeOffer>,
+    contexts: Record<TradeSideKey, TradeSideContext>
   ): Promise<TradeExecutionResult> {
     let raw: Record<TradeSideKey, AccountFields>;
     let after: Record<TradeSideKey, AccountFields>;
 
     try {
       const [rawA, rawB] = await Promise.all([
-        this.readFields(userIds.A),
-        this.readFields(userIds.B)
+        this.readFields(userIds.A, contexts.A.characterId),
+        this.readFields(userIds.B, contexts.B.characterId)
       ]);
       raw = { A: rawA, B: rawB };
-      after = this.plan(raw, offers);
+      after = this.plan(raw, offers, userIds, contexts);
     } catch (error) {
       if (error instanceof TradeError) {
         return { ok: false, reason: "VALIDATION", detail: error.code };
@@ -182,8 +202,10 @@ export default class TradeExecutor {
     try {
       const reply = await this.redis.eval(COMMIT_SCRIPT, {
         keys: [
-          this.userKey(userIds.A),
-          this.userKey(userIds.B),
+          this.characterKey(contexts.A.characterId),
+          this.accountKey(userIds.A),
+          this.characterKey(contexts.B.characterId),
+          this.accountKey(userIds.B),
           this.completionKey(snapshot.tradeId)
         ],
         arguments: [
@@ -335,9 +357,18 @@ export default class TradeExecutor {
    * validation passes (add-time, lock-time, here), and the only one that runs
    * against the exact bytes the commit will compare-and-swap against.
    */
+  /** Owner of a shared-box asset (legacy assets → default character = account id). */
+  private assetOwnerId(asset: { ownerCharacterId?: number }, accountId: number): number {
+    return Number.isInteger(asset.ownerCharacterId) && (asset.ownerCharacterId as number) > 0
+      ? (asset.ownerCharacterId as number)
+      : accountId;
+  }
+
   private plan(
     raw: Record<TradeSideKey, AccountFields>,
-    offers: Record<TradeSideKey, TradeOffer>
+    offers: Record<TradeSideKey, TradeOffer>,
+    userIds: Record<TradeSideKey, number>,
+    contexts: Record<TradeSideKey, TradeSideContext>
   ): Record<TradeSideKey, AccountFields> {
     const working: Record<TradeSideKey, AccountState> = {
       A: this.parseAccount(raw.A),
@@ -390,6 +421,12 @@ export default class TradeExecutor {
         for (const box of state.boxes) {
           const boxIndex = box.pokemon.findIndex((entry) => entry.id === venomon.venomonInstanceId);
           if (boxIndex !== -1) {
+            // A boxed venomon owned by a sibling character can only be traded
+            // away when the active character meets the medal requirement.
+            const owner = this.assetOwnerId(box.pokemon[boxIndex], contexts[from].characterId);
+            if (owner !== contexts[from].characterId && !contexts[from].canAccessOthersAssets) {
+              throw new TradeError("VENOMON_NOT_OWNED");
+            }
             outgoing[from].push(box.pokemon.splice(boxIndex, 1)[0]);
             found = true;
             break;
@@ -444,7 +481,7 @@ export default class TradeExecutor {
       // Held items travel with the Venomon — one game-wide rule, restated in
       // the snapshot and shown on the confirmation screen.
       for (const summary of outgoing[from]) {
-        this.placeVenomon(recipient, summary);
+        this.placeVenomon(recipient, summary, contexts[to].characterId);
       }
 
       if (offer.currency > 0) {
@@ -462,12 +499,29 @@ export default class TradeExecutor {
 
       // The game requires a non-empty party; pull one back out of storage
       // rather than failing a trade that leaves the trainer with Venomons.
+      // The refill must respect box ownership: prefer the character's own
+      // mons, and only touch a sibling's with the medal gate satisfied.
       if (state.party.length === 0) {
-        const donorBox = state.boxes.find((box) => box.pokemon.length > 0);
-        if (!donorBox) {
+        const context = contexts[side];
+        let refilled = false;
+        for (const box of state.boxes) {
+          const index = box.pokemon.findIndex((entry) => {
+            const owner = this.assetOwnerId(entry, contexts[side].characterId);
+            return owner === context.characterId || context.canAccessOthersAssets;
+          });
+          if (index !== -1) {
+            const [mon] = box.pokemon.splice(index, 1);
+            delete mon.ownerCharacterId;
+            delete mon.storedByCharacterId;
+            delete mon.storedAt;
+            state.party.push(mon);
+            refilled = true;
+            break;
+          }
+        }
+        if (!refilled) {
           throw new TradeError("VENOMON_LAST_ONE");
         }
-        state.party.push(donorBox.pokemon.shift()!);
       }
 
       if (state.party.length > MAX_POKEMON_PARTY_SIZE) {
@@ -512,12 +566,22 @@ export default class TradeExecutor {
     return { A: serialize("A"), B: serialize("B") };
   }
 
-  /** Party first (up to 6), then the first box with room, then a new box. */
-  private placeVenomon(recipient: AccountState, summary: PokemonSummary) {
+  /**
+   * Party first (up to 6), then the first box with room, then a new box.
+   * A received venomon belongs to the receiving character: party placement
+   * carries no box stamp, box overflow is stamped with the recipient.
+   */
+  private placeVenomon(recipient: AccountState, summary: PokemonSummary, characterId: number) {
+    delete summary.ownerCharacterId;
+    delete summary.storedByCharacterId;
+    delete summary.storedAt;
     if (recipient.party.length < MAX_POKEMON_PARTY_SIZE) {
       recipient.party.push(summary);
       return;
     }
+    summary.ownerCharacterId = characterId;
+    summary.storedByCharacterId = characterId;
+    summary.storedAt = new Date().toISOString();
     const target = recipient.boxes.find((box) => box.pokemon.length < box.capacity);
     if (target) {
       target.pokemon.push(summary);

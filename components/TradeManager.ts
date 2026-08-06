@@ -543,6 +543,11 @@ export default class TradeManager {
       await this.assertAvailableForTrade(targetUserId, "target");
       this.assertProximity(userId, targetUserId);
 
+      // Account-level blocks apply to every character either account owns.
+      if (await this.auth.isBlockedEitherWay(userId, targetUserId)) {
+        throw new TradeError("BLOCKED_BY_TARGET");
+      }
+
       // Privacy: the Friends window's "accept invitations" toggle doubles as
       // the trade-request switch until a dedicated preference ships. Friends
       // bypass it, which is the friends-only behaviour the spec asks for.
@@ -572,13 +577,7 @@ export default class TradeManager {
 
       this.emitToUser(targetUserId, "trade:request:received", {
         tradeId: session.id,
-        from: {
-          userId: session.participants.A.userId,
-          username: session.participants.A.username,
-          displayName: session.participants.A.displayName,
-          characterSkinId: session.participants.A.characterSkinId,
-          newAccount: session.participants.A.newAccount
-        },
+        from: { ...session.participants.A },
         expiresAt: session.expiresAt
       });
 
@@ -757,15 +756,21 @@ export default class TradeManager {
   private async buildParticipant(userId: number): Promise<TradeParticipantSnapshot> {
     const summary = await this.auth.getSocialUserSummary(userId);
     const createdAtMs = await this.auth.getAccountCreatedAtMs(userId);
+    const accountName = summary?.username ?? `player-${userId}`;
+    const characterName = summary?.characterName ?? summary?.name ?? accountName;
     return {
       userId,
-      username: summary?.username ?? `player-${userId}`,
-      displayName: summary?.name ?? summary?.username ?? `player-${userId}`,
+      username: accountName,
+      displayName: characterName,
       characterSkinId: summary?.characterSkinId ?? "",
       newAccount:
         this.config.newAccountFlagMs > 0 &&
         createdAtMs > 0 &&
-        Date.now() - createdAtMs < this.config.newAccountFlagMs
+        Date.now() - createdAtMs < this.config.newAccountFlagMs,
+      accountId: summary?.accountId ?? userId,
+      accountName,
+      characterId: summary?.characterId ?? userId,
+      characterName
     };
   }
 
@@ -1402,10 +1407,18 @@ export default class TradeManager {
         await this.revalidateOffer(session, side, session.playerIds[side], { fresh: true });
       }
 
+      const [contextA, contextB] = await Promise.all([
+        this.auth.getStorageAccessContext(session.playerIds.A),
+        this.auth.getStorageAccessContext(session.playerIds.B)
+      ]);
       const result = await this.executor.execute(
         session.snapshot,
         { A: session.playerIds.A, B: session.playerIds.B },
-        { A: session.offers.A, B: session.offers.B }
+        { A: session.offers.A, B: session.offers.B },
+        {
+          A: { characterId: contextA.characterId, canAccessOthersAssets: contextA.canAccessOthersAssets },
+          B: { characterId: contextB.characterId, canAccessOthersAssets: contextB.canAccessOthersAssets }
+        }
       );
 
       if (!result.ok) {

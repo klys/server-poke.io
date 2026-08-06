@@ -421,6 +421,12 @@ export interface TradeParticipantSnapshot {
   characterSkinId: string;
   /** Account age flag only — no timestamps, no emails, no ids beyond userId. */
   newAccount: boolean;
+  /** Account identity (userId/username restated for the shared contract). */
+  accountId: number;
+  accountName: string;
+  /** The character actually doing the trading. */
+  characterId: number;
+  characterName: string;
 }
 
 /**

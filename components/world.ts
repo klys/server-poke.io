@@ -1443,6 +1443,7 @@ export default class World {
         trainerProfile?: {
             username?: string;
             name?: string;
+            characterId?: number;
             profileImage?: string;
             description?: string;
             characterSkinId?: string;
@@ -1683,6 +1684,24 @@ export default class World {
      * Removes a player from the world and notifies clients.
      * @param socketId - The socket ID of the player to remove.
      */
+    /**
+     * Fully removes an authenticated player's world entity regardless of how
+     * many sockets are attached (character switch: the client re-joins as the
+     * newly selected character).
+     */
+    removePlayerByUserId(userId:number) {
+        const player = this.getPlayerByUserId(userId);
+        if (!player) {
+            return false;
+        }
+        for (const socketId of player.socketConnections) {
+            this.socketToPlayerId.delete(socketId);
+        }
+        World.socketServer.emit("removePlayer", { playerId: player.socketId, id: player.id });
+        this.players.delete(player.socketId);
+        return true;
+    }
+
     removePlayer(socketId:string) {
         const playerId = this.socketToPlayerId.get(socketId);
         if (!playerId) {
