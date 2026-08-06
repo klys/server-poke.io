@@ -28,7 +28,8 @@ touch `components/eventPageSelection.ts`, `essentialsScriptAdapters.ts`, or
 ## 3. E2E socket drivers (real server + real Redis)
 
 Drivers in `tools/`: `e2e-trade.ts`, `e2e-field-skills.ts`,
-`e2e-water-actions.ts`, `e2e-teach-machines.ts`, `e2e-hidden-venomon-gift.ts`.
+`e2e-water-actions.ts`, `e2e-teach-machines.ts`, `e2e-hidden-venomon-gift.ts`,
+`e2e-account-character.ts`, `e2e-chat.ts`.
 Each spawns its OWN server process on a custom port (e.g. 3997) and asserts
 against authoritative Redis state, not socket payloads.
 
@@ -57,6 +58,7 @@ Before running, check the constants block at the top of the driver:
 | Event pages / scripts / portals | build + progression |
 | Trade | build + `e2e-trade.ts` |
 | Field moves / water / TMs / gift events | build + the matching `e2e-*.ts` |
+| Chat / friends / blocks / accounts | build + `e2e-chat.ts` + `e2e-account-character.ts` |
 | Socket contract shape | build here AND `npm run build` in the client repo (see root `contract-sync` skill) |
 | Client-visible behavior | `client-poke.io:verify` skill (headless Chrome) |
 

@@ -455,7 +455,11 @@ export default class SocialManager {
             return;
           }
         }
-        this.emitToSocket(recipient.socketId, "chat:message", payload);
+        // `Player.socketId` is the logical player id, not a socket id — the
+        // live sockets live in `socketConnections` (one per open client).
+        for (const socketId of recipient.socketConnections) {
+          this.emitToSocket(socketId, "chat:message", payload);
+        }
       })
     );
   }

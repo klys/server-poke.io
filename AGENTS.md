@@ -92,6 +92,13 @@ Copy values from `.env.example` when setting up a local environment. Important v
 - Projectile updates run on an interval in `components/world.ts`.
 - Respawn waiting logic also runs in `components/world.ts`.
 - Authentication state is stored in Redis and hydrated onto `socket.data`.
+- **`Player.socketId` is NOT a socket id** — despite the name it holds the
+  logical player id (`user:{accountId}`). The live sockets are in
+  `Player.socketConnections` (a player can have several open clients). To
+  reach one player, iterate `socketConnections`, or use `world.emitToMap`
+  for a whole map. Passing `player.socketId` to `io.in(...)` targets a room
+  nobody joined, so the event vanishes with no error — this silently killed
+  map chat once.
 
 Redis auth keys currently follow these patterns:
 
