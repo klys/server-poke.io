@@ -2440,15 +2440,7 @@ function createConnectionHandler(
         );
         // Snap the requesting client back to the server's truth (same
         // dynamic move channel the relocation path uses).
-        world.emitToMap(player.currentMapId, "move" + player.socketId, {
-          x: player.x,
-          y: player.y,
-          angle: player.angle,
-          playerId: player.socketId,
-          id: player.id,
-          currentMapId: player.currentMapId,
-          teleported: true
-        });
+        world.emitToMap(player.currentMapId, "move" + player.socketId, player.movePayload({ teleported: true }));
         return;
       }
 

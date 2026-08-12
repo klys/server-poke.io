@@ -168,6 +168,22 @@ export default class Player {
                 : 1;
     }
 
+    /** Payload for a `move{playerId}` broadcast. Every movement emit goes
+     * through here so the packet always carries the server clock (`t`) —
+     * the client interpolation buffer keys segment timing on it. */
+    public movePayload(flags?: { stopped?: boolean; teleported?: boolean }) {
+        return {
+            x: this.x,
+            y: this.y,
+            angle: this.angle,
+            playerId: this.socketId,
+            id: this.id,
+            currentMapId: this.currentMapId,
+            t: Date.now(),
+            ...flags
+        };
+    }
+
     /** The cell the player currently occupies (its collision-box centre). */
     getCurrentCell(cellSize: number) {
         return {
@@ -206,15 +222,7 @@ export default class Player {
         } else {
             this.angle = dy > 0 ? 270 : 90;
         }
-        this.world.emitToMap(this.currentMapId, "move" + this.socketId, {
-            x: this.x,
-            y: this.y,
-            angle: this.angle,
-            playerId: this.socketId,
-            id: this.id,
-            currentMapId: this.currentMapId,
-            stopped: true
-        });
+        this.world.emitToMap(this.currentMapId, "move" + this.socketId, this.movePayload({ stopped: true }));
     }
 
     /**
@@ -277,15 +285,7 @@ export default class Player {
                 // Walk/turn/stop updates stay map-local (see World.emitToMap);
                 // only teleport() broadcasts globally, because the map change
                 // is what tells viewers on the old map to hide this player.
-                this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
-                    x:this.x,
-                    y:this.y,
-                    angle:this.angle,
-                    playerId:this.socketId,
-                    id:this.id,
-                    currentMapId:this.currentMapId,
-                    stopped:true
-                })
+                this.world.emitToMap(this.currentMapId, "move"+this.socketId, this.movePayload({ stopped: true }))
                 // RMXP bump-touch: walking into a blocked trigger-1/2 event
                 // (a door) fires it even though the step itself is denied.
                 this.world.notifyBlockedTouch(this, toX, toY);
@@ -299,27 +299,13 @@ export default class Player {
         this.y = nextY;
 
         if (!advancePath) {
-            this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
-                x:this.x,
-                y:this.y,
-                angle:this.angle,
-                playerId:this.socketId,
-                id:this.id,
-                currentMapId:this.currentMapId
-            })
+            this.world.emitToMap(this.currentMapId, "move"+this.socketId, this.movePayload())
             this.world.handlePlayerStep(this);
             return false;
         }
 
         this.path_pos = this.path_pos + 1;
-        this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
-            x:this.x,
-            y:this.y,
-            angle:this.angle,
-            playerId:this.socketId,
-            id:this.id,
-            currentMapId:this.currentMapId
-        })
+        this.world.emitToMap(this.currentMapId, "move"+this.socketId, this.movePayload())
         this.world.handlePlayerStep(this);
         return true;
     }
@@ -346,15 +332,7 @@ export default class Player {
         this.path_pos = 0;
 
         // Same-map relocation: only viewers of this map need the correction.
-        this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
-            x:this.x,
-            y:this.y,
-            angle:this.angle,
-            playerId:this.socketId,
-            id:this.id,
-            currentMapId:this.currentMapId,
-            teleported:true
-        })
+        this.world.emitToMap(this.currentMapId, "move"+this.socketId, this.movePayload({ teleported: true }))
 
         return true;
     }
@@ -386,15 +364,7 @@ export default class Player {
         if (this.path.length === 0 && (x !== this.x || y !== this.y)) {
             const direction = GameMath.point_direction(this.x, this.y, x, y) + 180;
             this.angle = GameMath.roundToQuadrant(direction);
-            this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
-                x:this.x,
-                y:this.y,
-                angle:this.angle,
-                playerId:this.socketId,
-                id:this.id,
-                currentMapId:this.currentMapId,
-                stopped:true
-            })
+            this.world.emitToMap(this.currentMapId, "move"+this.socketId, this.movePayload({ stopped: true }))
         }
     }
 
@@ -492,15 +462,7 @@ export default class Player {
         this.touchLockUntil = Date.now() + POST_TELEPORT_TOUCH_LOCK_MS;
         this.world.persistPlayerLocation(this);
 
-        World.socketServer.emit("move"+this.socketId, {
-            x:this.x,
-            y:this.y,
-            angle:this.angle,
-            playerId:this.socketId,
-            id:this.id,
-            currentMapId:this.currentMapId,
-            teleported:true
-        })
+        World.socketServer.emit("move"+this.socketId, this.movePayload({ teleported: true }))
 
         if (wasSurfing) {
             this.world.broadcastSurfState(this);
@@ -511,15 +473,7 @@ export default class Player {
         this.path = [];
         this.path_pos = 0;
 
-        this.world.emitToMap(this.currentMapId, "move"+this.socketId, {
-            x:this.x,
-            y:this.y,
-            angle:this.angle,
-            playerId:this.socketId,
-            id:this.id,
-            currentMapId:this.currentMapId,
-            stopped:true
-        })
+        this.world.emitToMap(this.currentMapId, "move"+this.socketId, this.movePayload({ stopped: true }))
     }
 
     public enterBattle() {

@@ -718,6 +718,10 @@ export default interface ServerToClientEvents {
     currentMapId?: string;
     teleported?: boolean;
     stopped?: boolean;
+    /** Server clock (ms) at emit time. Clients use consecutive deltas to
+     * time movement interpolation, so steps stay evenly spaced even when
+     * network jitter bunches packets up. */
+    t: number;
   }) => void;
   [event: `moveProjectil${string}`]: (data: ProjectilData) => void;
   [event: `playerReborn${string}`]: (data: { playerId: string; id: number }) => void;

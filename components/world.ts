@@ -372,15 +372,7 @@ export default class World {
         player.lastTouchCellKey = `${mapId}:${cellX}:${cellY}`;
         player.touchLockUntil = Date.now() + 300;
         this.persistPlayerLocation(player);
-        World.socketServer.emit("move" + player.socketId, {
-            x: player.x,
-            y: player.y,
-            angle: player.angle,
-            playerId: player.socketId,
-            id: player.id,
-            currentMapId: player.currentMapId,
-            teleported: true
-        });
+        World.socketServer.emit("move" + player.socketId, player.movePayload({ teleported: true }));
     }
 
     /** Tell the player's own client AND everyone on their map whether Surf is
