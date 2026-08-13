@@ -2092,6 +2092,20 @@ export default class Auth {
             return { error: "User not found." };
         }
 
+        await this.applyProgressReset(userId);
+
+        const updatedUser = await this.getUserAdminDetails(userId);
+        if (!updatedUser) {
+            return { error: "Unable to refresh the reset user." };
+        }
+
+        return {
+            user: updatedUser
+        };
+    }
+
+    /** The reset itself, shared by the per-user admin action and the bulk maintenance reset. */
+    private async applyProgressReset(userId:number):Promise<void> {
         const characterKey = await this.activeCharacterKey(userId);
         await this.redis.hSet(characterKey, {
             pokemon_party: JSON.stringify(DEFAULT_POKEMON_PARTY),
@@ -2118,15 +2132,66 @@ export default class Auth {
             await this.getActiveCharacterId(userId)
         );
         this.markPartyChanged(userId);
+    }
 
-        const updatedUser = await this.getUserAdminDetails(userId);
-        if (!updatedUser) {
-            return { error: "Unable to refresh the reset user." };
+    /**
+     * Ids of every stored account. Characters share the same id sequence, so
+     * existence of the `auth:user:{id}` hash (not the sequence range alone)
+     * decides membership.
+     */
+    public async listAllUserIds():Promise<number[]> {
+        const highestUserId = Number.parseInt(await this.redis.get(this.userIdSequenceKey()) ?? "0", 10);
+        if (!Number.isFinite(highestUserId) || highestUserId <= 0) {
+            return [];
         }
 
-        return {
-            user: updatedUser
-        };
+        const chunkSize = 200;
+        const ids:number[] = [];
+        for (let start = 1; start <= highestUserId; start += chunkSize) {
+            const count = Math.min(chunkSize, highestUserId - start + 1);
+            const chunk = await Promise.all(
+                Array.from({ length: count }, (_, index) => (
+                    this.redis.hGet(this.userKey(start + index), "id")
+                ))
+            );
+            chunk.forEach((id, index) => {
+                if (id) {
+                    ids.push(start + index);
+                }
+            });
+        }
+
+        return ids;
+    }
+
+    /**
+     * Applies resetUserProgress semantics to EVERY account (admin "Reset
+     * Adventure for Everyone" maintenance action). Failures on individual
+     * accounts are reported and skipped, never aborting the sweep.
+     */
+    public async resetAllUsersProgress(
+        onProgress?:(message:string)=>void
+    ):Promise<{ total:number; reset:number; failed:number }> {
+        const userIds = await this.listAllUserIds();
+        let reset = 0;
+        let failed = 0;
+
+        for (const userId of userIds) {
+            try {
+                await this.applyProgressReset(userId);
+                reset += 1;
+            } catch (error) {
+                failed += 1;
+                onProgress?.(`user ${userId}: reset failed (${(error as Error).message})`);
+            }
+
+            const processed = reset + failed;
+            if (processed % 25 === 0 || processed === userIds.length) {
+                onProgress?.(`… ${processed}/${userIds.length} accounts processed`);
+            }
+        }
+
+        return { total: userIds.length, reset, failed };
     }
 
     /**

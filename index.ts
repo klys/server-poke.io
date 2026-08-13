@@ -7,6 +7,7 @@ import MailService from "./components/MailService";
 import MapAssetStore from "./components/MapAssetStore";
 import PlayableMapsStore from "./components/PlayableMapsStore";
 import PokecraftApiClient from "./components/PokecraftApiClient";
+import RxdataUploadStore, { MAX_ZIP_BYTES } from "./components/RxdataUploadStore";
 import World from "./components/world"
 import {Server} from "socket.io"
 import { createServer } from "http";
@@ -228,20 +229,94 @@ async function bootstrap() {
     }
   };
 
+  // rxdata_json zip uploads for the admin panel's "Repair Essentials Events"
+  // maintenance action. Uploaded over HTTP (not Socket.IO) because a dump zip
+  // is a multi-MB binary blob — exactly the kind of payload that must stay
+  // off the websocket. Requires an admin.access session token.
+  const handleRxdataUpload = async (
+    request:import("http").IncomingMessage,
+    response:import("http").ServerResponse
+  ) => {
+    const headers:Record<string, string> = {
+      ...buildCorsHeaders(request.headers.origin),
+      "Content-Type": "application/json"
+    };
+
+    try {
+      const session = await auth.resolveSession(readBearerToken(request));
+      const permissions = session.user?.permissions ?? [];
+      if (!permissions.includes("admin.access")) {
+        response.writeHead(session.authenticated ? 403 : 401, headers);
+        response.end(JSON.stringify({ ok: false, errors: ["Admin access is required."] }));
+        return;
+      }
+      if (maintenanceRunner?.running) {
+        response.writeHead(409, headers);
+        response.end(JSON.stringify({ ok: false, errors: ["A maintenance action is running — try again when it finishes."] }));
+        return;
+      }
+
+      const chunks:Buffer[] = [];
+      let totalBytes = 0;
+      let aborted = false;
+      await new Promise<void>((resolve, reject) => {
+        request.on("data", (chunk:Buffer) => {
+          totalBytes += chunk.length;
+          if (totalBytes > MAX_ZIP_BYTES) {
+            aborted = true;
+            request.destroy();
+            resolve();
+            return;
+          }
+          chunks.push(chunk);
+        });
+        request.on("end", () => resolve());
+        request.on("error", (error) => (aborted ? resolve() : reject(error)));
+      });
+      if (aborted) {
+        response.writeHead(413, headers);
+        response.end(JSON.stringify({ ok: false, errors: ["The zip exceeds the upload size limit."] }));
+        return;
+      }
+
+      const originalName = decodeURIComponent(String(request.headers["x-file-name"] ?? "upload.zip")).slice(0, 120);
+      const uploadStore = maintenanceRunner?.rxdataUploads ?? new RxdataUploadStore();
+      const result = await uploadStore.stageZip(Buffer.concat(chunks), {
+        uploadedBy: session.user?.username ? `@${session.user.username}` : `user:${session.user?.id ?? "?"}`,
+        originalName
+      });
+      response.writeHead(result.ok ? 200 : 422, headers);
+      response.end(JSON.stringify(result));
+    } catch (error) {
+      console.error("Unable to process rxdata upload:", error);
+      response.writeHead(500, headers);
+      response.end(JSON.stringify({ ok: false, errors: ["Unexpected server error while processing the upload."] }));
+    }
+  };
+
   // Static assets (including /map-assets/...) are served by the standalone
   // asset-storage nginx server; this process only handles Socket.IO traffic
   // plus the endpoints below.
   const httpServer = createServer((request, response) => {
     // Preflight for requests carrying the Authorization header (designer-only
-    // section downloads). Socket.IO handles its own preflights.
-    if (request.method === "OPTIONS" && request.url?.startsWith("/designer-sections/")) {
+    // section downloads, admin rxdata uploads). Socket.IO handles its own
+    // preflights.
+    if (
+      request.method === "OPTIONS" &&
+      (request.url?.startsWith("/designer-sections/") || request.url === "/admin/maintenance/rxdata-upload")
+    ) {
       response.writeHead(204, {
         ...buildCorsHeaders(request.headers.origin),
-        "Access-Control-Allow-Methods": "GET, OPTIONS",
-        "Access-Control-Allow-Headers": "Authorization, Content-Type",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Authorization, Content-Type, X-File-Name",
         "Access-Control-Max-Age": "86400"
       });
       response.end();
+      return;
+    }
+
+    if (request.method === "POST" && request.url === "/admin/maintenance/rxdata-upload") {
+      void handleRxdataUpload(request, response);
       return;
     }
 
@@ -326,7 +401,7 @@ async function bootstrap() {
   await auth.initialize();
   world.setSocketServer(io);
   await world.initializeGroundItems(groundItemStore);
-  const { tradeManager } = registerSocketHandlers(io, world, auth, designerSectionStore, playableMapsStore, groundItemStore, redis, mapAssetStore, pokecraftApi);
+  const { tradeManager, maintenanceRunner } = registerSocketHandlers(io, world, auth, designerSectionStore, playableMapsStore, groundItemStore, redis, mapAssetStore, pokecraftApi, mailService);
   // Trades never survive a restart: drop any player claims and asset
   // reservations a previous run left behind before accepting connections.
   await tradeManager.initialize();

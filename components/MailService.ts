@@ -14,6 +14,7 @@ export default class MailService {
     private readonly smtpPass:string;
     private readonly smtpFrom:string;
     private readonly smtpEnabled:boolean;
+    private readonly smtpRequireTls:boolean;
     private readonly appPublicUrl:string;
     private readonly emailValidationPath:string;
     private readonly passwordResetPath:string;
@@ -26,6 +27,9 @@ export default class MailService {
         this.smtpUser = process.env.SMTP_USER || "";
         this.smtpPass = process.env.SMTP_PASS || "";
         this.smtpFrom = process.env.SMTP_FROM || "";
+        // STARTTLS is mandatory by default; SMTP_REQUIRE_TLS=false lets local
+        // capture sinks without TLS (Mailpit) work in development.
+        this.smtpRequireTls = (process.env.SMTP_REQUIRE_TLS || "true").toLowerCase() !== "false";
         this.appPublicUrl = (process.env.APP_PUBLIC_URL || "http://localhost:3000").replace(/\/$/, "");
         this.emailValidationPath = process.env.EMAIL_VALIDATION_PATH || "/#/validate-email";
         this.passwordResetPath = process.env.PASSWORD_RESET_PATH || "/#/recover-password";
@@ -45,7 +49,7 @@ export default class MailService {
                 user: this.smtpUser,
                 pass: this.smtpPass
             },
-            requireTLS: true,
+            requireTLS: this.smtpRequireTls,
             tls: {
                 minVersion: "TLSv1.2",
             },
@@ -124,6 +128,33 @@ export default class MailService {
             subject: "Confirm your Poke.io account deletion",
             text: this.convertHtmlToText(template),
             html: template
+        });
+    }
+
+    /**
+     * Admin-panel maintenance reports: pre-rendered HTML/text with the raw
+     * report files (md/json/console log) attached. Unlike the account emails
+     * above, a disabled SMTP setup is an error here — the admin explicitly
+     * asked for the email and must see that it cannot be delivered.
+     */
+    public async sendMaintenanceReport(options:{
+        to:string;
+        subject:string;
+        text:string;
+        html:string;
+        attachments?:Array<{ filename:string; content:string; contentType?:string }>;
+    }) {
+        if (!this.transporter) {
+            throw new Error("SMTP is not configured on this server.");
+        }
+
+        await this.transporter.sendMail({
+            from: this.smtpFrom,
+            to: options.to,
+            subject: options.subject,
+            text: options.text,
+            html: options.html,
+            attachments: options.attachments
         });
     }
 

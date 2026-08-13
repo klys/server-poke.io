@@ -30,6 +30,9 @@ SMTP_SECURE=false
 SMTP_USER=dev
 SMTP_PASS=dev
 SMTP_FROM=no-reply@localhost
+# Mailpit does not offer STARTTLS out of the box; the server requires it
+# unless explicitly disabled (keep the default "true" in production).
+SMTP_REQUIRE_TLS=false
 ```
 
 ---

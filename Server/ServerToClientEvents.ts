@@ -556,9 +556,32 @@ export default interface ServerToClientEvents {
   /** Real-time set of user ids currently online, pushed to subscribed admins. */
   "admin:presence:state": (data: { onlineUserIds: number[] }) => void;
   "admin:roles:list": (data: { roles: RoleDefinitionWithCount[] }) => void;
-  "admin:maintenance:list": (data: { actions: MaintenanceActionStatus[]; running: string | null }) => void;
+  "admin:maintenance:list": (data: {
+    actions: MaintenanceActionStatus[];
+    running: string | null;
+    /** SMTP is configured — report emailing is possible on this server. */
+    emailEnabled: boolean;
+  }) => void;
   "admin:maintenance:log": (data: { id: string; line: string }) => void;
   "admin:maintenance:done": (data: { id: string; ok: boolean; exitCode: number | null }) => void;
+  /** Stored last-run report of one action, rendered as a self-contained HTML document. */
+  "admin:maintenance:report": (data: {
+    id: string;
+    available: boolean;
+    html: string | null;
+    meta: {
+      actionName: string;
+      at: string;
+      ok: boolean;
+      dryRun: boolean;
+      exitCode: number | null;
+      by: string;
+    } | null;
+  }) => void;
+  /** Outcome of an admin:maintenance:email-report request. */
+  "admin:maintenance:email-result": (data: { id: string; ok: boolean; to: string; message: string }) => void;
+  /** Outcome of an admin:maintenance:broadcast request. */
+  "admin:maintenance:broadcast-result": (data: { ok: boolean; recipients: number; message: string }) => void;
   /** Effective global game settings + the env-derived defaults, admin-only. */
   "admin:settings-data": (data: {
     settings: {

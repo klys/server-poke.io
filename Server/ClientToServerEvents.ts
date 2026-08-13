@@ -416,6 +416,14 @@ export default interface ClientToServerEvents {
   "admin:roles:list": () => void;
   "admin:maintenance:list": () => void;
   "admin:maintenance:run": (data: { id: string; dryRun?: boolean }) => void;
+  /** Requests the stored report (HTML + meta) of an action's last run. */
+  "admin:maintenance:report": (data: { id: string }) => void;
+  /** Emails an action's last-run report; `to` defaults to the requesting admin's address. */
+  "admin:maintenance:email-report": (data: { id: string; to?: string }) => void;
+  /** Drops the admin-uploaded rxdata zip so the event repair reads the bundled dump again. */
+  "admin:maintenance:rxdata-clear": () => void;
+  /** Broadcasts a global chat message to every online player (admin.access). */
+  "admin:maintenance:broadcast": (data: { message: string }) => void;
 
   /** Requests the operator-tunable global game settings (admin.access). */
   "admin:settings:get": () => void;

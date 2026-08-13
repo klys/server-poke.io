@@ -5,6 +5,7 @@
   "dependencies": {
     "@dotenvx/dotenvx": "^1.55.1",
     "@types/socket.io": "^3.0.2",
+    "adm-zip": "^0.6.0",
     "jsonwebtoken": "^9.0.3",
     "nodemailer": "^8.0.2",
     "pathfinding": "^0.4.18",
@@ -22,6 +23,7 @@
     "report:migration": "ts-node tools/essentialsMigrationReport.ts"
   },
   "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^25.5.0",
     "@types/nodemailer": "^7.0.11",

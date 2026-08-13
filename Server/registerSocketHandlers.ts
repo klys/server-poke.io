@@ -29,7 +29,9 @@ import SocialManager from "../components/SocialManager";
 import TradeManager from "../components/TradeManager";
 import { TradeError, type TradeMutationSource } from "../components/trade/tradeTypes";
 import World from "../components/world";
-import MaintenanceRunner from "../components/MaintenanceRunner";
+import MaintenanceRunner, { MAINTENANCE_SERVER_ROOT, type MaintenanceRunRecord } from "../components/MaintenanceRunner";
+import { buildMaintenanceReport, collectRunArtifacts } from "../components/MaintenanceReport";
+import type MailService from "../components/MailService";
 import PokecraftApiClient, {
   PokecraftApiError,
   type ApiKeyScope,
@@ -346,6 +348,24 @@ export function isAllowedClientTeleport(
 // registerSocketHandlers where the redis client is available; the connection
 // handler only reads it.
 let maintenanceRunner:MaintenanceRunner | null = null;
+// SMTP delivery for emailed maintenance reports; null (or not enabled) means
+// the panel shows email actions disabled.
+let maintenanceMailService:MailService | null = null;
+
+/**
+ * Renders the stored last-run transcript of an action into the HTML/text
+ * report shared by the panel's report modal and the emailed report. Report
+ * files on disk (migration-report.md/json) only belong to the audit action.
+ */
+async function buildStoredMaintenanceReport(record:MaintenanceRunRecord) {
+  const artifacts = record.actionId === "essentials-migration-report"
+    ? await collectRunArtifacts(MAINTENANCE_SERVER_ROOT, record)
+    : [];
+  return buildMaintenanceReport(record, artifacts);
+}
+
+const MAINTENANCE_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAINTENANCE_BROADCAST_MAX_LENGTH = 500;
 
 function requireAdminAccess(socket:ServerSocket) {
   return requirePermission(
@@ -2041,7 +2061,8 @@ function createConnectionHandler(
         }
         socket.emit("admin:maintenance:list", {
           actions: await maintenanceRunner.listActions(),
-          running: maintenanceRunner.running
+          running: maintenanceRunner.running,
+          emailEnabled: maintenanceMailService?.isEnabled() ?? false
         });
       } catch (error) {
         console.error("Unable to list maintenance actions:", error);
@@ -2075,7 +2096,8 @@ function createConnectionHandler(
               .then((actions) =>
                 socket.emit("admin:maintenance:list", {
                   actions,
-                  running: maintenanceRunner?.running ?? null
+                  running: maintenanceRunner?.running ?? null,
+                  emailEnabled: maintenanceMailService?.isEnabled() ?? false
                 })
               )
               .catch(() => undefined);
@@ -2087,6 +2109,162 @@ function createConnectionHandler(
       } catch (error) {
         console.error("Unable to run maintenance action:", error);
         socket.emit("admin:error", { message: "Unable to run that maintenance action right now." });
+      }
+    });
+
+    socket.on("admin:maintenance:report", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+        if (!requireAdminAccess(socket) || !maintenanceRunner) {
+          return;
+        }
+        const actionId = typeof data?.id === "string" ? data.id : "";
+        const record = await maintenanceRunner.getRunRecord(actionId);
+        if (!record) {
+          socket.emit("admin:maintenance:report", { id: actionId, available: false, html: null, meta: null });
+          return;
+        }
+        const report = await buildStoredMaintenanceReport(record);
+        socket.emit("admin:maintenance:report", {
+          id: actionId,
+          available: true,
+          html: report.html,
+          meta: {
+            actionName: record.actionName,
+            at: record.at,
+            ok: record.ok,
+            dryRun: record.dryRun,
+            exitCode: record.exitCode,
+            by: record.by
+          }
+        });
+      } catch (error) {
+        console.error("Unable to build maintenance report:", error);
+        socket.emit("admin:error", { message: "Unable to build that report right now." });
+      }
+    });
+
+    socket.on("admin:maintenance:email-report", async (data) => {
+      const actionId = typeof data?.id === "string" ? data.id : "";
+      const requestedTo = typeof data?.to === "string" ? data.to.trim() : "";
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+        if (!requireAdminAccess(socket) || !maintenanceRunner) {
+          return;
+        }
+        // Default destination: the requesting admin's own account email.
+        const to = requestedTo || socket.data.email || "";
+        if (!MAINTENANCE_EMAIL_PATTERN.test(to)) {
+          socket.emit("admin:maintenance:email-result", {
+            id: actionId, ok: false, to,
+            message: "Provide a valid destination email address."
+          });
+          return;
+        }
+        if (!maintenanceMailService?.isEnabled()) {
+          socket.emit("admin:maintenance:email-result", {
+            id: actionId, ok: false, to,
+            message: "SMTP is not configured on this server — email delivery is disabled."
+          });
+          return;
+        }
+        const record = await maintenanceRunner.getRunRecord(actionId);
+        if (!record) {
+          socket.emit("admin:maintenance:email-result", {
+            id: actionId, ok: false, to,
+            message: "No stored report for this action yet — run it first."
+          });
+          return;
+        }
+        const report = await buildStoredMaintenanceReport(record);
+        await maintenanceMailService.sendMaintenanceReport({
+          to,
+          subject: report.subject,
+          text: report.text,
+          html: report.html,
+          attachments: report.attachments
+        });
+        socket.emit("admin:maintenance:email-result", {
+          id: actionId, ok: true, to,
+          message: `Report emailed to ${to}.`
+        });
+      } catch (error) {
+        console.error("Unable to email maintenance report:", error);
+        socket.emit("admin:maintenance:email-result", {
+          id: actionId, ok: false, to: requestedTo,
+          message: `Unable to send the email: ${(error as Error).message}`
+        });
+      }
+    });
+
+    socket.on("admin:maintenance:rxdata-clear", async () => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+        if (!requireAdminAccess(socket) || !maintenanceRunner) {
+          return;
+        }
+        if (maintenanceRunner.running) {
+          socket.emit("admin:error", { message: "Wait for the running action to finish before changing the rxdata data." });
+          return;
+        }
+        await maintenanceRunner.rxdataUploads.clearUpload();
+        socket.emit("auth:info", { message: "Uploaded rxdata data removed — the event repair will use the bundled dump." });
+        socket.emit("admin:maintenance:list", {
+          actions: await maintenanceRunner.listActions(),
+          running: maintenanceRunner.running,
+          emailEnabled: maintenanceMailService?.isEnabled() ?? false
+        });
+      } catch (error) {
+        console.error("Unable to clear uploaded rxdata data:", error);
+        socket.emit("admin:error", { message: "Unable to remove the uploaded rxdata data right now." });
+      }
+    });
+
+    socket.on("admin:maintenance:broadcast", async (data) => {
+      try {
+        if (!socket.data.authenticated && readSocketToken(socket)) {
+          await hydrateSocketAuth(socket, auth);
+        }
+        if (!requireAdminAccess(socket)) {
+          return;
+        }
+        const message = typeof data?.message === "string" ? data.message.trim() : "";
+        if (!message) {
+          socket.emit("admin:maintenance:broadcast-result", { ok: false, recipients: 0, message: "The message is empty." });
+          return;
+        }
+        if (message.length > MAINTENANCE_BROADCAST_MAX_LENGTH) {
+          socket.emit("admin:maintenance:broadcast-result", {
+            ok: false, recipients: 0,
+            message: `The message is too long (max ${MAINTENANCE_BROADCAST_MAX_LENGTH} characters).`
+          });
+          return;
+        }
+        // Same payload shape the moderator /global chat command emits.
+        io.emit("chat:message", {
+          id: crypto.randomUUID(),
+          channel: "global",
+          fromUserId: socket.data.userId,
+          fromUsername: socket.data.username ?? "",
+          fromName: socket.data.username || "Admin",
+          text: message,
+          at: new Date().toISOString()
+        });
+        const recipients = world.players.size;
+        socket.emit("admin:maintenance:broadcast-result", {
+          ok: true,
+          recipients,
+          message: `Global message delivered to ${recipients} online player(s).`
+        });
+      } catch (error) {
+        console.error("Unable to broadcast global message:", error);
+        socket.emit("admin:maintenance:broadcast-result", { ok: false, recipients: 0, message: "Unable to send the global message right now." });
       }
     });
 
@@ -3899,11 +4077,16 @@ export default function registerSocketHandlers(
   _groundItemStore:GroundItemStore,
   redis:RedisClientType,
   mapAssetStore?:MapAssetStore,
-  pokecraftApi?:PokecraftApiClient
+  pokecraftApi?:PokecraftApiClient,
+  mailService?:MailService
 ) {
   const battleManager = new BattleManager(io, world, auth, designerSectionStore);
   world.setBattleManager(battleManager);
   maintenanceRunner = new MaintenanceRunner(redis);
+  // Inline maintenance actions (e.g. reset-all-adventures) run against the
+  // live services instead of spawning a tool process.
+  maintenanceRunner.setServices({ auth, world, io });
+  maintenanceMailService = mailService ?? null;
   const eventRuntime = new EventRuntime(io, world, auth);
   const socialManager = new SocialManager(io, world, auth, battleManager, eventRuntime);
   const tradeManager = new TradeManager(
@@ -4012,5 +4195,5 @@ export default function registerSocketHandlers(
   );
   io.on("connection", createConnectionHandler(io, world, auth, designerSectionStore, playableMapsStore, battleManager, eventRuntime, socialManager, tradeManager, mapAssetStore, pokecraftApi));
 
-  return { tradeManager };
+  return { tradeManager, maintenanceRunner };
 }
