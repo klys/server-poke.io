@@ -518,7 +518,43 @@ export default class SocialManager {
       return;
     }
 
+    if (command === "/pelota" || command === "/ball") {
+      await this.spawnBeachBall(socket, player);
+      return;
+    }
+
     this.emitToSocket(socket.id, "chat:error", { message: `Unknown command: ${command}` });
+  }
+
+  /**
+   * /pelota (alias /ball): drops a beach ball on the cell the player faces.
+   * One live ball per map — a second one spawns already deflating — unless
+   * the admin global setting `allowMultipleBeachBalls` lifts the limit.
+   */
+  private async spawnBeachBall(socket: { data: SocketData; id: string }, player: Player) {
+    if (player.inBattle) {
+      this.emitToSocket(socket.id, "chat:error", { message: "No puedes sacar la pelota en batalla." });
+      return;
+    }
+
+    const settings = await this.auth.getGlobalSettings();
+    const cellSize = this.world.getMapCellSize(player.currentMapId);
+    const result = this.world.beachBalls.spawn(
+      player.currentMapId,
+      player.getFacingCell(cellSize),
+      settings.allowMultipleBeachBalls
+    );
+
+    if (!result) {
+      this.emitToSocket(socket.id, "chat:error", { message: "No hay espacio para la pelota aquí." });
+      return;
+    }
+
+    if (result.deflatedOnArrival) {
+      this.emitToSocket(socket.id, "chat:error", {
+        message: "Ya hay una pelota en este mapa: la nueva se desinfló al instante."
+      });
+    }
   }
 
   private async sendWhisper(fromPlayer: Player, fromUserId: number, targetName: string, message: string) {

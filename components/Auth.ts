@@ -113,6 +113,12 @@ export interface AuthenticatedUser {
     /** Palette key chosen for the Trainer Card background (client owns the palette). */
     trainerCardColor:string;
     battleHistory:BattleHistoryEntry[];
+    /** Whether the party leader walks behind the player on the map. */
+    followerEnabled:boolean;
+    /** How many bodies in a row this player can shove (see World.shovePastObstacle).
+     * Hidden gameplay stat: not shown in regular UX, tunable from the admin
+     * panel and intended for future item bonuses. */
+    pushDepth:number;
     role:UserRoleKey;
     permissions:RolePermission[];
 }
@@ -265,6 +271,8 @@ export interface AdminUserUpdatePayload {
     pokemonParty?: PokemonSummary[];
     battleHistory?: BattleHistoryEntry[];
     savedLocation?: SavedPlayerLocation | null;
+    /** Secret push-chain depth (see AuthenticatedUser.pushDepth). */
+    pushDepth?: number;
 }
 
 /**
@@ -559,6 +567,11 @@ export const MAX_CHARACTERS_PER_ACCOUNT = Math.max(
 const CHARACTER_RECOVERY_DAYS_DEFAULT = Math.max(0, Number(process.env.CHARACTER_RECOVERY_DAYS ?? 30));
 const SKIN_CHANGE_PRICE_DEFAULT = Math.max(0, Math.round(Number(process.env.SKIN_CHANGE_PRICE ?? 300)));
 
+/** Default bodies-in-a-row a player can shove (2 = push-over-push). */
+export const DEFAULT_PUSH_DEPTH = 2;
+/** Upper bound for the admin-tunable push depth. */
+export const MAX_PUSH_DEPTH = 8;
+
 /**
  * Operator-tunable global game settings, editable from the admin panel and
  * stored in Redis (`settings:global`). The env-derived constants above are
@@ -576,6 +589,8 @@ export interface GlobalGameSettings {
     skinChangePrice:number;
     /** Wallet money a brand-new account/character starts with. */
     startingMoney:number;
+    /** Bypass for the one-beach-ball-per-map rule (/pelota command). */
+    allowMultipleBeachBalls:boolean;
 }
 
 export const DEFAULT_GLOBAL_SETTINGS:GlobalGameSettings = {
@@ -583,7 +598,8 @@ export const DEFAULT_GLOBAL_SETTINGS:GlobalGameSettings = {
     crossCharacterStorageMinMedals: CROSS_CHARACTER_STORAGE_MIN_MEDALS,
     characterRecoveryDays: CHARACTER_RECOVERY_DAYS_DEFAULT,
     skinChangePrice: SKIN_CHANGE_PRICE_DEFAULT,
-    startingMoney: DEFAULT_MONEY
+    startingMoney: DEFAULT_MONEY,
+    allowMultipleBeachBalls: false
 };
 /** Same rule as account registration names (intro rename allows more). */
 const CHARACTER_NAME_PATTERN = /^[A-Za-z]{2,30}$/;
@@ -612,7 +628,9 @@ const CHARACTER_GAMEPLAY_FIELDS = [
     "event_switches",
     "event_variables",
     "event_self_switches",
-    "egg_cooldowns"
+    "egg_cooldowns",
+    "follower_enabled",
+    "push_depth"
 ] as const;
 const DEFAULT_ROLE_DEFINITIONS:RoleDefinition[] = [
     {
@@ -804,7 +822,11 @@ export default class Auth {
             crossCharacterStorageMinMedals: int(source.crossCharacterStorageMinMedals, DEFAULT_GLOBAL_SETTINGS.crossCharacterStorageMinMedals, 0, 64),
             characterRecoveryDays: int(source.characterRecoveryDays, DEFAULT_GLOBAL_SETTINGS.characterRecoveryDays, 0, 365),
             skinChangePrice: int(source.skinChangePrice, DEFAULT_GLOBAL_SETTINGS.skinChangePrice, 0, MAX_MONEY_BALANCE),
-            startingMoney: int(source.startingMoney, DEFAULT_GLOBAL_SETTINGS.startingMoney, 0, MAX_MONEY_BALANCE)
+            startingMoney: int(source.startingMoney, DEFAULT_GLOBAL_SETTINGS.startingMoney, 0, MAX_MONEY_BALANCE),
+            allowMultipleBeachBalls:
+                typeof source.allowMultipleBeachBalls === "boolean"
+                    ? source.allowMultipleBeachBalls
+                    : DEFAULT_GLOBAL_SETTINGS.allowMultipleBeachBalls
         };
     }
 
@@ -1166,7 +1188,7 @@ export default class Auth {
                 "inventory", "pokemon_party", "battle_history", "visited_towns",
                 "last_map_id", "last_x", "last_y", "last_surfing", "respawn_point",
                 "event_switches", "event_variables", "event_self_switches",
-                "egg_cooldowns", "money"
+                "egg_cooldowns", "money", "follower_enabled", "push_depth"
             ]);
             await this.redis.hSet(this.characterKey(characterId), {
                 purged_at: new Date().toISOString()
@@ -1295,6 +1317,24 @@ export default class Auth {
             last_y: String(Math.round(location.y)),
             last_surfing: location.surfing ? "1" : "0"
         });
+    }
+
+    /** Persists the follower-venomon toggle for the active character. */
+    public async saveFollowerEnabled(userId:number, enabled:boolean) {
+        await this.redis.hSet(await this.activeCharacterKey(userId), {
+            follower_enabled: enabled ? "1" : "0"
+        });
+    }
+
+    /** Clamped push-chain depth; missing/garbage falls back to the default. */
+    private parsePushDepth(raw:string | undefined):number {
+        const parsed = Number.parseInt(raw ?? "", 10);
+
+        if (!Number.isFinite(parsed)) {
+            return DEFAULT_PUSH_DEPTH;
+        }
+
+        return Math.min(MAX_PUSH_DEPTH, Math.max(0, parsed));
     }
 
     public async getUserForBattle(userId:number) {
@@ -2039,6 +2079,16 @@ export default class Auth {
 
         if (updates.battleHistory) {
             characterFields.battle_history = JSON.stringify(this.sanitizeBattleHistoryForStorage(updates.battleHistory));
+        }
+
+        if (typeof updates.pushDepth === "number") {
+            if (!Number.isFinite(updates.pushDepth)) {
+                return { error: "Push depth must be a valid number." };
+            }
+
+            characterFields.push_depth = String(
+                Math.min(MAX_PUSH_DEPTH, Math.max(0, Math.round(updates.pushDepth)))
+            );
         }
 
         if (Object.keys(accountFields).length > 0) {
@@ -3255,12 +3305,25 @@ export default class Auth {
         };
     }
 
+    /** Fired after any write that may have changed a user's party (see
+     * markPartyChanged); the follower system re-resolves its leader on it. */
+    private partyChangedListener:((userId:number) => void) | null = null;
+
+    public setPartyChangedListener(listener:(userId:number) => void) {
+        this.partyChangedListener = listener;
+    }
+
     /**
      * Invalidates the cached egg-presence hint for a user after any write that
      * could change which Pokemon (if any) is an egg in their party.
      */
     private markPartyChanged(userId:number) {
         this.eggPresenceByUserId.delete(userId);
+        try {
+            this.partyChangedListener?.(userId);
+        } catch (error) {
+            console.error("party-changed listener failed", error);
+        }
     }
 
     private async sendPostRegistrationEmails(user:AuthenticatedUser) {
@@ -3523,6 +3586,8 @@ export default class Auth {
                     trainerCardColor: "",
                     money: startingMoney,
                     battleHistory: DEFAULT_BATTLE_HISTORY,
+                    followerEnabled: true,
+                    pushDepth: DEFAULT_PUSH_DEPTH,
                     role,
                     permissions: role === "admin"
                         ? [...ROLE_PERMISSIONS]
@@ -3809,6 +3874,8 @@ export default class Auth {
             visitedTowns: this.parseVisitedTowns(character.visited_towns),
             trainerCardColor: character.trainer_card_color ?? "",
             battleHistory: this.parseBattleHistory(character.battle_history),
+            followerEnabled: character.follower_enabled !== "0",
+            pushDepth: this.parsePushDepth(character.push_depth),
             role: resolvedRole.role,
             permissions: resolvedRole.permissions,
             created_at: account.created_at
@@ -3842,6 +3909,8 @@ export default class Auth {
             visitedTowns: user.visitedTowns,
             trainerCardColor: user.trainerCardColor,
             battleHistory: user.battleHistory,
+            followerEnabled: user.followerEnabled,
+            pushDepth: user.pushDepth,
             role: user.role,
             permissions: user.permissions
         };

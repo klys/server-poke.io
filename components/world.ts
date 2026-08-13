@@ -23,6 +23,8 @@ import {
 } from "./eventPageSelection";
 import { logUnsupportedScript } from "./essentialsScriptAdapters";
 import NpcActorSimulation from "./NpcActors";
+import FollowerActorSimulation from "./FollowerActors";
+import BeachBalls from "./BeachBalls";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -55,6 +57,13 @@ type NpcBlocker = {
     facing:number | null;
     essentials:EssentialsEventRecord | null;
 };
+
+/** A body World.shovePastObstacle can displace (push chains walk these). */
+type PushableBody =
+    | { kind:"player"; player:Player }
+    | { kind:"npc"; id:string }
+    | { kind:"follower"; ownerId:string }
+    | { kind:"ball"; id:string };
 //pf = require("pathfinding");
 
 /**
@@ -82,6 +91,10 @@ export default class World {
     private npcBlockerCache = new WeakMap<object, Map<string, Array<NpcBlocker>>>();
     /** Server-authoritative movement for NPCs that walk (see NpcActors.ts). */
     npcSimulation: NpcActorSimulation | null = null;
+    /** Party leaders walking behind their trainers (see FollowerActors.ts). */
+    followerSimulation: FollowerActorSimulation | null = null;
+    /** Pushable /pelota beach balls (see BeachBalls.ts). */
+    beachBalls: BeachBalls;
     /** Short-lived overlay of live NPC positions; see `npcBlockersLive`. */
     private liveNpcBlockerCache = new Map<string, { at:number; blockers:Array<NpcBlocker> }>();
     private static readonly LIVE_NPC_BLOCKER_TTL_MS = 25;
@@ -133,6 +146,11 @@ export default class World {
 
         this.npcSimulation = new NpcActorSimulation(this);
         this.npcSimulation.start();
+
+        this.followerSimulation = new FollowerActorSimulation(this);
+        this.followerSimulation.start();
+
+        this.beachBalls = new BeachBalls(this);
     }
 
     async initializeGroundItems(groundItemStore: GroundItemStore) {
@@ -400,6 +418,7 @@ export default class World {
         player.touchLockUntil = Date.now() + 300;
         this.persistPlayerLocation(player);
         World.socketServer.emit("move" + player.socketId, player.movePayload({ teleported: true }));
+        this.followerSimulation?.onOwnerTeleport(player);
     }
 
     /** Tell the player's own client AND everyone on their map whether Surf is
@@ -433,6 +452,8 @@ export default class World {
         }
         this.persistPlayerLocation(player);
         this.broadcastSurfState(player);
+        // The follower waits on the shore: hidden while surfing/underwater.
+        this.followerSimulation?.refreshVisibility(player);
     }
 
     /** Surf: from land facing water, mount the water and start surfing.
@@ -697,6 +718,104 @@ export default class World {
             }
         }
 
+        // Follower venomons and beach balls are solid, pushable bodies — same
+        // anti-trap rule as players so overlaps can always separate.
+        const softBodies = [
+            ...(this.followerSimulation?.blockersOnMap(player.currentMapId) ?? []),
+            ...this.beachBalls.blockersOnMap(player.currentMapId)
+        ];
+        for (const body of softBodies) {
+            const bodyBounds = { x: body.x + inset, y: body.y + inset, width: 32 - inset * 2, height: 32 - inset * 2 };
+            if (this.checkCollision(currentBounds, bodyBounds)) {
+                continue;
+            }
+            if (this.checkCollision(bounds, bodyBounds)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Whether a cell holds any solid body (player, NPC, follower or ball).
+     * Moving followers/balls reserve both their origin and destination cells,
+     * like NPC actors, so two displaced bodies can't converge on one tile.
+     * `exclude` skips the asking body itself.
+     */
+    isCellOccupiedByBody(
+        mapId:string,
+        cellX:number,
+        cellY:number,
+        exclude:{ kind:"player" | "npc" | "follower" | "ball"; id:string } | null
+    ): boolean {
+        const cellSize = this.getMapCellSize(mapId);
+        const inset = 2;
+        const cellBounds = {
+            x: cellX * cellSize + inset,
+            y: cellY * cellSize + inset,
+            width: cellSize - inset * 2,
+            height: cellSize - inset * 2
+        };
+
+        for (const player of Array.from(this.players.values())) {
+            if (player.currentMapId !== mapId) {
+                continue;
+            }
+            if (exclude?.kind === "player" && exclude.id === player.socketId) {
+                continue;
+            }
+            const playerBounds = {
+                x: player.x + inset,
+                y: player.y + inset,
+                width: player.width - inset * 2,
+                height: player.height - inset * 2
+            };
+            if (this.checkCollision(cellBounds, playerBounds)) {
+                return true;
+            }
+        }
+
+        for (const blocker of this.npcBlockersLive(mapId)) {
+            if (exclude?.kind === "npc" && exclude.id === blocker.id) {
+                continue;
+            }
+            const blockerBounds = { x: blocker.x + inset, y: blocker.y + inset, width: 32 - inset * 2, height: 32 - inset * 2 };
+            if (this.checkCollision(cellBounds, blockerBounds)) {
+                return true;
+            }
+        }
+
+        for (const follower of this.followerSimulation?.snapshotForMap(mapId) ?? []) {
+            if (follower.hidden) {
+                continue;
+            }
+            if (exclude?.kind === "follower" && exclude.id === follower.ownerId) {
+                continue;
+            }
+            if (
+                (follower.x === cellX && follower.y === cellY) ||
+                (follower.toX === cellX && follower.toY === cellY)
+            ) {
+                return true;
+            }
+        }
+
+        for (const ball of this.beachBalls.snapshotForMap(mapId)) {
+            if (ball.deflated) {
+                continue;
+            }
+            if (exclude?.kind === "ball" && exclude.id === ball.id) {
+                continue;
+            }
+            if (
+                (ball.x === cellX && ball.y === cellY) ||
+                (ball.toX === cellX && ball.toY === cellY)
+            ) {
+                return true;
+            }
+        }
+
         return false;
     }
 
@@ -743,55 +862,209 @@ export default class World {
             height: pusher.height - inset * 2
         };
 
+        const body = this.findPushableBodyAt(
+            pusher.currentMapId,
+            targetBounds,
+            pusherBounds,
+            new Set([`player:${pusher.socketId}`])
+        );
+
+        if (!body) {
+            return false;
+        }
+
+        // The pusher's (secret) push depth caps how many bodies one bump can
+        // displace in a row: depth 2 = pushing A also budges B behind A.
+        return this.shoveBody(pusher.currentMapId, body, dx, dy, Math.max(1, pusher.pushDepth), new Set([`player:${pusher.socketId}`]));
+    }
+
+    /** Delay before a chained pushee re-tries its blocked step: long enough
+     * for the body ahead to have (mostly) vacated the destination cell. */
+    private static readonly CHAIN_RETRY_MS = 230;
+
+    /**
+     * The pushable body whose box overlaps `bounds`, or null. Bodies already
+     * overlapping `sourceBounds` don't count (they are separating). Stationary
+     * NPCs are never returned: they are scenery, not pushable.
+     */
+    private findPushableBodyAt(
+        mapId:string,
+        bounds:{ x:number; y:number; width:number; height:number },
+        sourceBounds:{ x:number; y:number; width:number; height:number } | null,
+        excludeKeys:Set<string>
+    ): PushableBody | null {
+        const inset = 2;
+
         for (const other of Array.from(this.players.values())) {
-            if (other.socketId === pusher.socketId || other.currentMapId !== pusher.currentMapId) {
+            if (other.currentMapId !== mapId || excludeKeys.has(`player:${other.socketId}`)) {
                 continue;
             }
-
             const otherBounds = {
                 x: other.x + inset,
                 y: other.y + inset,
                 width: other.width - inset * 2,
                 height: other.height - inset * 2
             };
-
-            // Already overlapping the pusher: they are separating, not colliding.
-            if (this.checkCollision(pusherBounds, otherBounds)) {
+            if (sourceBounds && this.checkCollision(sourceBounds, otherBounds)) {
                 continue;
             }
-            if (!this.checkCollision(targetBounds, otherBounds)) {
-                continue;
+            if (this.checkCollision(bounds, otherBounds)) {
+                return { kind: "player", player: other };
             }
-
-            return this.shovePlayer(other, dx, dy);
         }
 
-        for (const blocker of this.npcBlockersLive(pusher.currentMapId)) {
+        const follower = this.followerSimulation?.findAt(mapId, bounds);
+
+        if (follower && !excludeKeys.has(`follower:${follower.ownerId}`)) {
+            return { kind: "follower", ownerId: follower.ownerId };
+        }
+
+        const ball = this.beachBalls.findAt(mapId, bounds);
+
+        if (ball && !excludeKeys.has(`ball:${ball.id}`)) {
+            return { kind: "ball", id: ball.id };
+        }
+
+        for (const blocker of this.npcBlockersLive(mapId)) {
+            if (excludeKeys.has(`npc:${blocker.id}`)) {
+                continue;
+            }
             const blockerBounds = {
                 x: blocker.x + inset,
                 y: blocker.y + inset,
                 width: 32 - inset * 2,
                 height: 32 - inset * 2
             };
-
-            if (this.checkCollision(pusherBounds, blockerBounds)) {
+            if (sourceBounds && this.checkCollision(sourceBounds, blockerBounds)) {
                 continue;
             }
-            if (!this.checkCollision(targetBounds, blockerBounds)) {
+            if (!this.checkCollision(bounds, blockerBounds)) {
                 continue;
             }
             // Only NPCs the simulation actually walks can be pushed; shop
             // keepers and scenery events stay exactly where they were authored.
-            if (this.npcSimulation?.shove(pusher.currentMapId, blocker.id, dx, dy)) {
-                return true;
+            if (this.npcSimulation?.liveStateOf(mapId, blocker.id)) {
+                return { kind: "npc", id: blocker.id };
             }
         }
 
-        return false;
+        return null;
     }
 
-    /** One-cell displacement of a pushed player, walked rather than teleported. */
-    private shovePlayer(pushee:Player, dx:number, dy:number): boolean {
+    private bodyKey(body:PushableBody): string {
+        switch (body.kind) {
+            case "player":
+                return `player:${body.player.socketId}`;
+            case "npc":
+                return `npc:${body.id}`;
+            case "follower":
+                return `follower:${body.ownerId}`;
+            case "ball":
+                return `ball:${body.id}`;
+        }
+    }
+
+    /**
+     * Displaces a pushable body one cell, chaining through whatever pushable
+     * body blocks ITS destination while `depth` allows. Chains resolve
+     * back-to-front: the far body starts vacating now, and the near body
+     * re-tries its own displacement after CHAIN_RETRY_MS, when the cell ahead
+     * has cleared. `visited` breaks cycles (a ring of bodies pushing itself).
+     */
+    private shoveBody(
+        mapId:string,
+        body:PushableBody,
+        dx:number,
+        dy:number,
+        depth:number,
+        visited:Set<string>
+    ): boolean {
+        const key = this.bodyKey(body);
+
+        if (visited.has(key)) {
+            return false;
+        }
+        visited.add(key);
+
+        if (body.kind === "player") {
+            return this.shovePlayerChained(body.player, dx, dy, depth, visited);
+        }
+
+        const attempt = () => {
+            switch (body.kind) {
+                case "npc":
+                    return this.npcSimulation?.shove(mapId, body.id, dx, dy) ?? false;
+                case "follower":
+                    return this.followerSimulation?.shove(mapId, body.ownerId, dx, dy) ?? false;
+                case "ball":
+                    return this.beachBalls.shove(mapId, body.id, dx, dy);
+            }
+            return false;
+        };
+
+        if (attempt()) {
+            return true;
+        }
+
+        if (depth <= 1) {
+            return false;
+        }
+
+        // The destination may be blocked by another pushable body: shove that
+        // one along first, then repeat this displacement once it has moved.
+        const cell = this.cellOfBody(mapId, body);
+
+        if (!cell) {
+            return false;
+        }
+
+        const cellSize = this.getMapCellSize(mapId);
+        const inset = 2;
+        const destBounds = {
+            x: (cell.x + dx) * cellSize + inset,
+            y: (cell.y + dy) * cellSize + inset,
+            width: cellSize - inset * 2,
+            height: cellSize - inset * 2
+        };
+        const blocker = this.findPushableBodyAt(mapId, destBounds, null, visited);
+
+        if (!blocker || !this.shoveBody(mapId, blocker, dx, dy, depth - 1, visited)) {
+            return false;
+        }
+
+        setTimeout(() => {
+            attempt();
+        }, World.CHAIN_RETRY_MS);
+
+        return true;
+    }
+
+    private cellOfBody(mapId:string, body:PushableBody): { x:number; y:number } | null {
+        switch (body.kind) {
+            case "player": {
+                const cellSize = this.getMapCellSize(mapId);
+                return body.player.getCurrentCell(cellSize);
+            }
+            case "npc":
+                return this.npcSimulation?.cellOf(mapId, body.id) ?? null;
+            case "follower": {
+                const actor = this.followerSimulation?.getActor(body.ownerId);
+                return actor ? { x: actor.moving ? actor.toX : actor.cellX, y: actor.moving ? actor.toY : actor.cellY } : null;
+            }
+            case "ball": {
+                const ball = this.beachBalls.getBall(body.id);
+                return ball ? { x: ball.moving ? ball.toX : ball.cellX, y: ball.moving ? ball.toY : ball.cellY } : null;
+            }
+        }
+    }
+
+    /**
+     * One-cell displacement of a pushed player, walked rather than teleported.
+     * When the destination is held by another pushable body and `depth`
+     * allows, that body is shoved first and this player's walk starts after
+     * CHAIN_RETRY_MS — push-over-push.
+     */
+    private shovePlayerChained(pushee:Player, dx:number, dy:number, depth:number, visited:Set<string>): boolean {
         const now = Date.now();
 
         if (now < pushee.shoveCooldownUntil) {
@@ -808,10 +1081,6 @@ export default class World {
         const destinationX = pushee.x + dx * cellSize;
         const destinationY = pushee.y + dy * cellSize;
 
-        if (this.isRectBlockedForPlayer(pushee, destinationX, destinationY, pushee.width, pushee.height)) {
-            return false;
-        }
-
         const bounds = this.getMapBounds(pushee.currentMapId);
 
         if (
@@ -823,13 +1092,61 @@ export default class World {
             return false;
         }
 
-        pushee.shoveCooldownUntil = now + World.SHOVE_COOLDOWN_MS;
-        // Hand the destination to the pushee's own movement tick instead of
-        // teleporting: it re-runs collision per node, fires touch/portal
-        // handling on arrival, and reaches clients as an ordinary walk that
-        // the interpolation buffer glides through.
-        pushee.stopMovement();
-        pushee.findPath(this, destinationX, destinationY);
+        const displace = () => {
+            pushee.shoveCooldownUntil = Date.now() + World.SHOVE_COOLDOWN_MS;
+            // Hand the destination to the pushee's own movement tick instead of
+            // teleporting: it re-runs collision per node, fires touch/portal
+            // handling on arrival, and reaches clients as an ordinary walk that
+            // the interpolation buffer glides through.
+            pushee.stopMovement();
+            pushee.findPath(this, destinationX, destinationY);
+        };
+
+        if (!this.isRectBlockedForPlayer(pushee, destinationX, destinationY, pushee.width, pushee.height)) {
+            displace();
+            return true;
+        }
+
+        if (depth <= 1) {
+            return false;
+        }
+
+        const inset = 2;
+        const destBounds = {
+            x: destinationX + inset,
+            y: destinationY + inset,
+            width: pushee.width - inset * 2,
+            height: pushee.height - inset * 2
+        };
+        const pusheeBounds = {
+            x: pushee.x + inset,
+            y: pushee.y + inset,
+            width: pushee.width - inset * 2,
+            height: pushee.height - inset * 2
+        };
+        const blocker = this.findPushableBodyAt(pushee.currentMapId, destBounds, pusheeBounds, visited);
+
+        if (!blocker || !this.shoveBody(pushee.currentMapId, blocker, dx, dy, depth - 1, visited)) {
+            return false;
+        }
+
+        // Reserve the pushee now so a held key can't start a second chain
+        // while this one plays out; the delayed walk re-validates everything.
+        pushee.shoveCooldownUntil = now + World.SHOVE_COOLDOWN_MS + World.CHAIN_RETRY_MS;
+        const mapIdAtChain = pushee.currentMapId;
+
+        setTimeout(() => {
+            if (
+                pushee.currentMapId !== mapIdAtChain ||
+                pushee.inBattle ||
+                this.isEventMovementLocked(pushee) ||
+                this.isRectBlockedForPlayer(pushee, destinationX, destinationY, pushee.width, pushee.height)
+            ) {
+                return;
+            }
+            displace();
+        }, World.CHAIN_RETRY_MS);
+
         return true;
     }
 
@@ -1369,6 +1686,7 @@ export default class World {
         if (player.isSurfing && !isSurfableWaterTag(this.getPlayerTerrainTag(player))) {
             this.setSurfing(player, false);
         }
+        this.followerSimulation?.onOwnerStep(player);
         this.battleManager?.handlePlayerStep(player);
         this.battleManager?.handleEggStep(player);
         void this.handleGroundItemPickup(player);
@@ -1744,6 +2062,30 @@ export default class World {
         // current tiles: without this it would render them on their authored
         // tiles until the next step packet, which for an idling NPC is never.
         this.presentNpcActorsTo(socketId, mapId);
+        this.presentFollowersTo(socketId, mapId);
+        this.presentBeachBallsTo(socketId, mapId);
+    }
+
+    /** Sends the full follower state of a map to one socket. */
+    presentFollowersTo(socketId:string, mapId:string) {
+        const followers = this.followerSimulation?.snapshotForMap(mapId) ?? [];
+
+        if (followers.length === 0) {
+            return;
+        }
+
+        World.socketServer.in(socketId).emit("follower:sync", { mapId, t: Date.now(), followers });
+    }
+
+    /** Sends the live beach balls of a map to one socket. */
+    presentBeachBallsTo(socketId:string, mapId:string) {
+        const balls = this.beachBalls.snapshotForMap(mapId);
+
+        if (balls.length === 0) {
+            return;
+        }
+
+        World.socketServer.in(socketId).emit("ball:sync", { mapId, t: Date.now(), balls });
     }
 
     /** Sends the full NPC actor state of a map to one socket. */
@@ -1806,6 +2148,8 @@ export default class World {
                 World.socketServer.in(socketId).emit("world:item-dropped", item);
             }
         });
+        this.presentFollowersTo(socketId, mapId);
+        this.presentBeachBallsTo(socketId, mapId);
     }
 
     /**
@@ -1920,6 +2264,7 @@ export default class World {
         }
         World.socketServer.emit("removePlayer", { playerId: player.socketId, id: player.id });
         this.players.delete(player.socketId);
+        this.followerSimulation?.removeFor(player.socketId);
         return true;
     }
 
@@ -1944,6 +2289,7 @@ export default class World {
 
         World.socketServer.emit("removePlayer", {playerId: player.socketId, id:player.id})
         this.players.delete(playerId);
+        this.followerSimulation?.removeFor(playerId);
 
         return { player, removed: true };
     }

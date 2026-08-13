@@ -64,6 +64,12 @@ export default class Player {
      * Without it a held movement key would re-issue a push every 28ms tick and
      * the pushed player would never actually get to walk anywhere. */
     shoveCooldownUntil:number = 0;
+    /** Bodies-in-a-row this player can shove (secret stat; admin-tunable,
+     * future item bonuses). 2 = pushing A can displace B standing behind A. */
+    pushDepth:number = 2;
+    /** Whether the party leader walks behind this player (persisted per
+     * character as `follower_enabled`; see FollowerActors). */
+    followerEnabled:boolean = true;
     angle:number;
     life:number;
     death:boolean;
@@ -477,6 +483,9 @@ export default class Player {
         if (wasSurfing) {
             this.world.broadcastSurfState(this);
         }
+
+        // The follower rides along: re-park it behind the player on the new map.
+        this.world.followerSimulation?.onOwnerTeleport(this);
     }
 
     public stopMovement() {

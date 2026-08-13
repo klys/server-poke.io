@@ -27,6 +27,7 @@ import {
 } from "../components/PlayableMapsState";
 import SocialManager from "../components/SocialManager";
 import TradeManager from "../components/TradeManager";
+import { speciesCharsetName } from "../components/generated/speciesDex";
 import { TradeError, type TradeMutationSource } from "../components/trade/tradeTypes";
 import World from "../components/world";
 import MaintenanceRunner, { MAINTENANCE_SERVER_ROOT, type MaintenanceRunRecord } from "../components/MaintenanceRunner";
@@ -1506,6 +1507,15 @@ function createConnectionHandler(
           }
         }
 
+        // The (secret) push depth takes effect immediately when the player is
+        // online; otherwise it loads with the next session.
+        if (typeof result.user.pushDepth === "number") {
+          const player = world.getPlayerByUserId(userId);
+          if (player) {
+            player.pushDepth = result.user.pushDepth;
+          }
+        }
+
         // Tell the player what just happened to their account. Gifts are
         // spelled out per item / per venomon; anything else gets a generic
         // "<admin> updated your ..." notice.
@@ -2512,6 +2522,14 @@ function createConnectionHandler(
         socket.data.characterId = session.user.characterId;
       }
 
+      if (playerRegistration.player && session.user) {
+        // Per-character gameplay knobs that live on the world entity.
+        playerRegistration.player.followerEnabled = session.user.followerEnabled;
+        playerRegistration.player.pushDepth = session.user.pushDepth;
+        // Materialize (or refresh) the follower venomon for this player.
+        world.followerSimulation?.refreshFor(playerRegistration.player);
+      }
+
       if (playerRegistration.player) {
         socket.emit("myPlayer", { playerId: playerRegistration.player.socketId });
         world.presentPlayersTo(socket.id);
@@ -3124,6 +3142,28 @@ function createConnectionHandler(
 
       socket.emit("auth:session", { authenticated: true, user: result.user ?? null });
       socket.emit("auth:info", { message: result.message });
+    });
+
+    socket.on("follower:set-enabled", async (data) => {
+      if (typeof socket.data.userId !== "number") {
+        socket.emit("auth:error", { message: "Log in to change your follower." });
+        return;
+      }
+
+      const enabled = data?.enabled === true;
+      await auth.saveFollowerEnabled(socket.data.userId, enabled);
+
+      const player = world.getPlayerByUserId(socket.data.userId);
+      if (player) {
+        player.followerEnabled = enabled;
+        world.followerSimulation?.refreshFor(player);
+      }
+
+      const session = await auth.resolveSession(socket.data.token);
+      socket.emit("auth:session", session);
+      socket.emit("auth:info", {
+        message: enabled ? "Tu venomon ahora te sigue." : "Tu venomon volvió a su Venoball."
+      });
     });
 
     // Normalizes the batch/legacy id shape ({pokemonIds} or {pokemonId}).
@@ -4089,6 +4129,31 @@ export default function registerSocketHandlers(
   maintenanceMailService = mailService ?? null;
   const eventRuntime = new EventRuntime(io, world, auth);
   const socialManager = new SocialManager(io, world, auth, battleManager, eventRuntime);
+
+  // Follower venomon: resolve the party leader (slot 0) to an overworld
+  // charset. Eggs can't walk and unknown species have no sheet — both mean
+  // "no follower". The resolver is also re-run on every party mutation.
+  world.followerSimulation?.setLeaderResolver(async (player) => {
+    if (typeof player.userId !== "number" || !player.followerEnabled) {
+      return null;
+    }
+    const user = await auth.getUserForBattle(player.userId);
+    const leader = user?.pokemonParty?.[0];
+    if (!leader || leader.isEgg) {
+      return null;
+    }
+    const internalName = (leader.sourcePokemonId ?? "")
+      .replace(/^pokemon-/, "")
+      .toUpperCase();
+    const charset = internalName ? speciesCharsetName(internalName) : null;
+    return charset ? { charset } : null;
+  });
+  auth.setPartyChangedListener((userId) => {
+    const player = world.getPlayerByUserId(userId);
+    if (player) {
+      world.followerSimulation?.refreshFor(player);
+    }
+  });
   const tradeManager = new TradeManager(
     io,
     world,

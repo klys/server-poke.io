@@ -201,6 +201,10 @@ interface AuthUserData {
   visitedTowns: string[];
   /** Palette key for the Trainer Card background. */
   trainerCardColor: string;
+  /** Whether the party leader walks behind the player on the map. */
+  followerEnabled: boolean;
+  /** Secret push-chain depth (bodies-in-a-row one bump can displace). */
+  pushDepth: number;
   role: "admin" | "designer" | "moderator" | "user";
   permissions: Array<"game.access" | "designer.access" | "moderator.access" | "admin.access">;
   inventory: Array<{
@@ -362,6 +366,118 @@ export default interface ServerToClientEvents {
   }) => void;
   /** An NPC turned on the spot (a move route's turn command). */
   "npc:turn": (data: { mapId: string; id: string; facing: number; t: number }) => void;
+
+  /**
+   * Follower venomons (components/FollowerActors.ts): the party leader walks
+   * one tile behind its trainer, server-authoritative like NPC actors. All
+   * coordinates are CELLS. `charset` is the overworld sheet basename under
+   * /migration_exports/characters/ (e.g. "025" -> 025.png, a 4x4 grid).
+   */
+  "follower:steps": (data: {
+    mapId: string;
+    t: number;
+    steps: Array<{
+      ownerId: string;
+      fromX: number;
+      fromY: number;
+      toX: number;
+      toY: number;
+      /** RPG Maker facing: 2 down, 4 left, 6 right, 8 up. */
+      facing: number;
+      stepMs: number;
+    }>;
+  }) => void;
+  /** Full follower state for a map — sent on arrival and as a periodic resync. */
+  "follower:sync": (data: {
+    mapId: string;
+    t: number;
+    followers: Array<{
+      ownerId: string;
+      charset: string;
+      x: number;
+      y: number;
+      toX: number;
+      toY: number;
+      facing: number;
+      stepMs: number;
+      elapsedMs: number;
+      /** True while the owner surfs / is underwater: don't render, not solid. */
+      hidden: boolean;
+    }>;
+  }) => void;
+  /** One follower changed (appeared, species change, hide/show, snap). */
+  "follower:update": (data: {
+    mapId: string;
+    t: number;
+    follower: {
+      ownerId: string;
+      charset: string;
+      x: number;
+      y: number;
+      toX: number;
+      toY: number;
+      facing: number;
+      stepMs: number;
+      elapsedMs: number;
+      hidden: boolean;
+    };
+  }) => void;
+  /** A follower left the map (owner left/teleported, or follower disabled). */
+  "follower:remove": (data: { mapId: string; ownerId: string }) => void;
+
+  /**
+   * Beach balls (components/BeachBalls.ts): pushable /pelota map entities.
+   * Coordinates are CELLS; the sprite is /objects/BeachBall.png (a 7-frame
+   * 32x32 strip: 2 rolling frames + 5 deflate frames).
+   */
+  "ball:spawn": (data: {
+    mapId: string;
+    t: number;
+    ball: {
+      id: string;
+      mapId: string;
+      x: number;
+      y: number;
+      toX: number;
+      toY: number;
+      stepMs: number;
+      elapsedMs: number;
+      pushesLeft: number;
+      deflated: boolean;
+    };
+  }) => void;
+  /** Live balls of a map — sent on arrival. */
+  "ball:sync": (data: {
+    mapId: string;
+    t: number;
+    balls: Array<{
+      id: string;
+      mapId: string;
+      x: number;
+      y: number;
+      toX: number;
+      toY: number;
+      stepMs: number;
+      elapsedMs: number;
+      pushesLeft: number;
+      deflated: boolean;
+    }>;
+  }) => void;
+  /** The ball was kicked one cell. */
+  "ball:step": (data: {
+    mapId: string;
+    t: number;
+    id: string;
+    fromX: number;
+    fromY: number;
+    toX: number;
+    toY: number;
+    stepMs: number;
+    pushesLeft: number;
+  }) => void;
+  /** The ball ran out of pushes (or a second ball spawned): play the deflate
+   * animation, then remove it. */
+  "ball:deflate": (data: { mapId: string; t: number; id: string }) => void;
   // Teaching an MO/MT to a Venomon that already knows four moves: the client
   // must ask which move to replace, then re-send inventory:teach-move with it.
   "inventory:teach-replace-needed": (data: {
@@ -590,6 +706,7 @@ export default interface ServerToClientEvents {
       characterRecoveryDays: number;
       skinChangePrice: number;
       startingMoney: number;
+      allowMultipleBeachBalls: boolean;
     };
     defaults: {
       maxCharactersPerAccount: number;
@@ -597,6 +714,7 @@ export default interface ServerToClientEvents {
       characterRecoveryDays: number;
       skinChangePrice: number;
       startingMoney: number;
+      allowMultipleBeachBalls: boolean;
     };
   }) => void;
   "admin:apikeys:list": (data: { keys: ApiKeySummary[] }) => void;

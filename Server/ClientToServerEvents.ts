@@ -146,6 +146,12 @@ export default interface ClientToServerEvents {
   "pokemon:reorder": (data: { order: string[] }) => void;
 
   /**
+   * Toggles the follower venomon (the party leader walking behind the player
+   * on the map). Persisted per character; echoed back via `auth:session`.
+   */
+  "follower:set-enabled": (data: { enabled: boolean }) => void;
+
+  /**
    * Stats-window move management (outside battles): learn a move available at
    * the venomon's current level (learnset or a missed battle prompt),
    * optionally replacing a known move, or forget a known move.
@@ -438,6 +444,7 @@ export default interface ClientToServerEvents {
     characterRecoveryDays?: number;
     skinChangePrice?: number;
     startingMoney?: number;
+    allowMultipleBeachBalls?: boolean;
   }) => void;
   "admin:role:update": (data: {
     roleKey: UserRoleKey;
