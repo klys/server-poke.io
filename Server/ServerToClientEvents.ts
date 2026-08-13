@@ -319,6 +319,49 @@ export default interface ServerToClientEvents {
   }) => void;
   // A Strength boulder moved to a new cell (all clients on the map re-render it).
   "world:boulder-moved": (data: { mapId: string; boulderId: string; x: number; y: number }) => void;
+
+  /**
+   * NPC movement is server-authoritative (components/NpcActors.ts). Clients
+   * never simulate a walk: they interpolate the steps they are told about, so
+   * every player on a map sees an NPC on the same tile. All coordinates are
+   * CELLS, not pixels.
+   *
+   * Batched: one packet per map per simulation tick, not one per NPC.
+   */
+  "npc:steps": (data: {
+    mapId: string;
+    /** Server clock at emit time, for step-spacing on the client. */
+    t: number;
+    steps: Array<{
+      id: string;
+      fromX: number;
+      fromY: number;
+      toX: number;
+      toY: number;
+      /** RPG Maker facing: 2 down, 4 left, 6 right, 8 up. */
+      facing: number;
+      /** How long the step takes; the client glides over exactly this long. */
+      stepMs: number;
+    }>;
+  }) => void;
+  /** Full actor state for a map — sent on arrival and as a periodic resync. */
+  "npc:sync": (data: {
+    mapId: string;
+    t: number;
+    npcs: Array<{
+      id: string;
+      x: number;
+      y: number;
+      toX: number;
+      toY: number;
+      facing: number;
+      stepMs: number;
+      /** Milliseconds already elapsed of the step in progress (0 when idle). */
+      elapsedMs: number;
+    }>;
+  }) => void;
+  /** An NPC turned on the spot (a move route's turn command). */
+  "npc:turn": (data: { mapId: string; id: string; facing: number; t: number }) => void;
   // Teaching an MO/MT to a Venomon that already knows four moves: the client
   // must ask which move to replace, then re-send inventory:teach-move with it.
   "inventory:teach-replace-needed": (data: {

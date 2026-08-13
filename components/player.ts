@@ -60,7 +60,11 @@ export default class Player {
      * Set on teleport so a held movement key can't immediately bump the
      * paired door at the destination and warp the player straight back. */
     touchLockUntil:number = 0;
-    angle:number; 
+    /** Earliest time this player may be shoved again (see World.shovePastObstacle).
+     * Without it a held movement key would re-issue a push every 28ms tick and
+     * the pushed player would never actually get to walk anywhere. */
+    shoveCooldownUntil:number = 0;
+    angle:number;
     life:number;
     death:boolean;
     waitTime:number;
@@ -276,6 +280,12 @@ export default class Player {
                 nextY = canSlideX ? this.y : toY;
                 advancePath = false; // keep aiming at the same node next tick
             } else {
+                // Walking into a body shoves it along instead of dead-stopping
+                // against it: players push players, and players push wandering
+                // NPCs. The step itself still fails this tick — the tile only
+                // frees up once the shoved body has walked off it, and the
+                // client's drive loop re-issues the move 150ms later.
+                this.world.shovePastObstacle(this, toX, toY);
                 // Fully blocked: still TURN toward the obstacle so the player
                 // can face walls/NPCs (and interact with what's in front).
                 const blockedDirection = GameMath.point_direction(this.x, this.y, toX, toY) + 180;

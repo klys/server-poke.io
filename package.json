@@ -18,6 +18,7 @@
     "dev": "ts-node index.ts",
     "postinstall": "npm run build",
     "test:progression": "ts-node tools/testEssentialsProgression.ts",
+    "test:npc-movement": "ts-node tools/testNpcMovement.ts",
     "report:migration": "ts-node tools/essentialsMigrationReport.ts"
   },
   "devDependencies": {

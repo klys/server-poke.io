@@ -18,18 +18,27 @@ npm run build        # tsc; the only universal check — run after every change
 
 ```bash
 npm run test:progression      # ts-node tools/testEssentialsProgression.ts
+npm run test:npc-movement     # ts-node tools/testNpcMovement.ts
 ```
 
-Covers RMXP/Essentials semantics: event page selection, script switches,
-command-tree parsing, portal gating, teleport validation. Run it whenever you
-touch `components/eventPageSelection.ts`, `essentialsScriptAdapters.ts`, or
-`EventRuntime.ts` command parsing.
+`test:progression` covers RMXP/Essentials semantics: event page selection,
+script switches, command-tree parsing, portal gating, teleport validation. Run
+it whenever you touch `components/eventPageSelection.ts`,
+`essentialsScriptAdapters.ts`, or `EventRuntime.ts` command parsing.
+
+`test:npc-movement` drives the real `World` / `Player` /
+`NpcActorSimulation` against a synthetic map (no Redis, no sockets): NPC
+actors step one cell at a time, never enter walls or a player's tile, A*
+around a player parked on a route waypoint, and the shove mechanic displaces
+both players and NPCs (and refuses to push anyone into a wall). Run it for
+changes to `components/NpcActors.ts`, `components/gridPath.ts`, the shove path
+in `world.ts`, or `Player.stepAlongPath`. Takes ~25s (it waits on real timers).
 
 ## 3. E2E socket drivers (real server + real Redis)
 
 Drivers in `tools/`: `e2e-trade.ts`, `e2e-field-skills.ts`,
 `e2e-water-actions.ts`, `e2e-teach-machines.ts`, `e2e-hidden-venomon-gift.ts`,
-`e2e-account-character.ts`, `e2e-chat.ts`.
+`e2e-account-character.ts`, `e2e-chat.ts`, `e2e-npc-movement.ts`.
 Each spawns its OWN server process on a custom port (e.g. 3997) and asserts
 against authoritative Redis state, not socket payloads.
 
@@ -59,6 +68,7 @@ Before running, check the constants block at the top of the driver:
 | Trade | build + `e2e-trade.ts` |
 | Field moves / water / TMs / gift events | build + the matching `e2e-*.ts` |
 | Chat / friends / blocks / accounts | build + `e2e-chat.ts` + `e2e-account-character.ts` |
+| NPC movement / pathfinding / pushing | build + `npm run test:npc-movement` + `e2e-npc-movement.ts` |
 | Socket contract shape | build here AND `npm run build` in the client repo (see root `contract-sync` skill) |
 | Client-visible behavior | `client-poke.io:verify` skill (headless Chrome) |
 

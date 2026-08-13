@@ -22,6 +22,7 @@ import {
     type PageSelectionOptions
 } from "./eventPageSelection";
 import { logUnsupportedScript } from "./essentialsScriptAdapters";
+import NpcActorSimulation from "./NpcActors";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -37,6 +38,22 @@ type MapObstacle = {
 type MapBounds = {
     width:number;
     height:number;
+};
+
+/**
+ * An NPC as the collision/touch/sight layers see it. `x`/`y` are pixels —
+ * the authored tile for a stationary NPC, or the live interpolated position
+ * for one the actor simulation is walking. `facing` is non-null only while
+ * an actor owns the NPC.
+ */
+type NpcBlocker = {
+    id:string;
+    x:number;
+    y:number;
+    name:string | null;
+    sightRange:number;
+    facing:number | null;
+    essentials:EssentialsEventRecord | null;
 };
 //pf = require("pathfinding");
 
@@ -62,7 +79,14 @@ export default class World {
     battleManager: BattleManager | null;
     groundItems: Map<string, GroundItem>;
     /** Per-snapshot cache of NPC collision rectangles by map. */
-    private npcBlockerCache = new WeakMap<object, Map<string, Array<{ id:string; x:number; y:number; name:string | null; sightRange:number; essentials:EssentialsEventRecord | null }>>>();
+    private npcBlockerCache = new WeakMap<object, Map<string, Array<NpcBlocker>>>();
+    /** Server-authoritative movement for NPCs that walk (see NpcActors.ts). */
+    npcSimulation: NpcActorSimulation | null = null;
+    /** Short-lived overlay of live NPC positions; see `npcBlockersLive`. */
+    private liveNpcBlockerCache = new Map<string, { at:number; blockers:Array<NpcBlocker> }>();
+    private static readonly LIVE_NPC_BLOCKER_TTL_MS = 25;
+    /** Minimum gap between two shoves of the same player (see shovePlayer). */
+    private static readonly SHOVE_COOLDOWN_MS = 250;
     /** Fires trigger-1/2 (touch) events; wired to the event runtime. The
      * optional third argument is the tile a sight-spotted player must be
      * returned to when the event ends still armed (locked quest gates). */
@@ -106,6 +130,9 @@ export default class World {
         //setInterval(this.moveIn.bind(this), 1)
         setInterval(this.livingProjectil.bind(this), 100)
         setInterval(this.playerWaiting.bind(this),1000)
+
+        this.npcSimulation = new NpcActorSimulation(this);
+        this.npcSimulation.start();
     }
 
     async initializeGroundItems(groundItemStore: GroundItemStore) {
@@ -649,7 +676,7 @@ export default class World {
             }
         }
 
-        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
+        for (const blocker of this.npcBlockersLive(player.currentMapId)) {
             const blockerBounds = { x: blocker.x + inset, y: blocker.y + inset, width: 32 - inset * 2, height: 32 - inset * 2 };
             if (this.checkCollision(currentBounds, blockerBounds)) {
                 continue; // standing on it (e.g. arrived through a door): walk off freely
@@ -671,6 +698,139 @@ export default class World {
         }
 
         return false;
+    }
+
+    /**
+     * Displaces whatever is blocking a step one cell further along, so bodies
+     * shoulder past each other instead of deadlocking: a player walking into
+     * another player pushes them, and a player walking into a wandering NPC
+     * pushes it too. Static scenery, walls and stationary NPCs never move.
+     *
+     * The push only lands when the destination cell is itself free — pushing
+     * someone into a wall would either clip them through it or trap both
+     * bodies, so in that case the pusher just stops, as before.
+     *
+     * Returns true when something was displaced.
+     */
+    shovePastObstacle(pusher:Player, targetX:number, targetY:number): boolean {
+        // Shoves are cardinal: resolve the attempted step to its dominant axis
+        // so a diagonal walk pushes along one axis rather than into a corner.
+        const deltaX = targetX - pusher.x;
+        const deltaY = targetY - pusher.y;
+
+        if (deltaX === 0 && deltaY === 0) {
+            return false;
+        }
+
+        const dx = Math.abs(deltaX) >= Math.abs(deltaY) ? Math.sign(deltaX) : 0;
+        const dy = dx === 0 ? Math.sign(deltaY) : 0;
+
+        if (dx === 0 && dy === 0) {
+            return false;
+        }
+
+        const inset = 2;
+        const targetBounds = {
+            x: targetX + inset,
+            y: targetY + inset,
+            width: pusher.width - inset * 2,
+            height: pusher.height - inset * 2
+        };
+        const pusherBounds = {
+            x: pusher.x + inset,
+            y: pusher.y + inset,
+            width: pusher.width - inset * 2,
+            height: pusher.height - inset * 2
+        };
+
+        for (const other of Array.from(this.players.values())) {
+            if (other.socketId === pusher.socketId || other.currentMapId !== pusher.currentMapId) {
+                continue;
+            }
+
+            const otherBounds = {
+                x: other.x + inset,
+                y: other.y + inset,
+                width: other.width - inset * 2,
+                height: other.height - inset * 2
+            };
+
+            // Already overlapping the pusher: they are separating, not colliding.
+            if (this.checkCollision(pusherBounds, otherBounds)) {
+                continue;
+            }
+            if (!this.checkCollision(targetBounds, otherBounds)) {
+                continue;
+            }
+
+            return this.shovePlayer(other, dx, dy);
+        }
+
+        for (const blocker of this.npcBlockersLive(pusher.currentMapId)) {
+            const blockerBounds = {
+                x: blocker.x + inset,
+                y: blocker.y + inset,
+                width: 32 - inset * 2,
+                height: 32 - inset * 2
+            };
+
+            if (this.checkCollision(pusherBounds, blockerBounds)) {
+                continue;
+            }
+            if (!this.checkCollision(targetBounds, blockerBounds)) {
+                continue;
+            }
+            // Only NPCs the simulation actually walks can be pushed; shop
+            // keepers and scenery events stay exactly where they were authored.
+            if (this.npcSimulation?.shove(pusher.currentMapId, blocker.id, dx, dy)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /** One-cell displacement of a pushed player, walked rather than teleported. */
+    private shovePlayer(pushee:Player, dx:number, dy:number): boolean {
+        const now = Date.now();
+
+        if (now < pushee.shoveCooldownUntil) {
+            return false;
+        }
+        // Never yank someone out of a battle or a running cutscene: their
+        // movement is frozen there, so the push would silently do nothing or
+        // desync them from the event they are in.
+        if (pushee.inBattle || this.isEventMovementLocked(pushee)) {
+            return false;
+        }
+
+        const cellSize = this.getMapCellSize(pushee.currentMapId);
+        const destinationX = pushee.x + dx * cellSize;
+        const destinationY = pushee.y + dy * cellSize;
+
+        if (this.isRectBlockedForPlayer(pushee, destinationX, destinationY, pushee.width, pushee.height)) {
+            return false;
+        }
+
+        const bounds = this.getMapBounds(pushee.currentMapId);
+
+        if (
+            destinationX < 0 ||
+            destinationY < 0 ||
+            destinationX + pushee.width > bounds.width ||
+            destinationY + pushee.height > bounds.height
+        ) {
+            return false;
+        }
+
+        pushee.shoveCooldownUntil = now + World.SHOVE_COOLDOWN_MS;
+        // Hand the destination to the pushee's own movement tick instead of
+        // teleporting: it re-runs collision per node, fires touch/portal
+        // handling on arrival, and reaches clients as an ordinary walk that
+        // the interpolation buffer glides through.
+        pushee.stopMovement();
+        pushee.findPath(this, destinationX, destinationY);
+        return true;
     }
 
     /**
@@ -822,7 +982,7 @@ export default class World {
 
         const inset = 2;
         const bounds = { x: x + inset, y: y + inset, width: player.width - inset * 2, height: player.height - inset * 2 };
-        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
+        for (const blocker of this.npcBlockersLive(player.currentMapId)) {
             if (!blocker.essentials) {
                 continue;
             }
@@ -892,8 +1052,15 @@ export default class World {
             return;
         }
 
-        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
-            if (!blocker.essentials || blocker.x !== cellX * 32 || blocker.y !== cellY * 32) {
+        for (const blocker of this.npcBlockersLive(player.currentMapId)) {
+            // Rounded, not exact: a walking NPC sits between two tiles for most
+            // of its step, and its touch trigger belongs to the tile it is
+            // closest to rather than nowhere at all.
+            if (
+                !blocker.essentials ||
+                Math.round(blocker.x / 32) !== cellX ||
+                Math.round(blocker.y / 32) !== cellY
+            ) {
                 continue;
             }
             const page = selectConditionMetPage(
@@ -934,12 +1101,12 @@ export default class World {
         }
         const playerCellX = Math.floor((player.x + player.width / 2) / 32);
         const playerCellY = Math.floor((player.y + player.height / 2) / 32);
-        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
+        for (const blocker of this.npcBlockersLive(player.currentMapId)) {
             if (blocker.sightRange <= 0 || !blocker.essentials) {
                 continue;
             }
-            const eventCellX = blocker.x / 32;
-            const eventCellY = blocker.y / 32;
+            const eventCellX = Math.round(blocker.x / 32);
+            const eventCellY = Math.round(blocker.y / 32);
             // Cheap pre-filter before touching page selection.
             if (
                 Math.abs(playerCellX - eventCellX) > blocker.sightRange + 1 ||
@@ -955,7 +1122,9 @@ export default class World {
             if (!page || (page.trigger !== 1 && page.trigger !== 2)) {
                 continue;
             }
-            const direction = page.graphic?.direction;
+            // A walking trainer looks where it is walking, so its sight cone
+            // follows the actor's live facing rather than the authored one.
+            const direction = blocker.facing ?? page.graphic?.direction;
             const dx = direction === 6 ? 1 : direction === 4 ? -1 : 0;
             const dy = direction === 2 ? 1 : direction === 8 ? -1 : 0;
             if (dx === 0 && dy === 0) {
@@ -1076,8 +1245,8 @@ export default class World {
         if (this.isRectBlockedByCollisionGrid(player.currentMapId, x, y, size, size, player.isSurfing)) {
             return true;
         }
-        for (const blocker of this.getNpcBlockers(player.currentMapId)) {
-            if (blocker.x !== cellX * 32 || blocker.y !== cellY * 32) {
+        for (const blocker of this.npcBlockersLive(player.currentMapId)) {
+            if (Math.round(blocker.x / 32) !== cellX || Math.round(blocker.y / 32) !== cellY) {
                 continue;
             }
             if (!blocker.essentials) {
@@ -1095,10 +1264,49 @@ export default class World {
         return false;
     }
 
+    /**
+     * NPC blockers with the live positions of any that are walking. The static
+     * `getNpcBlockers` cache still supplies identity and page data; only x/y
+     * (and the facing an actor is actually walking in) are overlaid.
+     *
+     * Memoized for a fraction of the simulation tick because this sits on the
+     * 28ms-per-player movement path: without it every player would rebuild the
+     * whole list ~36 times a second.
+     */
+    private npcBlockersLive(mapId:string) {
+        const base = this.getNpcBlockers(mapId);
+
+        if (!this.npcSimulation?.hasActors(mapId)) {
+            return base;
+        }
+
+        const now = Date.now();
+        const cached = this.liveNpcBlockerCache.get(mapId);
+
+        if (cached && now - cached.at < World.LIVE_NPC_BLOCKER_TTL_MS) {
+            return cached.blockers;
+        }
+
+        const blockers = base.map((blocker) => {
+            const live = this.npcSimulation?.liveStateOf(mapId, blocker.id);
+            return live
+                ? { ...blocker, x: live.x, y: live.y, facing: live.facing }
+                : blocker;
+        });
+
+        this.liveNpcBlockerCache.set(mapId, { at: now, blockers });
+        return blockers;
+    }
+
+    /** The NPC actor simulation's view of static blockers (public for it). */
+    npcBlockersOnMap(mapId:string) {
+        return this.getNpcBlockers(mapId);
+    }
+
     private getNpcBlockers(mapId:string) {
         const state = this.playableMapsState;
         if (!state) {
-            return [] as Array<{ id:string; x:number; y:number; name:string | null; sightRange:number; essentials:EssentialsEventRecord | null }>;
+            return [] as Array<NpcBlocker>;
         }
 
         let byMap = this.npcBlockerCache.get(state);
@@ -1131,10 +1339,11 @@ export default class World {
                         y: placement.y * 32,
                         name,
                         sightRange,
+                        facing: null,
                         essentials: placement.essentialsEvent
                     });
                 } else if (placement.previewImageSrc) {
-                    blockers.push({ id: placement.id, x: placement.x * 32, y: placement.y * 32, name, sightRange: 0, essentials: null });
+                    blockers.push({ id: placement.id, x: placement.x * 32, y: placement.y * 32, name, sightRange: 0, facing: null, essentials: null });
                 }
             }
             byMap.set(mapId, blockers);
@@ -1145,6 +1354,10 @@ export default class World {
 
     setPlayableMapsState(playableMapsState: PlayableMapsStateSnapshot) {
         this.playableMapsState = playableMapsState;
+        // Placements (and their move routes) may have changed; drop the actors
+        // and the live-position overlay so both rebuild from the new payload.
+        this.npcSimulation?.reset();
+        this.liveNpcBlockerCache.clear();
     }
 
     setBattleManager(battleManager: BattleManager) {
@@ -1526,6 +1739,22 @@ export default class World {
 
             World.socketServer.in(socketId).emit("addPlayer", player.data());
         });
+
+        // Arriving on a map is exactly when a client needs the walking NPCs'
+        // current tiles: without this it would render them on their authored
+        // tiles until the next step packet, which for an idling NPC is never.
+        this.presentNpcActorsTo(socketId, mapId);
+    }
+
+    /** Sends the full NPC actor state of a map to one socket. */
+    presentNpcActorsTo(socketId:string, mapId:string) {
+        const npcs = this.npcSimulation?.snapshotForMap(mapId) ?? [];
+
+        if (npcs.length === 0) {
+            return;
+        }
+
+        World.socketServer.in(socketId).emit("npc:sync", { mapId, t: Date.now(), npcs });
     }
 
     /**

@@ -33,12 +33,31 @@ export type EventPageConditions = {
   variable?: { id: number; value: number };
 };
 
+/**
+ * The RPG Maker autonomous-movement block, as persisted by
+ * `tools/repairEssentialsEvents.ts`. `type` is the RMXP move_type: 0 fixed,
+ * 1 random, 2 approach, 3 custom route. Everything except `through` used to
+ * be invisible to the server; the NPC actor simulation drives movement from
+ * it now, so it is typed here rather than re-cast at each use.
+ */
+export type EssentialsEventMove = {
+  type?: number;
+  speed?: number;
+  frequency?: number;
+  route?: { list?: Array<{ code: number; parameters?: unknown[] }>; repeat?: boolean } | null;
+  directionFix?: boolean;
+  through?: boolean;
+  walkAnime?: boolean;
+  stepAnime?: boolean;
+  alwaysOnTop?: boolean;
+};
+
 export type EssentialsEventPage = {
   conditions: EventPageConditions;
   graphic: { characterName: string; direction: number; pattern: number };
   trigger: number;
   commands: Array<{ code: number; indent: number; parameters: unknown[] }>;
-  move?: { through?: boolean };
+  move?: EssentialsEventMove;
 };
 
 export type EssentialsEventRecord = {
