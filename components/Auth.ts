@@ -9,6 +9,12 @@ import {
     type PokemonStatBonuses
 } from "./LevelingCurve";
 import MailService from "./MailService";
+import {
+    applyAppearanceToSpritePath,
+    classifyEquipmentSlot,
+    resolveAppearanceEffect,
+    toSpeciesInternalId
+} from "./battle/heldItems";
 
 export const ROLE_PERMISSIONS = [
     "game.access",
@@ -334,8 +340,19 @@ export interface PokemonSummary {
     ivs?:Record<string, number>;
     evs?:Record<string, number>;
     status?:{ id:string; counter:number } | null;
+    /**
+     * Equipment slots. `heldItemId` is the historical single slot and now
+     * means the BONUS slot (passive equip bonuses; Leftovers-style holds).
+     * `battleItem*` is the consumable battle-use slot (berries, Focus Sash);
+     * `appearanceItem*` changes how the venomon looks while equipped.
+     * Legacy berries stored in heldItemId are migrated lazily on sanitize.
+     */
     heldItemId?:string;
     heldItemName?:string;
+    battleItemId?:string;
+    battleItemName?:string;
+    appearanceItemId?:string;
+    appearanceItemName?:string;
     pendingMoveLearns?:string[];
     /**
      * Egg state. An egg is a real (already-rolled) level-1 Pokemon that the
@@ -359,6 +376,53 @@ export interface PokemonSummary {
     ownerCharacterId?:number;
     storedByCharacterId?:number;
     storedAt?:string;
+}
+
+/** Item ids follow "item-<essentialsid>"; recover the Essentials internal id. */
+export function internalIdFromItemId(itemId?:string) {
+    return (itemId ?? "").replace(/^item-/i, "").trim().toUpperCase();
+}
+
+/**
+ * Normalizes the three equipment slots and lazily migrates legacy data: a
+ * consumable (berry-style) item stored in the old single held slot moves to
+ * the battle slot, and a form item moves to the appearance slot. Runs inside
+ * the storage sanitizer, so any load or save heals old records in place.
+ */
+function normalizePokemonEquipmentSlots(
+    pokemon:PokemonSummary
+):Pick<
+    PokemonSummary,
+    "heldItemId" | "heldItemName" | "battleItemId" | "battleItemName" | "appearanceItemId" | "appearanceItemName"
+> {
+    const text = (value:unknown) =>
+        typeof value === "string" && value.trim() !== "" ? value : undefined;
+    let heldItemId = text(pokemon.heldItemId);
+    let heldItemName = text(pokemon.heldItemName);
+    let battleItemId = text(pokemon.battleItemId);
+    let battleItemName = text(pokemon.battleItemName);
+    let appearanceItemId = text(pokemon.appearanceItemId);
+    let appearanceItemName = text(pokemon.appearanceItemName);
+
+    if (heldItemId) {
+        const slot = classifyEquipmentSlot({
+            essentialsId: internalIdFromItemId(heldItemId),
+            speciesInternalId: toSpeciesInternalId(pokemon.sourcePokemonId, pokemon.name)
+        });
+        if (slot === "battle" && !battleItemId) {
+            battleItemId = heldItemId;
+            battleItemName = heldItemName;
+            heldItemId = undefined;
+            heldItemName = undefined;
+        } else if (slot === "appearance" && !appearanceItemId) {
+            appearanceItemId = heldItemId;
+            appearanceItemName = heldItemName;
+            heldItemId = undefined;
+            heldItemName = undefined;
+        }
+    }
+
+    return { heldItemId, heldItemName, battleItemId, battleItemName, appearanceItemId, appearanceItemName };
 }
 
 /** Cosmetic per-box styling the player can customize at the PC. */
@@ -3959,13 +4023,26 @@ export default class Auth {
                 const icons =
                     pokemonIcons.get(pokemon.sourcePokemonId ?? "") ??
                     pokemonIcons.get(pokemon.id);
-                return icons
-                    ? {
-                          ...pokemon,
-                          iconImageSrc: icons.iconImageSrc || pokemon.iconImageSrc,
-                          frontImageSrc: icons.frontImageSrc || pokemon.frontImageSrc
-                      }
-                    : pokemon;
+                const appearance = resolveAppearanceEffect(
+                    internalIdFromItemId(pokemon.appearanceItemId),
+                    toSpeciesInternalId(pokemon.sourcePokemonId, pokemon.name)
+                );
+                const iconImageSrc = icons?.iconImageSrc || pokemon.iconImageSrc;
+                const frontImageSrc = icons?.frontImageSrc || pokemon.frontImageSrc;
+                if (!icons && !appearance) {
+                    return pokemon;
+                }
+                return {
+                    ...pokemon,
+                    iconImageSrc:
+                        appearance && iconImageSrc
+                            ? applyAppearanceToSpritePath(iconImageSrc, appearance, "icon")
+                            : iconImageSrc,
+                    frontImageSrc:
+                        appearance && frontImageSrc
+                            ? applyAppearanceToSpritePath(frontImageSrc, appearance, "front")
+                            : frontImageSrc
+                };
             }),
             createdAt: user.created_at,
             savedLocation
@@ -4260,6 +4337,7 @@ export default class Auth {
             )
             .slice(0, maxLength)
             .map((pokemon) => {
+                const equipment = normalizePokemonEquipmentSlots(pokemon);
                 const moves = pokemon.moves
                     .filter((move): move is string => typeof move === "string")
                     .slice(0, 4);
@@ -4276,6 +4354,7 @@ export default class Auth {
 
                 return {
                     ...pokemon,
+                    ...equipment,
                     sourcePokemonId:
                         typeof pokemon.sourcePokemonId === "string" ? pokemon.sourcePokemonId : undefined,
                     nickname:

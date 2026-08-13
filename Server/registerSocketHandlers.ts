@@ -3061,7 +3061,10 @@ function createConnectionHandler(
       const result = await battleManager.setHeldItem(
         socket.data.userId,
         data.pokemonId,
-        data.itemId
+        data.itemId,
+        data?.slot === "bonus" || data?.slot === "battle" || data?.slot === "appearance"
+          ? data.slot
+          : undefined
       );
 
       if (!result.ok) {
@@ -3402,7 +3405,13 @@ function createConnectionHandler(
 
       if (!guardTradedAssets("inventory:take-held-item", { venomonIds: [data?.pokemonId] })) return;
 
-      const result = await battleManager.takeHeldItem(socket.data.userId, data.pokemonId);
+      const result = await battleManager.takeHeldItem(
+        socket.data.userId,
+        data.pokemonId,
+        data?.slot === "bonus" || data?.slot === "battle" || data?.slot === "appearance"
+          ? data.slot
+          : "bonus"
+      );
 
       if (!result.ok) {
         socket.emit("auth:error", { message: result.message });

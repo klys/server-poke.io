@@ -365,6 +365,11 @@ export interface TradeOfferVenomon {
   moves: string[];
   heldItemId?: string;
   heldItemName?: string;
+  /** Battle-use and appearance equipment slots (transfer with the venomon). */
+  battleItemId?: string;
+  battleItemName?: string;
+  appearanceItemId?: string;
+  appearanceItemName?: string;
   isEgg: boolean;
   iconImageSrc?: string;
   rarity: TradeRarity;

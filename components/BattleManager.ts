@@ -40,8 +40,13 @@ import {
 } from "./battle/fieldItemEffects";
 import { canSpeciesLearnMachineMove } from "./TmCompatibility";
 import {
+  applyAppearanceToSpritePath,
+  classifyEquipmentSlot,
+  resolveAppearanceEffect,
   resolveHeldBonus,
   resolveHeldItemEffect,
+  toSpeciesInternalId,
+  type EquipmentSlot,
   type HeldBonusEffect,
   type HeldItemEffect
 } from "./battle/heldItems";
@@ -331,7 +336,7 @@ type BattlePokemon = {
   baseHappiness: number;
   weightKg: number;
   /** Held item consumed this battle (Recycle) and berry-eaten flag (Belch). */
-  consumedItem: { id: string; name: string } | null;
+  consumedItem: { id: string; name: string; slot: "bonus" | "battle" } | null;
   ateBerry: boolean;
   hp: number;
   maxHp: number;
@@ -349,8 +354,15 @@ type BattlePokemon = {
   stages: BattleStatStages;
   status: StatusState | null;
   volatile: BattleVolatileState;
+  /** Bonus slot (passive equip bonuses; the historical single held slot). */
   heldItemId: string | null;
   heldItemName: string | null;
+  /** Battle-use slot: consumable trigger items (berries, Focus Sash). */
+  battleItemId: string | null;
+  battleItemName: string | null;
+  /** Appearance slot: unlosable in battle, already baked into the sprites. */
+  appearanceItemId: string | null;
+  appearanceItemName: string | null;
   learnset: Array<{ skillId: string; skillName: string; level: number }>;
   evolutions: PokemonEvolutionDefinition[];
   moves: BattleMove[];
@@ -2665,7 +2677,17 @@ export default class BattleManager {
     }
   }
 
-  public async setHeldItem(userId: number, pokemonId: string, itemId: string) {
+  /** Field names on PokemonSummary for each equipment slot. */
+  private static readonly SLOT_FIELDS: Record<
+    EquipmentSlot,
+    { id: "heldItemId" | "battleItemId" | "appearanceItemId"; name: "heldItemName" | "battleItemName" | "appearanceItemName" }
+  > = {
+    bonus: { id: "heldItemId", name: "heldItemName" },
+    battle: { id: "battleItemId", name: "battleItemName" },
+    appearance: { id: "appearanceItemId", name: "appearanceItemName" }
+  };
+
+  public async setHeldItem(userId: number, pokemonId: string, itemId: string, slot?: EquipmentSlot) {
     const player = this.world.getPlayerByUserId(userId);
     if (player && this.isPlayerBattling(player.socketId)) {
       return { ok: false, message: "You can't change held items during a battle." };
@@ -2685,19 +2707,38 @@ export default class BattleManager {
       return { ok: false, message: "Choose a Pokemon to hold the item." };
     }
 
+    if (targetPokemon.isEgg) {
+      return { ok: false, message: "An egg can't hold items." };
+    }
+
+    const naturalSlot = classifyEquipmentSlot({
+      essentialsId: itemDefinition.essentialsId,
+      speciesInternalId: toSpeciesInternalId(targetPokemon.sourcePokemonId, targetPokemon.name),
+      heldBonus: itemDefinition.heldBonus,
+      heldEffect: itemDefinition.heldEffect
+    });
+    if (!naturalSlot) {
+      return { ok: false, message: `${itemDefinition.name} can't be equipped.` };
+    }
+    if (slot && slot !== naturalSlot) {
+      return { ok: false, message: `${itemDefinition.name} doesn't fit in that equipment slot.` };
+    }
+
+    const fields = BattleManager.SLOT_FIELDS[naturalSlot];
     let inventory = this.removeInventoryQuantity(user.inventory, item.id, 1);
-    if (targetPokemon.heldItemId) {
+    const previousItemId = targetPokemon[fields.id];
+    if (previousItemId) {
       const previousDefinition = this.getCachedItemDefinition(
-        targetPokemon.heldItemId,
-        targetPokemon.heldItemName ?? ""
+        previousItemId,
+        targetPokemon[fields.name] ?? ""
       );
       if (previousDefinition) {
         inventory = this.addInventoryQuantity(inventory, previousDefinition, 1);
       }
     }
 
-    targetPokemon.heldItemId = itemDefinition.id;
-    targetPokemon.heldItemName = itemDefinition.name;
+    targetPokemon[fields.id] = itemDefinition.id;
+    targetPokemon[fields.name] = itemDefinition.name;
     const nextUser = await this.auth.saveBattleState(userId, {
       pokemonParty: user.pokemonParty,
       inventory
@@ -2763,7 +2804,7 @@ export default class BattleManager {
     return this.auth.withdrawPokemonFromStorage(userId, pokemonIds, boxId);
   }
 
-  public async takeHeldItem(userId: number, pokemonId: string) {
+  public async takeHeldItem(userId: number, pokemonId: string, slot: EquipmentSlot = "bonus") {
     const player = this.world.getPlayerByUserId(userId);
     if (player && this.isPlayerBattling(player.socketId)) {
       return { ok: false, message: "You can't change held items during a battle." };
@@ -2777,21 +2818,23 @@ export default class BattleManager {
       return { ok: false, message: "That Pokemon is not in your party." };
     }
 
-    if (!targetPokemon.heldItemId) {
+    const fields = BattleManager.SLOT_FIELDS[slot] ?? BattleManager.SLOT_FIELDS.bonus;
+    const equippedItemId = targetPokemon[fields.id];
+    if (!equippedItemId) {
       return { ok: false, message: `${getPokemonDisplayName(targetPokemon)} is not holding anything.` };
     }
 
     const itemDefinition = this.getCachedItemDefinition(
-      targetPokemon.heldItemId,
-      targetPokemon.heldItemName ?? ""
+      equippedItemId,
+      targetPokemon[fields.name] ?? ""
     );
-    const itemName = targetPokemon.heldItemName ?? itemDefinition?.name ?? "its item";
+    const itemName = targetPokemon[fields.name] ?? itemDefinition?.name ?? "its item";
     const inventory = itemDefinition
       ? this.addInventoryQuantity(user.inventory, itemDefinition, 1)
       : user.inventory;
 
-    targetPokemon.heldItemId = undefined;
-    targetPokemon.heldItemName = undefined;
+    targetPokemon[fields.id] = undefined;
+    targetPokemon[fields.name] = undefined;
     const nextUser = await this.auth.saveBattleState(userId, {
       pokemonParty: user.pokemonParty,
       inventory
@@ -4023,8 +4066,32 @@ export default class BattleManager {
     if (entry.itemId) {
       const itemDefinition = this.getCachedItemDefinition(entry.itemId, "");
       if (itemDefinition) {
-        pokemon.heldItemId = itemDefinition.id;
-        pokemon.heldItemName = itemDefinition.name;
+        const species = toSpeciesInternalId(pokemon.sourcePokemonId, pokemon.name);
+        const slot =
+          classifyEquipmentSlot({
+            essentialsId: itemDefinition.essentialsId,
+            speciesInternalId: species,
+            heldBonus: itemDefinition.heldBonus,
+            heldEffect: itemDefinition.heldEffect
+          }) ?? "bonus";
+        if (slot === "battle") {
+          pokemon.battleItemId = itemDefinition.id;
+          pokemon.battleItemName = itemDefinition.name;
+        } else if (slot === "appearance") {
+          pokemon.appearanceItemId = itemDefinition.id;
+          pokemon.appearanceItemName = itemDefinition.name;
+          const sprites = this.resolveBattleSprites(
+            pokemon.frontImageSrc,
+            pokemon.backImageSrc,
+            itemDefinition.id,
+            species
+          );
+          pokemon.frontImageSrc = sprites.frontImageSrc;
+          pokemon.backImageSrc = sprites.backImageSrc;
+        } else {
+          pokemon.heldItemId = itemDefinition.id;
+          pokemon.heldItemName = itemDefinition.name;
+        }
       }
     }
 
@@ -4991,16 +5058,37 @@ export default class BattleManager {
 
   /** Returns true when at least one event was pushed. */
   private applyHeldItemTriggers(battle: BattleSession, side: BattleSide, pokemon: BattlePokemon): boolean {
-    if (!pokemon.heldItemId) {
-      return false;
-    }
-
     // Magic Room suspends every held item; Embargo blocks this battler's.
     if (battle.magicRoomTurns > 0 || pokemon.volatile.embargoTurns > 0) {
       return false;
     }
 
-    const definition = this.getCachedItemDefinition(pokemon.heldItemId, pokemon.heldItemName ?? "");
+    // Battle-use slot first (berries, herbs), then the bonus slot's
+    // trigger-style holds (Leftovers, Black Sludge, Flame/Toxic Orb).
+    const usedBattleSlot = this.applySlotItemTriggers(battle, side, pokemon, "battle");
+    const usedBonusSlot = this.applySlotItemTriggers(battle, side, pokemon, "bonus");
+    return usedBattleSlot || usedBonusSlot;
+  }
+
+  /** The item ids/names living in one of the two in-battle item slots. */
+  private getSlotItem(pokemon: BattlePokemon, slot: "bonus" | "battle") {
+    return slot === "bonus"
+      ? { id: pokemon.heldItemId, name: pokemon.heldItemName }
+      : { id: pokemon.battleItemId, name: pokemon.battleItemName };
+  }
+
+  private applySlotItemTriggers(
+    battle: BattleSession,
+    side: BattleSide,
+    pokemon: BattlePokemon,
+    slot: "bonus" | "battle"
+  ): boolean {
+    const slotItem = this.getSlotItem(pokemon, slot);
+    if (!slotItem.id) {
+      return false;
+    }
+
+    const definition = this.getCachedItemDefinition(slotItem.id, slotItem.name ?? "");
     const effect = definition?.heldEffect;
     if (!definition || !effect) {
       return false;
@@ -5008,6 +5096,86 @@ export default class BattleManager {
 
     const displayName = getPokemonDisplayName(pokemon);
     let used = false;
+
+    if (effect.trigger === "end-of-turn" && effect.action === "self-status" && !pokemon.status) {
+      this.applyStatusCondition(battle, side, pokemon, effect.status, true, true);
+      if (pokemon.status) {
+        this.say(battle, `${displayName} was hurt by its ${definition.name}!`);
+        used = true;
+      }
+    }
+
+    if (effect.trigger === "end-of-turn" && effect.action === "poison-heal-else-damage") {
+      const isPoisonType = pokemon.types.some((type) => type.trim().toUpperCase() === "POISON");
+      if (isPoisonType && pokemon.hp < pokemon.maxHp && pokemon.hp > 0) {
+        const amount = Math.max(1, Math.floor(pokemon.maxHp * effect.healFraction));
+        pokemon.hp = Math.min(pokemon.maxHp, pokemon.hp + amount);
+        this.pushEvent(
+          battle,
+          {
+            kind: "heal",
+            sideId: side.id,
+            pokemonId: pokemon.id,
+            amount,
+            hpAfter: pokemon.hp,
+            maxHp: pokemon.maxHp,
+            source: "held-item"
+          },
+          `${displayName} absorbed nutrients from its ${definition.name}.`
+        );
+        used = true;
+      } else if (!isPoisonType && pokemon.hp > 0) {
+        const amount = Math.max(1, Math.floor(pokemon.maxHp * effect.damageFraction));
+        pokemon.hp = Math.max(0, pokemon.hp - amount);
+        this.pushEvent(
+          battle,
+          {
+            kind: "damage",
+            sideId: side.id,
+            pokemonId: pokemon.id,
+            amount,
+            hpAfter: pokemon.hp,
+            maxHp: pokemon.maxHp,
+            effectiveness: 1,
+            critical: false,
+            source: "held-item"
+          },
+          `${displayName} was hurt by its ${definition.name}!`
+        );
+        used = true;
+      }
+    }
+
+    if (
+      effect.trigger === "pinch" &&
+      pokemon.hp > 0 &&
+      pokemon.hp <= Math.floor(pokemon.maxHp / 4)
+    ) {
+      const coreStats: Array<Exclude<BattleStageKey, "accuracy" | "evasion">> = [
+        "attack",
+        "defense",
+        "specialAttack",
+        "specialDefense",
+        "speed"
+      ];
+      const raisable = coreStats.filter((candidate) => pokemon.stages[candidate] < 6);
+      const stat =
+        effect.stat === "random"
+          ? raisable.length > 0
+            ? raisable[Math.floor(Math.random() * raisable.length)]
+            : null
+          : effect.stat;
+      if (stat && pokemon.stages[stat] < 6) {
+        this.pushEvent(
+          battle,
+          { kind: "held-item-used", sideId: side.id, pokemonId: pokemon.id, itemName: definition.name },
+          `${displayName} ate its ${definition.name}!`
+        );
+        this.applyStatStageChange(battle, side, pokemon, stat, effect.stages, false, true);
+        this.consumeHeldItem(pokemon, slot);
+        used = true;
+      }
+    }
 
     if (
       effect.trigger === "end-of-turn" &&
@@ -5052,7 +5220,7 @@ export default class BattleManager {
         maxHp: pokemon.maxHp,
         source: "held-item"
       });
-      this.consumeHeldItem(pokemon);
+      this.consumeHeldItem(pokemon, slot);
       used = true;
     }
 
@@ -5084,7 +5252,7 @@ export default class BattleManager {
             `${displayName} snapped out of its confusion.`
           );
         }
-        this.consumeHeldItem(pokemon);
+        this.consumeHeldItem(pokemon, slot);
         used = true;
       }
     }
@@ -5092,20 +5260,122 @@ export default class BattleManager {
     return used;
   }
 
-  private consumeHeldItem(pokemon: BattlePokemon) {
+  private consumeHeldItem(pokemon: BattlePokemon, slot: "bonus" | "battle" = "battle") {
+    const slotItem = this.getSlotItem(pokemon, slot);
     // Remember what was eaten for Recycle and Belch.
-    if (pokemon.heldItemId) {
-      pokemon.consumedItem = { id: pokemon.heldItemId, name: pokemon.heldItemName ?? "" };
-      if (this.pokemonHoldsBerry(pokemon)) {
+    if (slotItem.id) {
+      pokemon.consumedItem = { id: slotItem.id, name: slotItem.name ?? "", slot };
+      if (this.itemIsBerry(slotItem.id, slotItem.name)) {
         pokemon.ateBerry = true;
       }
     }
-    pokemon.heldItemId = null;
-    pokemon.heldItemName = null;
-    if (pokemon.originalSummary) {
-      pokemon.originalSummary.heldItemId = undefined;
-      pokemon.originalSummary.heldItemName = undefined;
+    this.setSlotItem(pokemon, slot, null, null);
+  }
+
+  /** Writes one of the two in-battle slots through to the persisted summary. */
+  private setSlotItem(
+    pokemon: BattlePokemon,
+    slot: "bonus" | "battle",
+    itemId: string | null,
+    itemName: string | null
+  ) {
+    if (slot === "bonus") {
+      pokemon.heldItemId = itemId;
+      pokemon.heldItemName = itemName;
+      if (pokemon.originalSummary) {
+        pokemon.originalSummary.heldItemId = itemId ?? undefined;
+        pokemon.originalSummary.heldItemName = itemName ?? undefined;
+      }
+    } else {
+      pokemon.battleItemId = itemId;
+      pokemon.battleItemName = itemName;
+      if (pokemon.originalSummary) {
+        pokemon.originalSummary.battleItemId = itemId ?? undefined;
+        pokemon.originalSummary.battleItemName = itemName ?? undefined;
+      }
     }
+  }
+
+  /** The battle-slot consumable that saves from a lethal hit (Focus Sash). */
+  private getLethalSaveItem(battle: BattleSession, pokemon: BattlePokemon) {
+    if (battle.magicRoomTurns > 0 || pokemon.volatile.embargoTurns > 0) {
+      return null;
+    }
+    const slotItem = this.getSlotItem(pokemon, "battle");
+    if (!slotItem.id) {
+      return null;
+    }
+    const definition = this.getCachedItemDefinition(slotItem.id, slotItem.name ?? "");
+    const effect = definition?.heldEffect;
+    if (!definition || !effect || effect.trigger !== "lethal-hit") {
+      return null;
+    }
+    return { definition, effect };
+  }
+
+  /** White Herb: right after a stat drop, reset every lowered stage. */
+  private applyStatDropTriggers(battle: BattleSession, side: BattleSide, pokemon: BattlePokemon) {
+    if (battle.magicRoomTurns > 0 || pokemon.volatile.embargoTurns > 0) {
+      return;
+    }
+    const slotItem = this.getSlotItem(pokemon, "battle");
+    if (!slotItem.id) {
+      return;
+    }
+    const definition = this.getCachedItemDefinition(slotItem.id, slotItem.name ?? "");
+    if (!definition || definition.heldEffect?.trigger !== "stat-drop") {
+      return;
+    }
+    const loweredStats = (Object.keys(pokemon.stages) as BattleStageKey[]).filter(
+      (stat) => pokemon.stages[stat] < 0
+    );
+    if (loweredStats.length === 0) {
+      return;
+    }
+    loweredStats.forEach((stat) => {
+      pokemon.stages[stat] = 0;
+    });
+    this.pushEvent(
+      battle,
+      { kind: "held-item-used", sideId: side.id, pokemonId: pokemon.id, itemName: definition.name },
+      `${getPokemonDisplayName(pokemon)} restored its stats with its ${definition.name}!`
+    );
+    this.consumeHeldItem(pokemon, "battle");
+  }
+
+  /** The slot Knock Off / Thief / Trick / Fling act on (appearance is unlosable). */
+  private getRemovableSlot(pokemon: BattlePokemon): "bonus" | "battle" | null {
+    if (pokemon.battleItemId) {
+      return "battle";
+    }
+    if (pokemon.heldItemId) {
+      return "bonus";
+    }
+    return null;
+  }
+
+  /**
+   * Hands an item to a battler mid-battle (Thief / Trick / Bestow): it lands
+   * in its natural slot when free, else in whichever of the two item slots is
+   * empty so nothing is ever silently lost. Returns false when both are full.
+   */
+  private giveItemToBattler(pokemon: BattlePokemon, itemId: string, itemName: string | null): boolean {
+    const definition = this.getCachedItemDefinition(itemId, itemName ?? "");
+    const slot = classifyEquipmentSlot({
+      essentialsId: definition?.essentialsId ?? this.internalIdFromItemId(itemId),
+      speciesInternalId: toSpeciesInternalId(pokemon.sourcePokemonId, pokemon.name),
+      heldBonus: definition?.heldBonus ?? null,
+      heldEffect: definition?.heldEffect ?? null
+    });
+    const preferred: Array<"bonus" | "battle"> =
+      slot === "battle" ? ["battle", "bonus"] : ["bonus", "battle"];
+    for (const candidate of preferred) {
+      if (!this.getSlotItem(pokemon, candidate).id) {
+        this.setSlotItem(pokemon, candidate, itemId, itemName);
+        return true;
+      }
+    }
+    return false;
   }
 
   private syncPokemonProgression(pokemon: BattlePokemon, config: LevelingCurveConfig) {
@@ -6569,13 +6839,28 @@ export default class BattleManager {
     return !pokemon.types.some((type) => type.trim().toUpperCase() === "FLYING");
   }
 
-  private pokemonHoldsBerry(pokemon: BattlePokemon) {
-    if (!pokemon.heldItemId) {
+  private itemIsBerry(itemId: string | null | undefined, itemName?: string | null) {
+    if (!itemId) {
       return false;
     }
-    const definition = this.getCachedItemDefinition(pokemon.heldItemId, pokemon.heldItemName ?? "");
-    const name = (pokemon.heldItemName ?? definition?.name ?? "").toLowerCase();
+    const definition = this.getCachedItemDefinition(itemId, itemName ?? "");
+    const name = (itemName ?? definition?.name ?? "").toLowerCase();
     return definition?.category === "berries" || name.includes("baya") || name.includes("berry");
+  }
+
+  /** The slot holding a berry (battle-use slot wins), or null. */
+  private getBerrySlot(pokemon: BattlePokemon): "bonus" | "battle" | null {
+    if (this.itemIsBerry(pokemon.battleItemId, pokemon.battleItemName)) {
+      return "battle";
+    }
+    if (this.itemIsBerry(pokemon.heldItemId, pokemon.heldItemName)) {
+      return "bonus";
+    }
+    return null;
+  }
+
+  private pokemonHoldsBerry(pokemon: BattlePokemon) {
+    return this.getBerrySlot(pokemon) !== null;
   }
 
   /** Roar / Whirlwind / Dragon Tail: drag out a random replacement. */
@@ -7500,6 +7785,29 @@ export default class BattleManager {
             `${attackerName} lost some of its HP to its ${attacker.heldItemName ?? "held item"}!`
           );
         }
+
+        // Shell Bell: sip back a fraction of the damage dealt.
+        if (
+          attackerHitBonus.healDealtFraction &&
+          attacker.hp > 0 &&
+          attacker.hp < attacker.maxHp
+        ) {
+          const healed = Math.max(1, Math.floor(totalDamage * attackerHitBonus.healDealtFraction));
+          attacker.hp = Math.min(attacker.maxHp, attacker.hp + healed);
+          this.pushEvent(
+            battle,
+            {
+              kind: "heal",
+              sideId: side.id,
+              pokemonId: attacker.id,
+              amount: healed,
+              hpAfter: attacker.hp,
+              maxHp: attacker.maxHp,
+              source: "held-item"
+            },
+            `${attackerName} restored a little HP using its ${attacker.heldItemName ?? "held item"}!`
+          );
+        }
       }
 
       // Smelling Salts / Wake-Up Slap: the doubled hit cures the condition.
@@ -7828,9 +8136,11 @@ export default class BattleManager {
       }
 
       // False Swipe never KOs; Endure keeps the battler at 1 HP; a held
-      // Focus Band sometimes does the same.
+      // Focus Band sometimes does the same; a Focus Sash always does (once)
+      // when the hit would KO from full HP.
       let enduredHit = false;
       let focusBandSave = false;
+      let focusSashSave: string | null = null;
       if (damage >= defender.hp) {
         if (spec.neverFaintTarget) {
           damage = Math.max(0, defender.hp - 1);
@@ -7842,6 +8152,16 @@ export default class BattleManager {
           if (defender.hp > 1 && focusBandChance > 0 && Math.random() < focusBandChance) {
             damage = Math.max(0, defender.hp - 1);
             focusBandSave = true;
+          } else {
+            const lethalSave = this.getLethalSaveItem(battle, defender);
+            if (
+              lethalSave &&
+              defender.hp > 1 &&
+              (!lethalSave.effect.requiresFullHp || defender.hp === defender.maxHp)
+            ) {
+              damage = Math.max(0, defender.hp - 1);
+              focusSashSave = lethalSave.definition.name;
+            }
           }
         }
       }
@@ -7889,6 +8209,10 @@ export default class BattleManager {
           `${getPokemonDisplayName(defender)} hung on using its ${defender.heldItemName ?? "Focus Band"}!`
         );
       }
+      if (focusSashSave) {
+        this.say(battle, `${getPokemonDisplayName(defender)} hung on using its ${focusSashSave}!`);
+        this.consumeHeldItem(defender, "battle");
+      }
     }
 
     return { totalDamage, hits: landedHits, anyCritical, hitSubstitute };
@@ -7921,7 +8245,8 @@ export default class BattleManager {
       damage = Math.max(0, defender.hp - 1);
       enduredHit = defender.volatile.endure && !spec.neverFaintTarget;
     } else if (damage >= defender.hp && defender.hp > 1) {
-      // A held Focus Band can save the target from flat damage too.
+      // A held Focus Band (chance) or Focus Sash (from full HP, consumed)
+      // can save the target from flat damage too.
       const focusBandChance = this.getHeldBonus(defender, battle)?.focusBandChance ?? 0;
       if (focusBandChance > 0 && Math.random() < focusBandChance) {
         damage = Math.max(0, defender.hp - 1);
@@ -7929,6 +8254,16 @@ export default class BattleManager {
           battle,
           `${getPokemonDisplayName(defender)} hung on using its ${defender.heldItemName ?? "Focus Band"}!`
         );
+      } else {
+        const lethalSave = this.getLethalSaveItem(battle, defender);
+        if (lethalSave && (!lethalSave.effect.requiresFullHp || defender.hp === defender.maxHp)) {
+          damage = Math.max(0, defender.hp - 1);
+          this.say(
+            battle,
+            `${getPokemonDisplayName(defender)} hung on using its ${lethalSave.definition.name}!`
+          );
+          this.consumeHeldItem(defender, "battle");
+        }
       }
     }
 
@@ -8474,97 +8809,101 @@ export default class BattleManager {
     }
 
     // ------------------------------------------------------------------
-    // Held items
+    // Held items. Item-moving moves act on the battle-use slot first, then
+    // the bonus slot; the appearance slot is unlosable (Essentials
+    // `unlosable?` semantics for form items).
     // ------------------------------------------------------------------
     if (spec.removeTargetItem && !isFainted(defender) && canAffectTarget) {
-      if (defender.heldItemId) {
-        const itemName = defender.heldItemName ?? "its item";
-        defender.heldItemId = null;
-        defender.heldItemName = null;
-        this.say(battle, `${attackerName} knocked off ${defenderName}'s ${itemName}!`);
+      const removableSlot = this.getRemovableSlot(defender);
+      if (removableSlot) {
+        const removed = this.getSlotItem(defender, removableSlot);
+        this.setSlotItem(defender, removableSlot, null, null);
+        this.say(battle, `${attackerName} knocked off ${defenderName}'s ${removed.name ?? "item"}!`);
       }
     }
 
     if (spec.stealTargetItem && !isFainted(defender) && canAffectTarget) {
-      if (!attacker.heldItemId && defender.heldItemId) {
-        attacker.heldItemId = defender.heldItemId;
-        attacker.heldItemName = defender.heldItemName;
-        defender.heldItemId = null;
-        defender.heldItemName = null;
-        this.say(battle, `${attackerName} stole ${defenderName}'s ${attacker.heldItemName}!`);
+      const removableSlot = this.getRemovableSlot(defender);
+      const stolen = removableSlot ? this.getSlotItem(defender, removableSlot) : null;
+      if (removableSlot && stolen?.id && this.giveItemToBattler(attacker, stolen.id, stolen.name)) {
+        this.setSlotItem(defender, removableSlot, null, null);
+        this.say(battle, `${attackerName} stole ${defenderName}'s ${stolen.name ?? "item"}!`);
       }
     }
 
     if (spec.swapItems && !isFainted(defender) && canAffectTarget) {
-      if (!attacker.heldItemId && !defender.heldItemId) {
+      const attackerSlot = this.getRemovableSlot(attacker);
+      const defenderSlot = this.getRemovableSlot(defender);
+      if (!attackerSlot && !defenderSlot) {
         this.say(battle, "But it failed!");
       } else {
-        const ownItemId = attacker.heldItemId;
-        const ownItemName = attacker.heldItemName;
-        attacker.heldItemId = defender.heldItemId;
-        attacker.heldItemName = defender.heldItemName;
-        defender.heldItemId = ownItemId;
-        defender.heldItemName = ownItemName;
-        this.say(battle, `${attackerName} switched items with its opponent!`);
-        if (attacker.heldItemName) {
-          this.say(battle, `${attackerName} obtained one ${attacker.heldItemName}.`);
+        const ownItem = attackerSlot ? this.getSlotItem(attacker, attackerSlot) : null;
+        const theirItem = defenderSlot ? this.getSlotItem(defender, defenderSlot) : null;
+        if (attackerSlot) {
+          this.setSlotItem(attacker, attackerSlot, null, null);
         }
-        if (defender.heldItemName) {
-          this.say(battle, `${defenderName} obtained one ${defender.heldItemName}.`);
+        if (defenderSlot) {
+          this.setSlotItem(defender, defenderSlot, null, null);
+        }
+        this.say(battle, `${attackerName} switched items with its opponent!`);
+        if (theirItem?.id && this.giveItemToBattler(attacker, theirItem.id, theirItem.name)) {
+          this.say(battle, `${attackerName} obtained one ${theirItem.name}.`);
+        }
+        if (ownItem?.id && this.giveItemToBattler(defender, ownItem.id, ownItem.name)) {
+          this.say(battle, `${defenderName} obtained one ${ownItem.name}.`);
         }
       }
     }
 
     if (spec.bestowItem && !isFainted(defender) && canAffectTarget) {
-      if (!attacker.heldItemId || defender.heldItemId) {
+      const attackerSlot = this.getRemovableSlot(attacker);
+      const gift = attackerSlot ? this.getSlotItem(attacker, attackerSlot) : null;
+      if (!attackerSlot || !gift?.id || !this.giveItemToBattler(defender, gift.id, gift.name)) {
         this.say(battle, "But it failed!");
       } else {
-        defender.heldItemId = attacker.heldItemId;
-        defender.heldItemName = attacker.heldItemName;
-        attacker.heldItemId = null;
-        attacker.heldItemName = null;
-        this.say(battle, `${attackerName} gave ${defenderName} its ${defender.heldItemName}!`);
+        this.setSlotItem(attacker, attackerSlot, null, null);
+        this.say(battle, `${attackerName} gave ${defenderName} its ${gift.name}!`);
       }
     }
 
     if (spec.eatTargetBerry && !isFainted(defender) && canAffectTarget) {
-      if (this.pokemonHoldsBerry(defender)) {
-        const berryName = defender.heldItemName ?? "berry";
-        defender.heldItemId = null;
-        defender.heldItemName = null;
+      const berrySlot = this.getBerrySlot(defender);
+      if (berrySlot) {
+        const berry = this.getSlotItem(defender, berrySlot);
+        this.setSlotItem(defender, berrySlot, null, null);
         attacker.ateBerry = true;
-        this.say(battle, `${attackerName} stole and ate ${defenderName}'s ${berryName}!`);
+        this.say(battle, `${attackerName} stole and ate ${defenderName}'s ${berry.name ?? "berry"}!`);
       }
     }
 
     if (spec.incinerateBerry && !isFainted(defender) && canAffectTarget) {
-      if (this.pokemonHoldsBerry(defender)) {
-        const berryName = defender.heldItemName ?? "berry";
-        defender.heldItemId = null;
-        defender.heldItemName = null;
-        this.say(battle, `${defenderName}'s ${berryName} was burned up!`);
+      const berrySlot = this.getBerrySlot(defender);
+      if (berrySlot) {
+        const berry = this.getSlotItem(defender, berrySlot);
+        this.setSlotItem(defender, berrySlot, null, null);
+        this.say(battle, `${defenderName}'s ${berry.name ?? "berry"} was burned up!`);
       }
     }
 
     if (spec.recycleItem) {
-      if (attacker.consumedItem && !attacker.heldItemId) {
-        attacker.heldItemId = attacker.consumedItem.id;
-        attacker.heldItemName = attacker.consumedItem.name;
+      const consumed = attacker.consumedItem;
+      if (consumed && !this.getSlotItem(attacker, consumed.slot).id) {
+        this.setSlotItem(attacker, consumed.slot, consumed.id, consumed.name);
         attacker.consumedItem = null;
-        this.say(battle, `${attackerName} found one ${attacker.heldItemName}!`);
+        this.say(battle, `${attackerName} found one ${consumed.name}!`);
       } else {
         this.say(battle, "But it failed!");
       }
     }
 
     if (spec.flingItem) {
-      if (!attacker.heldItemId || battle.magicRoomTurns > 0) {
+      const flingSlot = this.getRemovableSlot(attacker);
+      if (!flingSlot || battle.magicRoomTurns > 0) {
         this.say(battle, "But it failed!");
       } else {
-        const itemName = attacker.heldItemName ?? "its item";
-        attacker.heldItemId = null;
-        attacker.heldItemName = null;
-        this.say(battle, `${attackerName} flung its ${itemName}!`);
+        const flung = this.getSlotItem(attacker, flingSlot);
+        this.setSlotItem(attacker, flingSlot, null, null);
+        this.say(battle, `${attackerName} flung its ${flung.name ?? "item"}!`);
         if (!isFainted(defender) && canAffectTarget) {
           this.applyDirectDamage(battle, target, defender, 30, spec);
         }
@@ -9272,6 +9611,10 @@ export default class BattleManager {
       },
       `${displayName}'s ${statLabel} ${magnitudeText}!`
     );
+
+    if (actual < 0) {
+      this.applyStatDropTriggers(battle, side, pokemon);
+    }
   }
 
   private applyStatusCondition(
@@ -9365,9 +9708,11 @@ export default class BattleManager {
     const identified = defender.volatile.foresight || defender.volatile.miracleEye;
     const evasion = identified ? Math.min(0, defender.stages.evasion) : defender.stages.evasion;
     const stageDelta = clamp(attacker.stages.accuracy - evasion, -6, 6);
-    // BrightPowder on the target throws off incoming moves.
+    // BrightPowder on the target throws off incoming moves; a Wide Lens on
+    // the attacker sharpens its own.
     const brightPowder = this.getHeldBonus(defender)?.incomingAccuracyMultiplier ?? 1;
-    const chance = move.accuracy * getAccuracyStageMultiplier(stageDelta) * brightPowder;
+    const wideLens = this.getHeldBonus(attacker)?.accuracyMultiplier ?? 1;
+    const chance = move.accuracy * getAccuracyStageMultiplier(stageDelta) * brightPowder * wideLens;
     return Math.random() * 100 < chance;
   }
 
@@ -9521,6 +9866,10 @@ export default class BattleManager {
       }
       if (attackerBonus.allPowerMultiplier) {
         itemMultiplier *= attackerBonus.allPowerMultiplier;
+      }
+      // Expert Belt: only super-effective hits get the boost.
+      if (attackerBonus.superEffectivePowerMultiplier && effectiveness > 1) {
+        itemMultiplier *= attackerBonus.superEffectivePowerMultiplier;
       }
     }
 
@@ -10312,13 +10661,50 @@ export default class BattleManager {
       ateBerry: false,
       heldItemId: typeof pokemon.heldItemId === "string" ? pokemon.heldItemId : null,
       heldItemName: typeof pokemon.heldItemName === "string" ? pokemon.heldItemName : null,
+      battleItemId: typeof pokemon.battleItemId === "string" ? pokemon.battleItemId : null,
+      battleItemName: typeof pokemon.battleItemName === "string" ? pokemon.battleItemName : null,
+      appearanceItemId: typeof pokemon.appearanceItemId === "string" ? pokemon.appearanceItemId : null,
+      appearanceItemName:
+        typeof pokemon.appearanceItemName === "string" ? pokemon.appearanceItemName : null,
       learnset: definition?.skills ?? [],
       evolutions: definition?.evolutions ?? [],
       moves,
-      frontImageSrc: definition?.frontImageSrc ?? "",
-      backImageSrc: definition?.backImageSrc ?? "",
+      ...this.resolveBattleSprites(
+        definition?.frontImageSrc ?? "",
+        definition?.backImageSrc ?? "",
+        pokemon.appearanceItemId,
+        toSpeciesInternalId(pokemon.sourcePokemonId, pokemon.name)
+      ),
       originalSummary: pokemon
     };
+  }
+
+  /** Battle sprites with the appearance-slot item (forms, shiny) baked in. */
+  private resolveBattleSprites(
+    frontImageSrc: string,
+    backImageSrc: string,
+    appearanceItemId: string | null | undefined,
+    speciesInternalId: string
+  ): { frontImageSrc: string; backImageSrc: string } {
+    const appearanceDefinition = appearanceItemId
+      ? this.getCachedItemDefinition(appearanceItemId, "")
+      : null;
+    const appearance = resolveAppearanceEffect(
+      appearanceDefinition?.essentialsId ?? this.internalIdFromItemId(appearanceItemId),
+      speciesInternalId
+    );
+    if (!appearance) {
+      return { frontImageSrc, backImageSrc };
+    }
+    return {
+      frontImageSrc: applyAppearanceToSpritePath(frontImageSrc, appearance, "front"),
+      backImageSrc: applyAppearanceToSpritePath(backImageSrc, appearance, "back")
+    };
+  }
+
+  /** Item ids follow "item-<essentialsid>"; recover the internal id. */
+  private internalIdFromItemId(itemId?: string | null) {
+    return (itemId ?? "").replace(/^item-/i, "").trim().toUpperCase();
   }
 
   private buildWildPokemon(
@@ -10368,6 +10754,10 @@ export default class BattleManager {
       ateBerry: false,
       heldItemId: null,
       heldItemName: null,
+      battleItemId: null,
+      battleItemName: null,
+      appearanceItemId: null,
+      appearanceItemName: null,
       learnset: definition.skills,
       evolutions: definition.evolutions,
       moves,
@@ -10427,6 +10817,10 @@ export default class BattleManager {
           status: pokemon.status ? { ...pokemon.status } : undefined,
           heldItemId: pokemon.heldItemId ?? undefined,
           heldItemName: pokemon.heldItemName ?? undefined,
+          battleItemId: pokemon.battleItemId ?? undefined,
+          battleItemName: pokemon.battleItemName ?? undefined,
+          appearanceItemId: pokemon.appearanceItemId ?? undefined,
+          appearanceItemName: pokemon.appearanceItemName ?? undefined,
           moves,
           movePp: moves.reduce<Record<string, number>>((accumulator, moveName) => {
             const battleMove = pokemon.moves.find((move) => move.name === moveName);

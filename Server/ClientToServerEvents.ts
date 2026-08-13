@@ -125,8 +125,18 @@ export default interface ClientToServerEvents {
     targetPokemonId: string;
     replaceMoveName?: string;
   }) => void;
-  "inventory:hold-item": (data: { pokemonId: string; itemId: string }) => void;
-  "inventory:take-held-item": (data: { pokemonId: string }) => void;
+  // slot: "bonus" (passive equip; default/legacy), "battle" (consumable
+  // battle-use item) or "appearance" (sprite-changing form item). Omitted =
+  // the server classifies the item into its natural slot.
+  "inventory:hold-item": (data: {
+    pokemonId: string;
+    itemId: string;
+    slot?: "bonus" | "battle" | "appearance";
+  }) => void;
+  "inventory:take-held-item": (data: {
+    pokemonId: string;
+    slot?: "bonus" | "battle" | "appearance";
+  }) => void;
   "inventory:throw-away": (data: { itemId: string; quantity: number }) => void;
   "npc:heal-party": (data: { npcPlacementId: string }) => void;
   "npc:battle": (data: { npcPlacementId: string }) => void;

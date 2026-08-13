@@ -1,6 +1,23 @@
 import type { BattleStatusId } from "./events";
 
 /**
+ * The three equipment slots a venomon exposes in the Estadísticas "Equipo"
+ * tab. Every equippable item belongs to exactly one slot (appearance items
+ * are species-resolved: an Arceus plate is "appearance" on Arceus and a
+ * plain type-boost "bonus" on anyone else).
+ */
+export type EquipmentSlot = "bonus" | "battle" | "appearance";
+
+/** Stats a pinch berry can raise (mirrors the battle stage keys). */
+export type PinchBerryStat =
+  | "attack"
+  | "defense"
+  | "specialAttack"
+  | "specialDefense"
+  | "speed"
+  | "random";
+
+/**
  * Held item battle behaviors. A pokemon holding an item uses it on its own
  * when the trigger condition is met (classic in-battle berry/Leftovers
  * semantics). Effects resolve from the item's Essentials internal id first,
@@ -10,7 +27,23 @@ export type HeldItemEffect =
   | { trigger: "hp-below-half"; action: "heal-amount"; amount: number; consumed: true }
   | { trigger: "hp-below-half"; action: "heal-fraction"; fraction: number; consumed: true }
   | { trigger: "status"; cures: BattleStatusId[] | "any"; curesConfusion: boolean; consumed: true }
-  | { trigger: "end-of-turn"; action: "heal-fraction"; fraction: number; consumed: false };
+  | { trigger: "end-of-turn"; action: "heal-fraction"; fraction: number; consumed: false }
+  /** Pinch berries (Liechi...): below 1/4 max HP, raise a stat stage. */
+  | { trigger: "pinch"; action: "stat-stages"; stat: PinchBerryStat; stages: number; consumed: true }
+  /** Focus Sash: survive a lethal hit at 1 HP when taken from full HP. */
+  | { trigger: "lethal-hit"; requiresFullHp: boolean; consumed: true }
+  /** White Herb: reset every lowered stat stage right after the drop. */
+  | { trigger: "stat-drop"; consumed: true }
+  /** Flame Orb / Toxic Orb: inflict a status on the holder at end of turn. */
+  | { trigger: "end-of-turn"; action: "self-status"; status: "burn" | "toxic"; consumed: false }
+  /** Black Sludge: heals Poison-types, hurts everyone else. */
+  | {
+      trigger: "end-of-turn";
+      action: "poison-heal-else-damage";
+      healFraction: number;
+      damageFraction: number;
+      consumed: false;
+    };
 
 const HELD_EFFECTS_BY_INTERNAL_ID: Record<string, HeldItemEffect> = {
   // Modern berry names.
@@ -33,7 +66,25 @@ const HELD_EFFECTS_BY_INTERNAL_ID: Record<string, HeldItemEffect> = {
   BURNTBERRY: { trigger: "status", cures: ["freeze"], curesConfusion: false, consumed: true },
   BITTERBERRY: { trigger: "status", cures: [], curesConfusion: true, consumed: true },
   MIRACLEBERRY: { trigger: "status", cures: "any", curesConfusion: true, consumed: true },
-  LEFTOVERS: { trigger: "end-of-turn", action: "heal-fraction", fraction: 1 / 16, consumed: false }
+  LEFTOVERS: { trigger: "end-of-turn", action: "heal-fraction", fraction: 1 / 16, consumed: false },
+  // Pinch berries: +1 stage (Starf: +2 to a random stat) below 1/4 max HP.
+  LIECHIBERRY: { trigger: "pinch", action: "stat-stages", stat: "attack", stages: 1, consumed: true },
+  GANLONBERRY: { trigger: "pinch", action: "stat-stages", stat: "defense", stages: 1, consumed: true },
+  SALACBERRY: { trigger: "pinch", action: "stat-stages", stat: "speed", stages: 1, consumed: true },
+  PETAYABERRY: { trigger: "pinch", action: "stat-stages", stat: "specialAttack", stages: 1, consumed: true },
+  APICOTBERRY: { trigger: "pinch", action: "stat-stages", stat: "specialDefense", stages: 1, consumed: true },
+  STARFBERRY: { trigger: "pinch", action: "stat-stages", stat: "random", stages: 2, consumed: true },
+  FOCUSSASH: { trigger: "lethal-hit", requiresFullHp: true, consumed: true },
+  WHITEHERB: { trigger: "stat-drop", consumed: true },
+  FLAMEORB: { trigger: "end-of-turn", action: "self-status", status: "burn", consumed: false },
+  TOXICORB: { trigger: "end-of-turn", action: "self-status", status: "toxic", consumed: false },
+  BLACKSLUDGE: {
+    trigger: "end-of-turn",
+    action: "poison-heal-else-damage",
+    healFraction: 1 / 16,
+    damageFraction: 1 / 8,
+    consumed: false
+  }
 };
 
 /**
@@ -78,6 +129,12 @@ export type HeldBonusEffect = {
   expMultiplier?: number;
   /** Trainer prize-money multiplier when the holder is in the winning party (Amulet Coin). */
   moneyMultiplier?: number;
+  /** Extra power on super-effective moves (Expert Belt). */
+  superEffectivePowerMultiplier?: number;
+  /** The holder's own moves get this accuracy multiplier (Wide Lens). */
+  accuracyMultiplier?: number;
+  /** Heal this fraction of damage dealt after a landed damaging move (Shell Bell). */
+  healDealtFraction?: number;
 };
 
 const TYPE_BOOST_ITEMS: Record<string, string> = {
@@ -97,7 +154,31 @@ const TYPE_BOOST_ITEMS: Record<string, string> = {
   NEVERMELTICE: "ICE",
   DRAGONFANG: "DRAGON",
   METALCOAT: "STEEL",
-  BLACKGLASSES: "DARK"
+  BLACKGLASSES: "DARK",
+  // Arceus plates double as plain type boosters for any other holder
+  // (their appearance role on Arceus itself wins in classifyEquipmentSlot).
+  FLAMEPLATE: "FIRE",
+  SPLASHPLATE: "WATER",
+  ZAPPLATE: "ELECTRIC",
+  MEADOWPLATE: "GRASS",
+  ICICLEPLATE: "ICE",
+  FISTPLATE: "FIGHTING",
+  TOXICPLATE: "POISON",
+  EARTHPLATE: "GROUND",
+  SKYPLATE: "FLYING",
+  MINDPLATE: "PSYCHIC",
+  INSECTPLATE: "BUG",
+  STONEPLATE: "ROCK",
+  SPOOKYPLATE: "GHOST",
+  DRACOPLATE: "DRAGON",
+  DREADPLATE: "DARK",
+  IRONPLATE: "STEEL",
+  // Type-boosting incenses.
+  SEAINCENSE: "WATER",
+  WAVEINCENSE: "WATER",
+  ROSEINCENSE: "GRASS",
+  ODDINCENSE: "PSYCHIC",
+  ROCKINCENSE: "ROCK"
 };
 
 const HELD_BONUSES_BY_INTERNAL_ID: Record<string, HeldBonusEffect> = {
@@ -122,7 +203,27 @@ const HELD_BONUSES_BY_INTERNAL_ID: Record<string, HeldBonusEffect> = {
   AMULETCOIN: { moneyMultiplier: 2 },
   THICKCLUB: { attackMultiplier: 2, onlySpecies: ["CUBONE", "MAROWAK"] },
   LIGHTBALL: { attackMultiplier: 2, specialAttackMultiplier: 2, onlySpecies: ["PIKACHU"] },
-  EVIOLITE: { defenseMultiplier: 1.5, specialDefenseMultiplier: 1.5, onlyIfCanEvolve: true }
+  EVIOLITE: { defenseMultiplier: 1.5, specialDefenseMultiplier: 1.5, onlyIfCanEvolve: true },
+  RAZORCLAW: { critStageBonus: 1 },
+  RAZORFANG: { flinchChance: 0.1 },
+  LAXINCENSE: { incomingAccuracyMultiplier: 0.9 },
+  LUCKINCENSE: { moneyMultiplier: 2 },
+  MACHOBRACE: { speedMultiplier: 0.5 },
+  IRONBALL: { speedMultiplier: 0.5 },
+  EXPERTBELT: { superEffectivePowerMultiplier: 1.2 },
+  WIDELENS: { accuracyMultiplier: 1.1 },
+  SHELLBELL: { healDealtFraction: 1 / 8 },
+  SOULDEW: {
+    specialAttackMultiplier: 1.5,
+    specialDefenseMultiplier: 1.5,
+    onlySpecies: ["LATIAS", "LATIOS"]
+  },
+  METALPOWDER: { defenseMultiplier: 2, onlySpecies: ["DITTO"] },
+  QUICKPOWDER: { speedMultiplier: 2, onlySpecies: ["DITTO"] },
+  DEEPSEATOOTH: { specialAttackMultiplier: 2, onlySpecies: ["CLAMPERL"] },
+  DEEPSEASCALE: { specialDefenseMultiplier: 2, onlySpecies: ["CLAMPERL"] },
+  STICK: { critStageBonus: 2, onlySpecies: ["FARFETCHD"] },
+  LUCKYPUNCH: { critStageBonus: 2, onlySpecies: ["CHANSEY"] }
 };
 
 export function resolveHeldBonus(essentialsId?: string): HeldBonusEffect | null {
@@ -131,15 +232,140 @@ export function resolveHeldBonus(essentialsId?: string): HeldBonusEffect | null 
 }
 
 /**
- * Internal ids the client offers under "Equip item" — every passive-bonus item
- * plus Leftovers (a trigger effect, but an equipment-style hold item all the
- * same). Berries stay in their own "Give Berry" flow.
+ * Internal ids the client offers for the BONUS slot — every passive-bonus item
+ * plus the non-consumed trigger items (Leftovers, Black Sludge, Flame/Toxic
+ * Orb) that behave like equipment.
  * KEEP IN SYNC with client-poke.io src/components/ux/game/equipableItems.ts.
  */
 export const EQUIPABLE_INTERNAL_IDS: readonly string[] = [
   ...Object.keys(HELD_BONUSES_BY_INTERNAL_ID),
-  "LEFTOVERS"
+  "LEFTOVERS",
+  "BLACKSLUDGE",
+  "FLAMEORB",
+  "TOXICORB"
 ];
+
+/**
+ * Appearance-slot items: while equipped they change how the venomon looks
+ * (sprite form variants, ported from Essentials MultipleForms "getForm"
+ * handlers; form numbers follow the BW v3.1.1 project this game's sprite
+ * pack was exported from). The Shiny Charm is an engine adaptation: any
+ * holder swaps to its shiny (variocolor) sprites.
+ */
+export type AppearanceEffect = {
+  /** Species internal names the item works on; absent = any venomon. */
+  onlySpecies?: string[];
+  /** "_1"... — appended to the sprite file basename (GIRATINA_1.gif). */
+  formSuffix?: string;
+  /** Swap the front/back sprite directories for their -shiny variants. */
+  shiny?: boolean;
+  /** Display label for the UI ("Forma Origen"). */
+  formName?: string;
+};
+
+const ARCEUS = ["ARCEUS"];
+const GENESECT = ["GENESECT"];
+
+export const APPEARANCE_ITEMS_BY_INTERNAL_ID: Record<string, AppearanceEffect> = {
+  SHINYCHARM: { shiny: true, formName: "Variocolor" },
+  GRISEOUSORB: { onlySpecies: ["GIRATINA"], formSuffix: "_1", formName: "Forma Origen" },
+  SHOCKDRIVE: { onlySpecies: GENESECT, formSuffix: "_1", formName: "FulgoROM" },
+  BURNDRIVE: { onlySpecies: GENESECT, formSuffix: "_2", formName: "PiroROM" },
+  CHILLDRIVE: { onlySpecies: GENESECT, formSuffix: "_3", formName: "CrioROM" },
+  DOUSEDRIVE: { onlySpecies: GENESECT, formSuffix: "_4", formName: "HidroROM" },
+  // Arceus plates (BW form numbering: 9 = "?" type is intentionally unused).
+  FISTPLATE: { onlySpecies: ARCEUS, formSuffix: "_1", formName: "Tipo Lucha" },
+  SKYPLATE: { onlySpecies: ARCEUS, formSuffix: "_2", formName: "Tipo Volador" },
+  TOXICPLATE: { onlySpecies: ARCEUS, formSuffix: "_3", formName: "Tipo Veneno" },
+  EARTHPLATE: { onlySpecies: ARCEUS, formSuffix: "_4", formName: "Tipo Tierra" },
+  STONEPLATE: { onlySpecies: ARCEUS, formSuffix: "_5", formName: "Tipo Roca" },
+  INSECTPLATE: { onlySpecies: ARCEUS, formSuffix: "_6", formName: "Tipo Bicho" },
+  SPOOKYPLATE: { onlySpecies: ARCEUS, formSuffix: "_7", formName: "Tipo Fantasma" },
+  IRONPLATE: { onlySpecies: ARCEUS, formSuffix: "_8", formName: "Tipo Acero" },
+  FLAMEPLATE: { onlySpecies: ARCEUS, formSuffix: "_10", formName: "Tipo Fuego" },
+  SPLASHPLATE: { onlySpecies: ARCEUS, formSuffix: "_11", formName: "Tipo Agua" },
+  MEADOWPLATE: { onlySpecies: ARCEUS, formSuffix: "_12", formName: "Tipo Planta" },
+  ZAPPLATE: { onlySpecies: ARCEUS, formSuffix: "_13", formName: "Tipo Eléctrico" },
+  MINDPLATE: { onlySpecies: ARCEUS, formSuffix: "_14", formName: "Tipo Psíquico" },
+  ICICLEPLATE: { onlySpecies: ARCEUS, formSuffix: "_15", formName: "Tipo Hielo" },
+  DRACOPLATE: { onlySpecies: ARCEUS, formSuffix: "_16", formName: "Tipo Dragón" },
+  DREADPLATE: { onlySpecies: ARCEUS, formSuffix: "_17", formName: "Tipo Siniestro" }
+};
+
+/** Normalizes "pokemon-GIRATINA" / "Giratina" to the species internal name. */
+export function toSpeciesInternalId(sourcePokemonId?: string, fallbackName?: string): string {
+  const fromSource = (sourcePokemonId ?? "").replace(/^pokemon-/i, "").trim().toUpperCase();
+  return fromSource || (fallbackName ?? "").trim().toUpperCase();
+}
+
+export function resolveAppearanceEffect(
+  essentialsId?: string,
+  speciesInternalId?: string
+): AppearanceEffect | null {
+  const internalId = (essentialsId ?? "").trim().toUpperCase();
+  const effect = APPEARANCE_ITEMS_BY_INTERNAL_ID[internalId];
+  if (!effect) {
+    return null;
+  }
+  if (effect.onlySpecies && !effect.onlySpecies.includes((speciesInternalId ?? "").toUpperCase())) {
+    return null;
+  }
+  return effect;
+}
+
+/**
+ * Rewrites a sprite path for an appearance effect. Form suffixes slot in
+ * before the extension (/front/GIRATINA.gif -> /front/GIRATINA_1.gif); shiny
+ * swaps the animation directory for its -shiny sibling. Icon paths are left
+ * untouched — the sprite pack has no shiny icons and almost no form icons.
+ */
+export function applyAppearanceToSpritePath(
+  src: string,
+  effect: AppearanceEffect,
+  kind: "front" | "back" | "icon"
+): string {
+  if (!src || kind === "icon") {
+    return src;
+  }
+  let next = src;
+  if (effect.shiny) {
+    next = next.replace(`/${kind}/`, `/${kind}-shiny/`);
+  }
+  if (effect.formSuffix) {
+    next = next.replace(/(\.[a-z0-9]+)$/i, `${effect.formSuffix}$1`);
+  }
+  return next;
+}
+
+/**
+ * Which equipment slot an item belongs to for a given holder, or null when
+ * it is not equippable at all. Appearance wins over bonus so form items
+ * (plates on Arceus) land in the appearance slot for the species they
+ * transform, while remaining ordinary boosters for everyone else.
+ */
+export function classifyEquipmentSlot(options: {
+  essentialsId?: string;
+  speciesInternalId?: string;
+  heldBonus?: HeldBonusEffect | null;
+  heldEffect?: HeldItemEffect | null;
+}): EquipmentSlot | null {
+  const internalId = (options.essentialsId ?? "").trim().toUpperCase();
+  if (resolveAppearanceEffect(internalId, options.speciesInternalId)) {
+    return "appearance";
+  }
+  const bonus = options.heldBonus !== undefined ? options.heldBonus : resolveHeldBonus(internalId);
+  if (bonus) {
+    return "bonus";
+  }
+  const effect =
+    options.heldEffect !== undefined
+      ? options.heldEffect
+      : resolveHeldItemEffect({ essentialsId: internalId });
+  if (effect) {
+    return effect.consumed ? "battle" : "bonus";
+  }
+  return null;
+}
 
 export function resolveHeldItemEffect(options: {
   essentialsId?: string;

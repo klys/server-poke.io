@@ -1721,6 +1721,10 @@ export default class TradeManager {
       moves: [...(owned.summary.moves ?? [])],
       heldItemId: owned.summary.heldItemId,
       heldItemName: owned.summary.heldItemName,
+      battleItemId: owned.summary.battleItemId,
+      battleItemName: owned.summary.battleItemName,
+      appearanceItemId: owned.summary.appearanceItemId,
+      appearanceItemName: owned.summary.appearanceItemName,
       isEgg: Boolean(owned.summary.isEgg),
       iconImageSrc: catalogEntry?.iconImageSrc,
       rarity: this.venomonRarity(owned.summary)
@@ -1848,11 +1852,16 @@ export default class TradeManager {
             detail: `${venomon.nickname ?? venomon.species} (Lv ${venomon.level})`
           });
         }
-        if (venomon.heldItemName) {
+        const equippedNames = [
+          venomon.heldItemName,
+          venomon.battleItemName,
+          venomon.appearanceItemName
+        ].filter((name): name is string => Boolean(name));
+        if (equippedNames.length > 0) {
           warnings.push({
             code: "HELD_ITEM_TRANSFERS",
             side,
-            detail: `${venomon.nickname ?? venomon.species} is holding ${venomon.heldItemName}.`
+            detail: `${venomon.nickname ?? venomon.species} is holding ${equippedNames.join(", ")}.`
           });
         }
       }
