@@ -247,11 +247,24 @@ export const EQUIPABLE_INTERNAL_IDS: readonly string[] = [
 
 /**
  * Appearance-slot items: while equipped they change how the venomon looks
- * (sprite form variants, ported from Essentials MultipleForms "getForm"
- * handlers; form numbers follow the BW v3.1.1 project this game's sprite
- * pack was exported from). The Shiny Charm is an engine adaptation: any
- * holder swaps to its shiny (variocolor) sprites.
+ * (sprite form variants) and — for the Venova Adventure custom forms — its
+ * typing, base stats, and known moves. Ported from the game's
+ * MultipleForms "getForm"/"onSetForm" handlers (Venova Scripts.rxdata,
+ * section Pokemon_MultipleForms; sprite numbering follows that project).
+ * Only the ITEM trigger is ported: the scripts' map-id trigger
+ * (maps 49/50/51/72/73) is a copy-paste bug — those are Pokémon Centers and
+ * houses, not the Distortion World. The Shiny Charm is an engine
+ * adaptation: any holder swaps to its shiny (variocolor) sprites.
  */
+export type AppearanceBaseStatsOverride = {
+  hp?: number;
+  attack?: number;
+  defense?: number;
+  specialAttack?: number;
+  specialDefense?: number;
+  speed?: number;
+};
+
 export type AppearanceEffect = {
   /** Species internal names the item works on; absent = any venomon. */
   onlySpecies?: string[];
@@ -261,27 +274,109 @@ export type AppearanceEffect = {
   shiny?: boolean;
   /** Display label for the UI ("Forma Origen"). */
   formName?: string;
+  /** Replace the primary/secondary type while equipped (Venova forms). */
+  typesOverride?: { type1?: string; type2?: string };
+  /** Replace individual base stats while equipped (Venova forms). */
+  baseStatsOverride?: AppearanceBaseStatsOverride;
+  /** Move (Essentials internal id) the holder knows while equipped
+   * (Canamate's HACKEO). Granted on equip, removed on unequip. */
+  grantsMoveId?: string;
 };
 
 const ARCEUS = ["ARCEUS"];
 const GENESECT = ["GENESECT"];
 
-export const APPEARANCE_ITEMS_BY_INTERNAL_ID: Record<string, AppearanceEffect> = {
+/**
+ * Items shared between species (plates, Griseous Orb) carry one variant per
+ * species; resolveAppearanceEffect picks the one matching the holder.
+ */
+export const APPEARANCE_ITEMS_BY_INTERNAL_ID: Record<
+  string,
+  AppearanceEffect | AppearanceEffect[]
+> = {
   SHINYCHARM: { shiny: true, formName: "Variocolor" },
-  GRISEOUSORB: { onlySpecies: ["GIRATINA"], formSuffix: "_1", formName: "Forma Origen" },
-  SHOCKDRIVE: { onlySpecies: GENESECT, formSuffix: "_1", formName: "FulgoROM" },
-  BURNDRIVE: { onlySpecies: GENESECT, formSuffix: "_2", formName: "PiroROM" },
-  CHILLDRIVE: { onlySpecies: GENESECT, formSuffix: "_3", formName: "CrioROM" },
-  DOUSEDRIVE: { onlySpecies: GENESECT, formSuffix: "_4", formName: "HidroROM" },
+  // "Hueso Maldito": Sayolda (HAUNTER) Forma Origen in Venova; kept working
+  // for stock Giratina too (Venova's scripts dropped that handler, but the
+  // sprites and lore still exist).
+  GRISEOUSORB: [
+    {
+      onlySpecies: ["HAUNTER"],
+      formSuffix: "_1",
+      formName: "Forma Origen",
+      typesOverride: { type2: "DARK" },
+      baseStatsOverride: { hp: 80, attack: 100, defense: 90, speed: 90, specialAttack: 120, specialDefense: 95 }
+    },
+    { onlySpecies: ["GIRATINA"], formSuffix: "_1", formName: "Forma Origen" }
+  ],
+  // "Pendrive": Canamate (ARIADOS) Forma Origen — gains DARK typing and the
+  // exclusive move HACKEO while the pendrive is equipped.
+  PENDRIVE: {
+    onlySpecies: ["ARIADOS"],
+    formSuffix: "_1",
+    formName: "Forma Origen",
+    typesOverride: { type2: "DARK" },
+    baseStatsOverride: { hp: 70, attack: 50, defense: 70, speed: 90, specialAttack: 60, specialDefense: 100 },
+    grantsMoveId: "HACKEO"
+  },
+  // "Reliquia Dorada": Elebeon (HOOTHOOT) Forma Origen — stats only.
+  ADAMANTORB: {
+    onlySpecies: ["HOOTHOOT"],
+    formSuffix: "_1",
+    formName: "Forma Origen",
+    baseStatsOverride: { hp: 120, attack: 180, defense: 100, speed: 90, specialAttack: 100, specialDefense: 125 }
+  },
+  // "Zafiro Corrupto": Toniptera (GOLDUCK) Forma Origen.
+  ZAFIRO: {
+    onlySpecies: ["GOLDUCK"],
+    formSuffix: "_1",
+    formName: "Forma Origen",
+    typesOverride: { type2: "GHOST" },
+    baseStatsOverride: { hp: 70, attack: 60, defense: 78, speed: 120, specialAttack: 120, specialDefense: 80 }
+  },
+  // "Caparazón Fluvial": Morroan (PARASECT) Forma Origen.
+  CAPARAZON: {
+    onlySpecies: ["PARASECT"],
+    formSuffix: "_1",
+    formName: "Forma Origen",
+    typesOverride: { type2: "WATER" },
+    baseStatsOverride: { hp: 70, attack: 100, defense: 120, speed: 40, specialAttack: 60, specialDefense: 110 }
+  },
+  // "Lápida Oscura": Yaregon (TYPHLOSION) Forma Origen. The script's move
+  // grant is dead code (no LAPIDA move exists in the game) — not ported.
+  LAPIDA: {
+    onlySpecies: ["TYPHLOSION"],
+    formSuffix: "_1",
+    formName: "Forma Origen",
+    typesOverride: { type1: "DRAGON", type2: "GHOST" },
+    baseStatsOverride: { hp: 130, attack: 150, defense: 90, speed: 110, specialAttack: 60, specialDefense: 120 }
+  },
   // Arceus plates (BW form numbering: 9 = "?" type is intentionally unused).
-  FISTPLATE: { onlySpecies: ARCEUS, formSuffix: "_1", formName: "Tipo Lucha" },
-  SKYPLATE: { onlySpecies: ARCEUS, formSuffix: "_2", formName: "Tipo Volador" },
+  // Five of them are Faidy's (MEW) "Mágica" instruments in Venova and get a
+  // second variant: a secondary-type change (STONEPLATE really is NORMAL per
+  // the getForm table, despite boosting Rock damage as a held bonus).
+  FISTPLATE: [
+    { onlySpecies: ARCEUS, formSuffix: "_1", formName: "Tipo Lucha" },
+    { onlySpecies: ["MEW"], formSuffix: "_2", formName: "Tambór Mágico", typesOverride: { type2: "FIGHTING" } }
+  ],
+  SKYPLATE: [
+    { onlySpecies: ARCEUS, formSuffix: "_2", formName: "Tipo Volador" },
+    { onlySpecies: ["MEW"], formSuffix: "_1", formName: "Flauta Mágica", typesOverride: { type2: "FLYING" } }
+  ],
   TOXICPLATE: { onlySpecies: ARCEUS, formSuffix: "_3", formName: "Tipo Veneno" },
-  EARTHPLATE: { onlySpecies: ARCEUS, formSuffix: "_4", formName: "Tipo Tierra" },
-  STONEPLATE: { onlySpecies: ARCEUS, formSuffix: "_5", formName: "Tipo Roca" },
+  EARTHPLATE: [
+    { onlySpecies: ARCEUS, formSuffix: "_4", formName: "Tipo Tierra" },
+    { onlySpecies: ["MEW"], formSuffix: "_3", formName: "Maraca Mágica", typesOverride: { type2: "GROUND" } }
+  ],
+  STONEPLATE: [
+    { onlySpecies: ARCEUS, formSuffix: "_5", formName: "Tipo Roca" },
+    { onlySpecies: ["MEW"], formSuffix: "_4", formName: "Cuatro Mágico", typesOverride: { type2: "NORMAL" } }
+  ],
   INSECTPLATE: { onlySpecies: ARCEUS, formSuffix: "_6", formName: "Tipo Bicho" },
   SPOOKYPLATE: { onlySpecies: ARCEUS, formSuffix: "_7", formName: "Tipo Fantasma" },
-  IRONPLATE: { onlySpecies: ARCEUS, formSuffix: "_8", formName: "Tipo Acero" },
+  IRONPLATE: [
+    { onlySpecies: ARCEUS, formSuffix: "_8", formName: "Tipo Acero" },
+    { onlySpecies: ["MEW"], formSuffix: "_5", formName: "Arpa Mágica", typesOverride: { type2: "STEEL" } }
+  ],
   FLAMEPLATE: { onlySpecies: ARCEUS, formSuffix: "_10", formName: "Tipo Fuego" },
   SPLASHPLATE: { onlySpecies: ARCEUS, formSuffix: "_11", formName: "Tipo Agua" },
   MEADOWPLATE: { onlySpecies: ARCEUS, formSuffix: "_12", formName: "Tipo Planta" },
@@ -303,14 +398,53 @@ export function resolveAppearanceEffect(
   speciesInternalId?: string
 ): AppearanceEffect | null {
   const internalId = (essentialsId ?? "").trim().toUpperCase();
-  const effect = APPEARANCE_ITEMS_BY_INTERNAL_ID[internalId];
-  if (!effect) {
+  const entry = APPEARANCE_ITEMS_BY_INTERNAL_ID[internalId];
+  if (!entry) {
     return null;
   }
-  if (effect.onlySpecies && !effect.onlySpecies.includes((speciesInternalId ?? "").toUpperCase())) {
-    return null;
+  const species = (speciesInternalId ?? "").toUpperCase();
+  const variants = Array.isArray(entry) ? entry : [entry];
+  return (
+    variants.find(
+      (variant) => !variant.onlySpecies || variant.onlySpecies.includes(species)
+    ) ?? null
+  );
+}
+
+/**
+ * The holder's effective typing while the appearance item is equipped:
+ * type1/type2 replace the species' base slots (a Venova "Forma Origen").
+ * Base types come from the species definition, never from a previously
+ * overridden list — callers must pass the catalog types.
+ */
+export function applyAppearanceToTypes(baseTypes: string[], effect: AppearanceEffect | null): string[] {
+  if (!effect?.typesOverride) {
+    return [...baseTypes];
   }
-  return effect;
+  const type1 = effect.typesOverride.type1 ?? baseTypes[0];
+  const type2 = effect.typesOverride.type2 ?? baseTypes[1];
+  const next = [type1, type2].filter(
+    (type): type is string => typeof type === "string" && type.trim().length > 0
+  );
+  // Collapse duplicate slots (mono-type forms) while keeping order.
+  return next.filter((type, index) => next.indexOf(type) === index);
+}
+
+/** The holder's effective base stats while the appearance item is equipped. */
+export function applyAppearanceToBaseStats<T extends Record<string, number>>(
+  baseStats: T,
+  effect: AppearanceEffect | null
+): T {
+  if (!effect?.baseStatsOverride) {
+    return baseStats;
+  }
+  const next = { ...baseStats } as Record<string, number>;
+  for (const [stat, value] of Object.entries(effect.baseStatsOverride)) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      next[stat] = value;
+    }
+  }
+  return next as T;
 }
 
 /**

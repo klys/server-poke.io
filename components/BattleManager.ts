@@ -40,12 +40,15 @@ import {
 } from "./battle/fieldItemEffects";
 import { canSpeciesLearnMachineMove } from "./TmCompatibility";
 import {
+  applyAppearanceToBaseStats,
   applyAppearanceToSpritePath,
+  applyAppearanceToTypes,
   classifyEquipmentSlot,
   resolveAppearanceEffect,
   resolveHeldBonus,
   resolveHeldItemEffect,
   toSpeciesInternalId,
+  type AppearanceEffect,
   type EquipmentSlot,
   type HeldBonusEffect,
   type HeldItemEffect
@@ -2737,8 +2740,13 @@ export default class BattleManager {
       }
     }
 
+    const previousAppearance =
+      naturalSlot === "appearance" ? this.resolveAppearanceForSummary(targetPokemon) : null;
     targetPokemon[fields.id] = itemDefinition.id;
     targetPokemon[fields.name] = itemDefinition.name;
+    if (naturalSlot === "appearance") {
+      await this.applyAppearanceFormChange(targetPokemon, previousAppearance);
+    }
     const nextUser = await this.auth.saveBattleState(userId, {
       pokemonParty: user.pokemonParty,
       inventory
@@ -2833,8 +2841,13 @@ export default class BattleManager {
       ? this.addInventoryQuantity(user.inventory, itemDefinition, 1)
       : user.inventory;
 
+    const previousAppearance =
+      slot === "appearance" ? this.resolveAppearanceForSummary(targetPokemon) : null;
     targetPokemon[fields.id] = undefined;
     targetPokemon[fields.name] = undefined;
+    if (slot === "appearance") {
+      await this.applyAppearanceFormChange(targetPokemon, previousAppearance);
+    }
     const nextUser = await this.auth.saveBattleState(userId, {
       pokemonParty: user.pokemonParty,
       inventory
@@ -4080,6 +4093,21 @@ export default class BattleManager {
         } else if (slot === "appearance") {
           pokemon.appearanceItemId = itemDefinition.id;
           pokemon.appearanceItemName = itemDefinition.name;
+          const effect = resolveAppearanceEffect(itemDefinition.essentialsId, species);
+          if (effect) {
+            pokemon.types = applyAppearanceToTypes(pokemon.types, effect).map(normalizeType);
+            pokemon.baseStats = applyAppearanceToBaseStats(pokemon.baseStats, effect);
+            const formStats = calculateStats(
+              pokemon.baseStats,
+              pokemon.level,
+              pokemon.statBonuses,
+              pokemon.ivs,
+              pokemon.evs
+            );
+            pokemon.stats = formStats;
+            pokemon.maxHp = formStats.hp;
+            pokemon.hp = formStats.hp;
+          }
           const sprites = this.resolveBattleSprites(
             pokemon.frontImageSrc,
             pokemon.backImageSrc,
@@ -10601,14 +10629,19 @@ export default class BattleManager {
     const statBonuses = sanitizePokemonStatBonuses(pokemon.statBonuses);
     const ivs = sanitizeBattleStats(pokemon.ivs, 31);
     const evs = sanitizeBattleStats(pokemon.evs, MAX_EV_PER_STAT);
-    const baseStats = definition?.baseStats ?? {
-      hp: pokemon.maxHp,
-      attack: Math.max(1, pokemon.maxHp),
-      defense: Math.max(1, pokemon.maxHp),
-      specialAttack: Math.max(1, pokemon.maxHp),
-      specialDefense: Math.max(1, pokemon.maxHp),
-      speed: Math.max(1, pokemon.maxHp)
-    };
+    // Venova form items (appearance slot) can override base stats and typing.
+    const appearance = this.resolveAppearanceForSummary(pokemon);
+    const baseStats = applyAppearanceToBaseStats(
+      definition?.baseStats ?? {
+        hp: pokemon.maxHp,
+        attack: Math.max(1, pokemon.maxHp),
+        defense: Math.max(1, pokemon.maxHp),
+        specialAttack: Math.max(1, pokemon.maxHp),
+        specialDefense: Math.max(1, pokemon.maxHp),
+        speed: Math.max(1, pokemon.maxHp)
+      },
+      appearance
+    );
     const stats = calculateStats(baseStats, level, statBonuses, ivs, evs);
     const learnedMoveNames = pokemon.moves.length > 0
       ? pokemon.moves
@@ -10637,7 +10670,12 @@ export default class BattleManager {
       name: pokemon.name,
       nickname: pokemon.nickname,
       level,
-      types: pokemon.types.length > 0 ? pokemon.types.map(normalizeType) : definition?.types ?? [],
+      types:
+        appearance?.typesOverride && definition
+          ? applyAppearanceToTypes(definition.types, appearance).map(normalizeType)
+          : pokemon.types.length > 0
+            ? pokemon.types.map(normalizeType)
+            : definition?.types ?? [],
       hp: clamp(pokemon.hp, 0, stats.hp),
       maxHp: stats.hp,
       experience: Math.max(0, Math.round(pokemon.experience)),
@@ -10705,6 +10743,134 @@ export default class BattleManager {
   /** Item ids follow "item-<essentialsid>"; recover the internal id. */
   private internalIdFromItemId(itemId?: string | null) {
     return (itemId ?? "").replace(/^item-/i, "").trim().toUpperCase();
+  }
+
+  /**
+   * Applies a Venova form change after the appearance slot mutated: typing
+   * and maxHp are rebuilt from the catalog base data plus the current
+   * effect's overrides, and a granted move (Canamate's HACKEO) is learned or
+   * forgotten. `previousEffect` is the effect of the item that just left the
+   * slot. Mirrors the MultipleForms onSetForm behavior of the original game.
+   */
+  private async applyAppearanceFormChange(
+    targetPokemon: PokemonSummary,
+    previousEffect: AppearanceEffect | null
+  ) {
+    const catalogs = await this.loadCatalogs();
+    const definition = this.resolveSummaryDefinition(targetPokemon, catalogs);
+    const nextEffect = this.resolveAppearanceForSummary(targetPokemon);
+
+    if (definition) {
+      targetPokemon.types = applyAppearanceToTypes(definition.types, nextEffect).map(normalizeType);
+      this.recomputeSummaryMaxHp(targetPokemon, {
+        ...definition,
+        baseStats: applyAppearanceToBaseStats(definition.baseStats, nextEffect)
+      });
+    }
+
+    const previousMoveId = previousEffect?.grantsMoveId ?? null;
+    const nextMoveId = nextEffect?.grantsMoveId ?? null;
+    if (previousMoveId && previousMoveId !== nextMoveId) {
+      this.removeGrantedMove(targetPokemon, previousMoveId, definition, catalogs);
+    }
+    if (nextMoveId && nextMoveId !== previousMoveId) {
+      this.grantAppearanceMove(targetPokemon, nextMoveId, catalogs);
+    }
+  }
+
+  private resolveSkillByInternalId(
+    internalId: string,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ): SkillDefinition | null {
+    const normalized = internalId.trim().toUpperCase();
+    return (
+      catalogs.skillsById.get(`skill-${normalized}`) ??
+      catalogs.skillsById.get(`skill-${normalized.toLowerCase()}`) ??
+      catalogs.skillsByName.get(normalized.toLowerCase()) ??
+      null
+    );
+  }
+
+  /** Teach the form move: directly with a free slot, else as a pending learn
+   * the player resolves from the Moves tab (replace prompt). */
+  private grantAppearanceMove(
+    targetPokemon: PokemonSummary,
+    moveInternalId: string,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ) {
+    const skill = this.resolveSkillByInternalId(moveInternalId, catalogs);
+    if (!skill) {
+      return;
+    }
+    const sameMove = (name: string) => name.toLowerCase() === skill.name.toLowerCase();
+    if (targetPokemon.moves.some(sameMove)) {
+      return;
+    }
+    if (targetPokemon.moves.length < 4) {
+      targetPokemon.moves = [...targetPokemon.moves, skill.name];
+      targetPokemon.movePp = { ...(targetPokemon.movePp ?? {}), [skill.name]: skill.powerPoint };
+      return;
+    }
+    const pending = targetPokemon.pendingMoveLearns ?? [];
+    if (!pending.some(sameMove)) {
+      targetPokemon.pendingMoveLearns = [...pending, skill.name];
+    }
+  }
+
+  /** Forget the form move on unequip; a venomon never ends up move-less —
+   * the original script falls back to a basic move (Canamate: Impactrueno). */
+  private removeGrantedMove(
+    targetPokemon: PokemonSummary,
+    moveInternalId: string,
+    definition: PokemonDefinition | null,
+    catalogs: Awaited<ReturnType<BattleManager["loadCatalogs"]>>
+  ) {
+    const skill = this.resolveSkillByInternalId(moveInternalId, catalogs);
+    if (!skill) {
+      return;
+    }
+    const sameMove = (name: string) => name.toLowerCase() === skill.name.toLowerCase();
+    targetPokemon.moves = targetPokemon.moves.filter((name) => !sameMove(name));
+    const movePp = { ...(targetPokemon.movePp ?? {}) };
+    delete movePp[skill.name];
+    targetPokemon.movePp = movePp;
+    targetPokemon.pendingMoveLearns = (targetPokemon.pendingMoveLearns ?? []).filter(
+      (name) => !sameMove(name)
+    );
+
+    if (targetPokemon.moves.length === 0) {
+      const fallbackEntry = (definition?.skills ?? [])
+        .filter((entry) => entry.level <= targetPokemon.level)
+        .sort((a, b) => a.level - b.level)[0];
+      const fallbackSkill = fallbackEntry
+        ? catalogs.skillsById.get(fallbackEntry.skillId) ??
+          catalogs.skillsByName.get(fallbackEntry.skillName.toLowerCase()) ??
+          null
+        : this.resolveSkillByInternalId("THUNDERSHOCK", catalogs);
+      if (fallbackSkill) {
+        targetPokemon.moves = [fallbackSkill.name];
+        targetPokemon.movePp = {
+          ...(targetPokemon.movePp ?? {}),
+          [fallbackSkill.name]: fallbackSkill.powerPoint
+        };
+      }
+    }
+  }
+
+  /** The appearance effect of the item in a holder's appearance slot. */
+  private resolveAppearanceForSummary(pokemon: {
+    appearanceItemId?: string | null;
+    sourcePokemonId?: string;
+    name: string;
+  }): AppearanceEffect | null {
+    if (!pokemon.appearanceItemId) {
+      return null;
+    }
+    const definition = this.getCachedItemDefinition(pokemon.appearanceItemId, "");
+    return resolveAppearanceEffect(
+      definition?.essentialsId ?? this.internalIdFromItemId(pokemon.appearanceItemId),
+      toSpeciesInternalId(pokemon.sourcePokemonId, pokemon.name)
+    );
   }
 
   private buildWildPokemon(

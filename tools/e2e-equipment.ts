@@ -12,6 +12,9 @@
  *   T7  an explicit slot that contradicts the item's class is refused
  *   T8  a legacy berry stored in the old single heldItem slot migrates to the
  *       battle slot on the next session load
+ *   T9  Venova form: equipping the Pendrive on a Canamate (ARIADOS) adds the
+ *       DARK typing and teaches the exclusive move Hackeo
+ *   T10 unequipping the Pendrive reverts typing and forgets Hackeo
  *
  * Run:  cd server-poke.io && node_modules/.bin/ts-node tools/e2e-equipment.ts
  */
@@ -331,6 +334,48 @@ async function main() {
     }
     if (migrated.heldItemId) fail(`legacy heldItemId lingers (${migrated.heldItemId})`);
     pass("legacy berry moved from heldItem* to battleItem* on load");
+
+    // ---- T9 Venova form: Pendrive on Canamate (ARIADOS) -------------------
+    log("── T9 Pendrive transforms Canamate ──");
+    const canamate = {
+      ...leaderSummary(),
+      id: `e2e-canamate-${Date.now()}`,
+      sourcePokemonId: "pokemon-ARIADOS",
+      name: "Canamate",
+      types: ["ELECTRIC"],
+      moves: ["Impactrueno"]
+    };
+    await redis.hSet(charKey, {
+      pokemon_party: JSON.stringify([legacy, canamate]),
+      inventory: JSON.stringify([item("item-pendrive", "Pendrive", 1)])
+    });
+    await relogin(legacy.id);
+    const partyMember = (id: string) =>
+      (session?.user?.pokemonParty ?? []).find((entry: any) => entry.id === id);
+    socket.emit("inventory:hold-item", { pokemonId: canamate.id, itemId: "item-pendrive" });
+    await waitFor(
+      "Pendrive equipped",
+      () => partyMember(canamate.id)?.appearanceItemId === "item-pendrive"
+    );
+    const formed = partyMember(canamate.id);
+    const hasType = (pokemon: any, type: string) =>
+      (pokemon.types as string[]).some((entry) => entry.toUpperCase() === type);
+    if (!(hasType(formed, "ELECTRIC") && hasType(formed, "DARK"))) {
+      fail(`types not overridden: ${JSON.stringify(formed.types)}`);
+    }
+    if (!formed.moves.includes("Hackeo")) fail(`Hackeo not granted: ${JSON.stringify(formed.moves)}`);
+    pass("Canamate gained the DARK typing and learned Hackeo");
+
+    // ---- T10 unequip reverts the Venova form ------------------------------
+    log("── T10 removing the Pendrive reverts the form ──");
+    socket.emit("inventory:take-held-item", { pokemonId: canamate.id, slot: "appearance" });
+    await waitFor("Pendrive removed", () => !partyMember(canamate.id)?.appearanceItemId);
+    const reverted = partyMember(canamate.id);
+    if (hasType(reverted, "DARK")) fail(`DARK type lingers: ${JSON.stringify(reverted.types)}`);
+    if (reverted.moves.includes("Hackeo")) fail(`Hackeo lingers: ${JSON.stringify(reverted.moves)}`);
+    if (reverted.moves.length === 0) fail("moveset emptied on unequip");
+    if (bagQty("item-pendrive") !== 1) fail("Pendrive not returned to bag");
+    pass("form reverted: DARK typing gone, Hackeo forgotten, Pendrive back in bag");
 
     log(`\nALL PASS — ${passed} assertions`);
   } finally {
