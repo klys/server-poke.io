@@ -2526,6 +2526,10 @@ function createConnectionHandler(
         // Per-character gameplay knobs that live on the world entity.
         playerRegistration.player.followerEnabled = session.user.followerEnabled;
         playerRegistration.player.pushDepth = session.user.pushDepth;
+        // Restore a still-running repellent charge (persisted per character).
+        void battleManager.loadRepelStateForPlayer(playerRegistration.player).catch((error) => {
+          console.error("Unable to restore repel state:", error);
+        });
         // Materialize (or refresh) the follower venomon for this player.
         world.followerSimulation?.refreshFor(playerRegistration.player);
       }

@@ -694,7 +694,8 @@ const CHARACTER_GAMEPLAY_FIELDS = [
     "event_self_switches",
     "egg_cooldowns",
     "follower_enabled",
-    "push_depth"
+    "push_depth",
+    "repel_steps"
 ] as const;
 const DEFAULT_ROLE_DEFINITIONS:RoleDefinition[] = [
     {
@@ -1252,7 +1253,8 @@ export default class Auth {
                 "inventory", "pokemon_party", "battle_history", "visited_towns",
                 "last_map_id", "last_x", "last_y", "last_surfing", "respawn_point",
                 "event_switches", "event_variables", "event_self_switches",
-                "egg_cooldowns", "money", "follower_enabled", "push_depth"
+                "egg_cooldowns", "money", "follower_enabled", "push_depth",
+                "repel_steps"
             ]);
             await this.redis.hSet(this.characterKey(characterId), {
                 purged_at: new Date().toISOString()
@@ -1388,6 +1390,23 @@ export default class Auth {
         await this.redis.hSet(await this.activeCharacterKey(userId), {
             follower_enabled: enabled ? "1" : "0"
         });
+    }
+
+    /** Remaining repel steps persisted on the active character (0 = none). */
+    public async getRepelSteps(userId:number):Promise<number> {
+        const raw = await this.redis.hGet(await this.activeCharacterKey(userId), "repel_steps");
+        const parsed = Number.parseInt(raw ?? "", 10);
+        return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+    }
+
+    /** Persists the remaining repel steps (deletes the field when depleted). */
+    public async saveRepelSteps(userId:number, steps:number) {
+        const key = await this.activeCharacterKey(userId);
+        if (steps > 0) {
+            await this.redis.hSet(key, { repel_steps: String(Math.round(steps)) });
+        } else {
+            await this.redis.hDel(key, "repel_steps");
+        }
     }
 
     /** Clamped push-chain depth; missing/garbage falls back to the default. */
