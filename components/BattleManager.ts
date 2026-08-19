@@ -89,7 +89,7 @@ import type Player from "./player";
 import type World from "./world";
 import { resolveInitialSpawnFromPlayableMapsState } from "./PlayableMapsState";
 import { resolveDivePair } from "./diveMaps";
-import { isDeepWaterTag, isSurfableWaterTag } from "./terrainTags";
+import { GRASS_TERRAIN_TAG, isDeepWaterTag, isSurfableWaterTag } from "./terrainTags";
 import type ClientToServerEvents from "../Server/ClientToServerEvents";
 import type InterServerEvents from "../Server/InterServerEvents";
 import type { SocketData } from "../Server/registerSocketHandlers";
@@ -126,6 +126,9 @@ export type BattleActionRequest = {
   battleId: string;
   action: BattleClientAction;
 };
+
+/** Terrain context a battle starts in, used to pick the backdrop variant. */
+type BattleBackContext = "grass" | "water" | "underwater" | "cave";
 
 export type BattleChallengePayload = {
   targetPlayerId: string;
@@ -1035,6 +1038,10 @@ export default class BattleManager {
       }>;
     }
   > | null = null;
+  /** Battleback names present in designer:section:battleBackgrounds (lower-
+   * cased), loaded once by loadCatalogs so resolveBattleBackForPlayer can
+   * prefer terrain variants ("CaveWater") that actually exist. */
+  private cachedBattleBackNames: Set<string> | null = null;
   private readonly challenges = new Map<string, ChallengeRequest>();
   private readonly tradeRequests = new Map<string, TradeRequest>();
   /**
@@ -1842,7 +1849,7 @@ export default class BattleManager {
     if (!grass || (grass.pokemonIds.length === 0 && !grass.encounterRows?.length)) {
       return { ok: false, message: "There's no tall grass to search here." };
     }
-    await this.startWildBattle(player, grass);
+    await this.startWildBattle(player, grass, "grass");
     return { ok: true, message: `The ${item.name} found a rustling patch of grass!` };
   }
 
@@ -1863,15 +1870,17 @@ export default class BattleManager {
     }
     const snapshot = this.world.getPlayableMapsState();
     const editorData = snapshot?.editorDataByMapId[player.currentMapId];
-    const table = this.getMapEncounterTable(editorData);
+    const table = this.getMapEncounterTable(player.currentMapId, editorData);
     if (!table || (table.pokemonIds.length === 0 && !table.encounterRows?.length)) {
       return;
     }
     await this.startWildBattle(player, table);
   }
 
-  /** The map's shared grass encounter table (fishing fallback pool). */
+  /** The map's shared walking encounter pool: the grass-cell carrier table,
+   * falling back to the Cave table on grass-less cave-style maps. */
   private getMapEncounterTable(
+    mapId: string,
     editorData:
       | { grass: Array<{ pokemonIds: string[]; minLevel: number; maxLevel: number; encounterRows?: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }> }> }
       | undefined
@@ -1879,15 +1888,19 @@ export default class BattleManager {
     const carrier = (editorData?.grass ?? []).find(
       (cell) => (cell.encounterRows?.length ?? 0) > 0 || cell.pokemonIds.length > 0
     );
-    if (!carrier) {
-      return null;
+    if (carrier) {
+      return {
+        pokemonIds: carrier.pokemonIds,
+        minLevel: carrier.minLevel,
+        maxLevel: carrier.maxLevel,
+        encounterRows: carrier.encounterRows
+      };
     }
-    return {
-      pokemonIds: carrier.pokemonIds,
-      minLevel: carrier.minLevel,
-      maxLevel: carrier.maxLevel,
-      encounterRows: carrier.encounterRows
-    };
+    const cave = this.getEncounterTableForMap(mapId, "Cave");
+    if (cave) {
+      return { pokemonIds: [], minLevel: 1, maxLevel: 100, encounterRows: cave.rows };
+    }
+    return null;
   }
 
   /** Normalizes designer:section:encounters items into the per-map cache.
@@ -2121,7 +2134,7 @@ export default class BattleManager {
       if (Math.random() > biteChance) {
         return { ok: true, message: "No pica nada..." };
       }
-      await this.startWildBattle(player, table);
+      await this.startWildBattle(player, table, "water");
       return { ok: true, message: `¡Oh! ¡Algo ha picado en la ${item.name}!`, battleStarted: true };
     } finally {
       this.world.emitToMap(player.currentMapId, "player:pose", {
@@ -3343,7 +3356,7 @@ export default class BattleManager {
     }
 
     this.pendingStepChecks.add(player.socketId);
-    void this.startWildBattle(player, step.table)
+    void this.startWildBattle(player, step.table, step.context)
       .catch((error) => {
         console.error("Unable to start wild battle:", error);
         this.emitToPlayer(player, "battle:error", { message: "Unable to start a wild battle." });
@@ -3363,6 +3376,8 @@ export default class BattleManager {
    * Kept strictly per traversal mode so the pools never bleed into each other:
    * - surfing        -> the map's Essentials "Water" table (water density)
    * - walking (land) -> derived tall-grass cells (Land table)
+   * - cave-style map -> the map's "Cave" table on ANY walked tile, mirroring
+   *   Essentials' has_cave_encounters? rule (cave maps have no grass tiles)
    * - underwater map -> the underwater map's own "Land" table, the old
    *   Essentials convention for underwater encounters (their floors have no
    *   grass terrain tag, so no grass cells were derived there)
@@ -3370,6 +3385,7 @@ export default class BattleManager {
   private getStepEncounterForPlayer(player: Player): {
     key: string;
     encounterRate: number;
+    context: BattleBackContext;
     table: {
       pokemonIds: string[];
       minLevel: number;
@@ -3391,6 +3407,7 @@ export default class BattleManager {
       return {
         key: `water:${player.currentMapId}:${cellX}:${cellY}`,
         encounterRate: table.encounterRate,
+        context: "water",
         table: { pokemonIds: [], minLevel: 1, maxLevel: 100, encounterRows: table.rows }
       };
     }
@@ -3400,7 +3417,18 @@ export default class BattleManager {
       return {
         key: `grass:${player.currentMapId}:${grass.x}:${grass.y}`,
         encounterRate: grass.encounterRate,
+        context: "grass",
         table: grass
+      };
+    }
+
+    const cave = this.getEncounterTableForMap(player.currentMapId, "Cave");
+    if (cave) {
+      return {
+        key: `cave:${player.currentMapId}:${cellX}:${cellY}`,
+        encounterRate: cave.encounterRate,
+        context: "cave",
+        table: { pokemonIds: [], minLevel: 1, maxLevel: 100, encounterRows: cave.rows }
       };
     }
 
@@ -3410,6 +3438,7 @@ export default class BattleManager {
         return {
           key: `underwater:${player.currentMapId}:${cellX}:${cellY}`,
           encounterRate: table.encounterRate,
+          context: "underwater",
           table: { pokemonIds: [], minLevel: 1, maxLevel: 100, encounterRows: table.rows }
         };
       }
@@ -3779,7 +3808,8 @@ export default class BattleManager {
       minLevel: number;
       maxLevel: number;
       encounterRows?: Array<{ weight: number; pokemonId: string; minLevel: number; maxLevel: number }>;
-    }
+    },
+    context?: BattleBackContext
   ) {
     if (player.userId === null || (grass.pokemonIds.length === 0 && !(grass.encounterRows?.length))) {
       return;
@@ -3847,7 +3877,7 @@ export default class BattleManager {
       playerSide,
       wildSide,
       [`A wild ${getPokemonDisplayName(wildPokemon)} appeared.`],
-      this.resolveBattleBackForPlayer(player, true)
+      this.resolveBattleBackForPlayer(player, context)
     );
 
     this.activateBattle(battle);
@@ -4092,7 +4122,7 @@ export default class BattleManager {
       playerSide,
       wildSide,
       [`A wild ${getPokemonDisplayName(wildPokemon)} appeared.`],
-      this.resolveBattleBackForPlayer(player, true)
+      this.resolveBattleBackForPlayer(player)
     );
 
     this.activateBattle(battle);
@@ -4250,11 +4280,18 @@ export default class BattleManager {
 
   /**
    * Resolves the Essentials battleback for the map a player is standing on
-   * (imported from PBS metadata.txt into playableMapConfig.battleBack).
-   * Wild battles that started in tall grass upgrade the plain Field backdrop
-   * to its grass variant, mirroring Essentials' terrain-based bases.
+   * (imported from PBS metadata.txt into playableMapConfig.battleBack),
+   * upgraded to the terrain variant of where the battle actually started —
+   * grass, open water (surfing/fishing), cave floor or an underwater map —
+   * mirroring Essentials' environment-based backdrops. Wild encounters pass
+   * their pool's context; every other battle kind (NPC, PvP, scripted) infers
+   * it from the player's current terrain, so a surf PvP gets a water backdrop.
+   * Variants are only chosen when they exist in the battleBackgrounds section.
    */
-  private resolveBattleBackForPlayer(player: Player | null | undefined, fromGrass = false): string | null {
+  private resolveBattleBackForPlayer(
+    player: Player | null | undefined,
+    context?: BattleBackContext
+  ): string | null {
     if (!player) {
       return null;
     }
@@ -4262,16 +4299,56 @@ export default class BattleManager {
     const snapshot = this.world.getPlayableMapsState();
     const map = snapshot?.items.find((item) => item.id === player.currentMapId);
     const config = map?.playableMapConfig as { battleBack?: unknown } | undefined;
-    let name =
+    const base =
       typeof config?.battleBack === "string" && config.battleBack.trim().length > 0
         ? config.battleBack.trim()
         : null;
 
-    if (fromGrass && (!name || name.toLowerCase() === "field")) {
-      name = "FieldGrass";
+    const resolved = context ?? this.inferBattleBackContext(player);
+
+    const candidates: string[] = [];
+    if (resolved === "water") {
+      if (base) {
+        candidates.push(`${base}Water`);
+      }
+      candidates.push("Water");
+    } else if (resolved === "underwater") {
+      candidates.push("Underwater");
+    } else if (resolved === "grass") {
+      if (base) {
+        candidates.push(`${base}Grass`);
+      } else {
+        candidates.push("FieldGrass");
+      }
+    } else if (resolved === "cave" && !base) {
+      candidates.push("Cave");
+    }
+    if (base) {
+      candidates.push(base);
     }
 
-    return name;
+    const known = this.cachedBattleBackNames;
+    if (known && known.size > 0) {
+      const match = candidates.find((name) => known.has(name.toLowerCase()));
+      if (match) {
+        return match;
+      }
+    }
+    return candidates[0] ?? null;
+  }
+
+  /** The terrain context a non-step battle starts in (null = plain ground). */
+  private inferBattleBackContext(player: Player): BattleBackContext | null {
+    if (player.isSurfing) {
+      return "water";
+    }
+    if (resolveDivePair(player.currentMapId)?.role === "underwater") {
+      return "underwater";
+    }
+    if (this.world.getPlayerTerrainTag(player) === GRASS_TERRAIN_TAG) {
+      return "grass";
+    }
+    return null;
   }
 
   private createBattle(
@@ -10215,6 +10292,18 @@ export default class BattleManager {
     ]);
 
     this.cachedEncounterProfiles = this.buildEncounterProfileCache(encountersPayload?.state.items ?? []);
+
+    // Loaded once per process: the section is heavy (embedded images) but the
+    // backdrop NAMES are all resolveBattleBackForPlayer needs, and new
+    // backdrops are only added via re-import.
+    if (!this.cachedBattleBackNames) {
+      const battleBacksPayload = await this.designerSectionStore.read("battleBackgrounds");
+      this.cachedBattleBackNames = new Set(
+        (battleBacksPayload?.state.items ?? [])
+          .map((item) => (typeof item.name === "string" ? item.name.trim().toLowerCase() : ""))
+          .filter((name) => name.length > 0)
+      );
+    }
 
     this.typeChart = buildTypeChart(typesPayload?.state.items ?? []);
     const skillsById = new Map<string, SkillDefinition>();
