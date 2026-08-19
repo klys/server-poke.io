@@ -27,7 +27,7 @@ import {
   isScriptCommandHandled,
   compareNumbers
 } from "../components/essentialsScriptAdapters";
-import { parseCommands } from "../components/EventRuntime";
+import { parseCommands, pageHasObservableNodes } from "../components/EventRuntime";
 import { isAllowedClientTeleport } from "../Server/registerSocketHandlers";
 import World from "../components/world";
 import Player from "../components/player";
@@ -281,6 +281,108 @@ test("unknown conditional-branch types parse as unsupported (fail closed at runt
   const branch = nodes[0] as { kind: string; test: { kind: string; branchType?: number } };
   assert.strictEqual(branch.test.kind, "unsupported");
   assert.strictEqual(branch.test.branchType, 4);
+});
+
+// ---------------------------------------------------------------------------
+// 4b. Cutscene presentation commands (Map158 "???" earthquake sequence)
+// ---------------------------------------------------------------------------
+
+test("earthquake cutscene commands compile: animation, shake, scroll, wait-for-scroll", () => {
+  // The real EV036 page from Map158 ("???" outside Guarida Revolution).
+  const nodes = parseCommands([
+    { code: 207, indent: 0, parameters: [-1, 3] },
+    { code: 106, indent: 0, parameters: [10] },
+    { code: 225, indent: 0, parameters: [9, 7, 70] },
+    { code: 106, indent: 0, parameters: [40] },
+    { code: 250, indent: 0, parameters: [{ name: "644Cry", volume: 80 }] },
+    { code: 101, indent: 0, parameters: ["(Cainebreeeeeeeee)"] },
+    { code: 106, indent: 0, parameters: [10] },
+    { code: 203, indent: 0, parameters: [2, 30, 4] },
+    { code: 210, indent: 0, parameters: [] },
+    { code: 203, indent: 0, parameters: [8, 30, 4] },
+    { code: 210, indent: 0, parameters: [] },
+    { code: 123, indent: 0, parameters: ["A", 0] }
+  ]);
+  assert.deepStrictEqual(
+    nodes.map((node) => node.kind),
+    ["animation", "wait", "screen", "wait", "sound", "text", "wait",
+     "scrollMap", "waitScroll", "scrollMap", "waitScroll", "selfSwitch"]
+  );
+  const shake = nodes[2] as { effect: string; power?: number; durationMs?: number };
+  assert.strictEqual(shake.effect, "shake");
+  assert.strictEqual(shake.power, 9);
+  assert.strictEqual(shake.durationMs, 70 * 25);
+  const scrollDown = nodes[7] as { direction: number; distance: number; speed: number };
+  assert.strictEqual(scrollDown.direction, 2);
+  assert.strictEqual(scrollDown.distance, 30);
+  assert.strictEqual(scrollDown.speed, 4);
+  const scrollUp = nodes[9] as { direction: number };
+  assert.strictEqual(scrollUp.direction, 8);
+  const animation = nodes[0] as { animationId: number; onEvent: boolean };
+  assert.strictEqual(animation.animationId, 3);
+  assert.strictEqual(animation.onEvent, false); // -1 targets the player
+});
+
+test("screen tone (223) maps to a darken overlay; flash (224) to a flash", () => {
+  const nodes = parseCommands([
+    { code: 223, indent: 0, parameters: [{ red: -127.5, green: -127.5, blue: -127.5, gray: 0 }, 20] },
+    { code: 224, indent: 0, parameters: [{ red: 255, green: 255, blue: 255, alpha: 255 }, 10] }
+  ]);
+  const tone = nodes[0] as { kind: string; effect: string; darken?: number; durationMs?: number };
+  assert.strictEqual(tone.effect, "tone");
+  assert.strictEqual(tone.darken, 0.5);
+  assert.strictEqual(tone.durationMs, 20 * 25);
+  const flash = nodes[1] as { effect: string; durationMs?: number };
+  assert.strictEqual(flash.effect, "flash");
+  assert.strictEqual(flash.durationMs, 10 * 25);
+});
+
+test("parallel pages with nothing observable are skipped; the cutscene is not", () => {
+  // Fog settings (204) and move-route choreography (209/509) compile to
+  // nothing; running them would be silent dead air.
+  assert.strictEqual(
+    pageHasObservableNodes({
+      commands: [{ code: 204, indent: 0, parameters: [1, "Air Fog", 0, 135, 0, 200, 5, 0] }]
+    }),
+    false
+  );
+  assert.strictEqual(
+    pageHasObservableNodes({
+      commands: [
+        { code: 209, indent: 0, parameters: [12, {}] },
+        { code: 106, indent: 0, parameters: [20] }
+      ]
+    }),
+    false
+  );
+  // A wait tucked inside a conditional branch is still unobservable.
+  assert.strictEqual(
+    pageHasObservableNodes({
+      commands: [
+        { code: 111, indent: 0, parameters: [0, 85, 0] },
+        { code: 106, indent: 1, parameters: [20] },
+        { code: 412, indent: 0, parameters: [] }
+      ]
+    }),
+    false
+  );
+  assert.strictEqual(
+    pageHasObservableNodes({
+      commands: [
+        { code: 225, indent: 0, parameters: [9, 7, 70] },
+        { code: 101, indent: 0, parameters: ["(Cainebreeeeeeeee)"] }
+      ]
+    }),
+    true
+  );
+  // State mutations count as observable: parallel controller pages that only
+  // flip switches still have to run.
+  assert.strictEqual(
+    pageHasObservableNodes({
+      commands: [{ code: 123, indent: 0, parameters: ["A", 0] }]
+    }),
+    true
+  );
 });
 
 // ---------------------------------------------------------------------------

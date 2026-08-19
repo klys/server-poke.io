@@ -91,7 +91,29 @@ export type EventStepPayload =
       durationMs?: number;
     }
   | { type: "sound"; kind: "SE" | "ME" | "BGM" | "BGS" | "BGMStop" | "BGSStop"; name?: string; volume?: number }
-  | { type: "screen"; effect: "fadeout" | "fadein" | "tone"; durationMs?: number; darken?: number }
+  // "shake" (RMXP Screen Shake 225) rattles the viewport: power is the RMXP
+  // 1-9 strength, durationMs how long. "flash" (224) is a brief white overlay.
+  | {
+      type: "screen";
+      effect: "fadeout" | "fadein" | "tone" | "flash" | "shake";
+      durationMs?: number;
+      darken?: number;
+      power?: number;
+    }
+  // RMXP Scroll Map (203): pan the camera off the player — direction is the
+  // RMXP numpad value (2 down, 4 left, 6 right, 8 up) for distanceTiles over
+  // durationMs. Scrolls accumulate; "end" resets the camera to the player.
+  | { type: "camera"; op: "scroll"; direction: number; distanceTiles: number; durationMs: number }
+  // RMXP Show Animation (207), rendered client-side as a lightweight emote
+  // (exclaim/question bubble by animation name) plus the animation's sound
+  // effect. targetCell is the event's cell for non-player targets.
+  | {
+      type: "animation";
+      animationId: number;
+      name?: string;
+      se?: string;
+      targetCell?: { x: number; y: number } | null;
+    }
   | { type: "end" };
 
 interface PlayerData {

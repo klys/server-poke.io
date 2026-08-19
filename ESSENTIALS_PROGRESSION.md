@@ -57,6 +57,20 @@ server re-selects the page on every interaction, touch, and transfer.
 server-side (text, choices, conditional branches, switches/variables/self
 switches, labels, transfers, battles, item grants, marts, PC boxes...).
 
+Presentation commands stream to the client as `event:step` payloads: pictures
+(231/232/235), sounds (241–250), fades (221/222), screen tone (223), screen
+flash (224), screen shake (225), camera pans (Scroll Map 203 + Wait for
+Move's Completion 210, which holds the event for the pan), and Show Animation
+(207, rendered as an emote bubble named by `data/Animations.json` plus its
+timed sound effect). The Map158 "???" earthquake cutscene exercises most of
+these end to end — `tools/e2e-cutscene.ts` drives it against a real server.
+
+Parallel-process pages (trigger 4) run as one-shot autoruns on map entry and
+after interactions, with two guards: a page that stays active after running
+is not restarted during the same visit, and pages whose commands compile to
+nothing observable (fog settings, move-route-only choreography) are skipped
+(`pageHasObservableNodes`).
+
 Transfer rules:
 
 1. **Touch transfers (doors, mats, cave mouths)** — the world detects the
@@ -140,8 +154,8 @@ generations where their syntax overlaps.
 
 - `cooledDown?` / `cooledDownDays?` (daily berries/gifts) reset per map visit
   instead of per real-time window (original timestamps are not persisted).
-- Parallel-process pages (trigger 4) do not run; the 9 state-writing ones are
-  listed by the migration report for case-by-case porting.
+- Parallel-process pages (trigger 4) run once per map visit instead of
+  looping continuously; pure-cosmetic loops (fog, tone flicker) are skipped.
 - Phone rematches, Mystery Gift, Safari Zone, Bug Contest, day-care
   deposits/breeding are not simulated; their branches resolve as they would
   for a player outside those systems.

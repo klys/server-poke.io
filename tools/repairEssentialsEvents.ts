@@ -6,8 +6,12 @@
  *    original map defines) gets a placement carrying its FULL page data
  *    (conditions, triggers, commands). The runtime then routes those portals
  *    through real event execution — page conditions, dialogue and conditional
- *    branches included — instead of blind teleporting. Existing placements
- *    are never modified.
+ *    branches included — instead of blind teleporting. Designer-owned fields
+ *    of existing placements (position, names, store stock…) are never
+ *    modified, but their essentialsEvent PAGES are refreshed from the dump:
+ *    placements written by older importer versions carry command lists with
+ *    then-unsupported codes stripped (Scroll Map, Screen Shake, Show
+ *    Animation…), and the runtime can only play what the placement holds.
  * 2. The System.rxdata switch/variable tables are imported as
  *    `state.essentialsSystem`: script switches ("s:" names — day/night, temp
  *    switches) become evaluable page conditions, and the plain names feed
@@ -171,6 +175,7 @@ async function main() {
 
     const editorData = payload.state.editorDataByMapId ?? {};
     let addedPlacements = 0;
+    let refreshedPlacements = 0;
     let portalsNowGated = 0;
     let mapsTouched = 0;
     let missingRxMaps = 0;
@@ -205,8 +210,24 @@ async function main() {
       );
 
       let addedHere = 0;
+      let refreshedHere = 0;
       for (const rawEvent of Object.values(rxMap.data.events ?? {})) {
         if (existingEventIds.has(rawEvent.id)) {
+          // Refresh stale page data in place: only the essentialsEvent pages
+          // are replaced, never the designer-owned placement fields.
+          const freshPages = (rawEvent.pages ?? []).map(convertPage);
+          if (freshPages.length === 0) {
+            continue;
+          }
+          for (const npc of npcs) {
+            const holder = npc as { essentialsEvent?: { pages?: unknown } };
+            if (Number(npc.eventId) === rawEvent.id && holder.essentialsEvent) {
+              if (JSON.stringify(holder.essentialsEvent.pages) !== JSON.stringify(freshPages)) {
+                holder.essentialsEvent.pages = freshPages;
+                refreshedHere += 1;
+              }
+            }
+          }
           continue;
         }
         const pages = (rawEvent.pages ?? []).map(convertPage);
@@ -266,9 +287,10 @@ async function main() {
         addedHere += 1;
       }
 
-      if (addedHere > 0) {
+      if (addedHere > 0 || refreshedHere > 0) {
         mapsTouched += 1;
         addedPlacements += addedHere;
+        refreshedPlacements += refreshedHere;
       }
 
       // Count portals that now have a page-aware owner on their cell.
@@ -296,7 +318,7 @@ async function main() {
     };
 
     console.log(
-      `Placements added: ${addedPlacements} across ${mapsTouched} maps ` +
+      `Placements added: ${addedPlacements}, event pages refreshed: ${refreshedPlacements} across ${mapsTouched} maps ` +
         `(rxdata missing for ${missingRxMaps} maps). ` +
         `Essentials portals with page-aware owners: ${portalsNowGated}. ` +
         `Script switches: ${Object.keys(scriptSwitches).length}, ` +

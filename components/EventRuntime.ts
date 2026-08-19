@@ -80,6 +80,9 @@ import {
   compareNumbers
 } from "./essentialsScriptAdapters";
 import LEGACY_ITEM_INTERNAL_BY_NUMBER from "./legacyItemNumbers";
+import { BUNDLED_RXDATA_DIR } from "./RxdataUploadStore";
+import { readFileSync } from "fs";
+import path from "path";
 
 /** Reverse of the legacy item table: internal name (uppercase) -> numeric id. */
 const LEGACY_ITEM_NUMBER_BY_INTERNAL = new Map<string, number>(
@@ -95,6 +98,42 @@ type TypedSocketServer = Server<
   InterServerEvents,
   SocketData
 >;
+
+// Show Animation (207) metadata from the bundled rxdata dump: the animation's
+// editor name (the client picks an emote bubble from it — "Exclaim bubble",
+// "Question bubble") and its first timed sound effect. Cosmetic, so a missing
+// or unparseable Animations.json just degrades to id-only payloads.
+let animationMetaCache: Map<number, { name: string; se?: string }> | null = null;
+function animationMeta(animationId: number): { name: string; se?: string } | null {
+  if (!animationMetaCache) {
+    animationMetaCache = new Map();
+    try {
+      const file = path.join(BUNDLED_RXDATA_DIR, "data", "Animations.json");
+      const parsed = JSON.parse(readFileSync(file, "utf8")) as unknown;
+      const list = Array.isArray(parsed)
+        ? parsed
+        : (parsed as { data?: unknown[] } | null)?.data;
+      for (const entry of Array.isArray(list) ? list : []) {
+        const animation = entry as
+          | { id?: unknown; name?: unknown; timings?: Array<{ se?: { name?: unknown } }> }
+          | null;
+        if (!animation || typeof animation.id !== "number") {
+          continue;
+        }
+        const se = (animation.timings ?? [])
+          .map((timing) => timing?.se?.name)
+          .find((name): name is string => typeof name === "string" && name.length > 0);
+        animationMetaCache.set(animation.id, {
+          name: typeof animation.name === "string" ? animation.name : "",
+          se
+        });
+      }
+    } catch {
+      // fall through with an empty cache
+    }
+  }
+  return animationMetaCache.get(animationId) ?? null;
+}
 
 type RawCommand = { code: number; indent: number; parameters: unknown[] };
 
@@ -149,7 +188,10 @@ type Node =
   | { kind: "wait"; frames: number }
   | { kind: "picture"; op: "show" | "move" | "erase"; slot: number; name?: string; origin?: number; x?: number; y?: number; opacity?: number; durationMs?: number }
   | { kind: "sound"; soundKind: "SE" | "ME" | "BGM" | "BGS" | "BGMStop" | "BGSStop"; name?: string; volume?: number }
-  | { kind: "screen"; effect: "fadeout" | "fadein"; durationMs?: number }
+  | { kind: "screen"; effect: "fadeout" | "fadein" | "tone" | "flash" | "shake"; durationMs?: number; darken?: number; power?: number }
+  | { kind: "scrollMap"; direction: number; distance: number; speed: number }
+  | { kind: "waitScroll" }
+  | { kind: "animation"; animationId: number; onEvent: boolean }
   | { kind: "transfer"; mapId: number; x: number; y: number }
   | { kind: "recoverAll" }
   | { kind: "exit" };
@@ -184,7 +226,21 @@ type EventStep =
   | { type: "nameInput"; npcName: string; text: string; defaultName: string }
   | { type: "picture"; op: "show" | "move" | "erase"; slot: number; name?: string; origin?: number; x?: number; y?: number; opacity?: number; durationMs?: number }
   | { type: "sound"; kind: "SE" | "ME" | "BGM" | "BGS" | "BGMStop" | "BGSStop"; name?: string; volume?: number }
-  | { type: "screen"; effect: "fadeout" | "fadein" | "tone"; durationMs?: number; darken?: number }
+  | {
+      type: "screen";
+      effect: "fadeout" | "fadein" | "tone" | "flash" | "shake";
+      durationMs?: number;
+      darken?: number;
+      power?: number;
+    }
+  | { type: "camera"; op: "scroll"; direction: number; distanceTiles: number; durationMs: number }
+  | {
+      type: "animation";
+      animationId: number;
+      name?: string;
+      se?: string;
+      targetCell?: { x: number; y: number } | null;
+    }
   // pbPokemonMart: opens the store overlay stocked with these items; buying/
   // selling goes through the regular npc:store-buy/npc:store-sell sockets,
   // validated against the mart session this runtime keeps per user. x/y are
@@ -263,6 +319,9 @@ type Session = {
   // The most recent step shown, re-emitted when a client (re)joins while the
   // session is still alive so the dialog reappears instead of a dead screen.
   lastStep: EventStep | null;
+  // When the latest Scroll Map (203) pan finishes, so a following Wait for
+  // Move's Completion (210) can hold the event until the camera arrives.
+  scrollEndsAt: number;
 };
 
 function emptyEventStateWrites(): EventStateWrites {
@@ -476,6 +535,9 @@ export default class EventRuntime {
       return { ready: false, ran: false };
     }
     let ranAny = false;
+    // Parallel-process pages already played this visit (see below): a page
+    // that stays active after running must not restart every chain round.
+    const ranParallelPages = new Set<string>();
     // Guard cap: Venova's door template gives every doorway an autorun page
     // that self-disables via a temp switch, so a hub map can legitimately
     // chain a dozen autoruns on entry before settling.
@@ -502,10 +564,27 @@ export default class EventRuntime {
       const eventPlacements = placements.filter((placement) => placement.essentialsEvent);
       const state = await this.auth.getEventState(userId);
       let ran = false;
-      for (const placement of eventPlacements) {
-        const essentials = placement.essentialsEvent as EssentialsEvent;
-        const page = this.selectActivePage(essentials, player, state);
-        if (page && page.trigger === 3) {
+      for (const runTrigger of [3, 4]) {
+        for (const placement of eventPlacements) {
+          const essentials = placement.essentialsEvent as EssentialsEvent;
+          const page = this.selectActivePage(essentials, player, state);
+          if (!page || page.trigger !== runTrigger) {
+            continue;
+          }
+          // Parallel-process pages (trigger 4) run like one-shot autoruns —
+          // Venova uses them for map-entry cutscenes (the "???" earthquake).
+          // A true RMXP parallel loop never terminates, so two guards: a page
+          // that stays active after running is not restarted this visit, and
+          // pages whose commands compile to nothing observable (fog settings,
+          // move-route-only choreography) are skipped instead of played as
+          // seconds of dead air.
+          if (page.trigger === 4) {
+            const key = `${String(placement.id)}:${essentials.pages.indexOf(page)}`;
+            if (ranParallelPages.has(key) || !pageHasObservableNodes(page)) {
+              continue;
+            }
+            ranParallelPages.add(key);
+          }
           const outcome = await this.executeSession(
             userId,
             player,
@@ -528,6 +607,9 @@ export default class EventRuntime {
           ran = true;
           ranAny = true;
           break; // re-evaluate all events against the new state
+        }
+        if (ran) {
+          break; // autoruns take priority over parallel pages each round
         }
       }
       if (!ran) {
@@ -709,7 +791,8 @@ export default class EventRuntime {
       stringVars: {},
       nodesRun: 0,
       pendingWrites: emptyEventStateWrites(),
-      lastStep: null
+      lastStep: null,
+      scrollEndsAt: 0
     };
     this.sessions.set(userId, session);
 
@@ -1026,9 +1109,47 @@ export default class EventRuntime {
           this.emitStep(session, {
             type: "screen",
             effect: node.effect,
-            durationMs: node.durationMs
+            durationMs: node.durationMs,
+            darken: node.darken,
+            power: node.power
           });
           break;
+        case "scrollMap": {
+          // RMXP scroll: distance*128 map units drained at 2^speed units per
+          // frame at 40fps — speed 4 over 30 tiles is the classic 6s pan.
+          const frames = (node.distance * 128) / Math.pow(2, node.speed);
+          const durationMs = Math.round(frames * 25);
+          this.emitStep(session, {
+            type: "camera",
+            op: "scroll",
+            direction: node.direction,
+            distanceTiles: node.distance,
+            durationMs
+          });
+          session.scrollEndsAt = Math.max(session.scrollEndsAt, Date.now() + durationMs);
+          break;
+        }
+        case "waitScroll": {
+          // Wait for Move's Completion (210): the interpreter side of move
+          // routes lives in NpcActors, so the pending camera pan is what this
+          // actually holds for. Capped so bad data can't freeze the session.
+          const remainingMs = session.scrollEndsAt - Date.now();
+          if (remainingMs > 0) {
+            await this.sleep(Math.min(remainingMs, 20000));
+          }
+          break;
+        }
+        case "animation": {
+          const meta = animationMeta(node.animationId);
+          this.emitStep(session, {
+            type: "animation",
+            animationId: node.animationId,
+            name: meta?.name,
+            se: meta?.se,
+            targetCell: node.onEvent ? session.eventCell : null
+          });
+          break;
+        }
         case "transfer": {
           // Commit buffered state BEFORE moving the player: the intro sets
           // its "don't run again" self-switch a few commands before the
@@ -2447,6 +2568,32 @@ export default class EventRuntime {
 // ---------------------------------------------------------------------------
 // Flat RMXP command list -> nested node tree.
 // ---------------------------------------------------------------------------
+/**
+ * Whether a page's commands compile to anything a player would notice — text,
+ * effects, state changes. Waits, labels and jumps alone don't count: a
+ * parallel page made only of those (fog loops, move-route choreography the
+ * compiler skips) would play as silent dead air, so callers skip it instead.
+ */
+export function pageHasObservableNodes(page: { commands: RawCommand[] }): boolean {
+  const observable = (nodes: Node[]): boolean =>
+    nodes.some((node) => {
+      switch (node.kind) {
+        case "wait":
+        case "waitScroll":
+        case "label":
+        case "jump":
+          return false;
+        case "condition":
+          return observable(node.then) || observable(node.otherwise);
+        case "choices":
+          return true;
+        default:
+          return true;
+      }
+    });
+  return observable(parseCommands(page.commands));
+}
+
 export function parseCommands(commands: RawCommand[]): Node[] {
   const parsed = parseBlock(commands, 0, commands.length > 0 ? commands[0].indent : 0);
   return parsed.nodes;
@@ -2750,6 +2897,69 @@ function parseBlock(commands: RawCommand[], start: number, indent: number): { no
       }
       case 314:
         nodes.push({ kind: "recoverAll" });
+        i += 1;
+        break;
+      case 203: {
+        // Scroll Map: [direction (2 down/4 left/6 right/8 up), distanceTiles, speed 1-6]
+        nodes.push({
+          kind: "scrollMap",
+          direction: Number(command.parameters[0] ?? 2),
+          distance: Number(command.parameters[1] ?? 0),
+          speed: Number(command.parameters[2] ?? 4)
+        });
+        i += 1;
+        break;
+      }
+      case 210:
+        // Wait for Move's Completion — holds for a pending camera scroll.
+        nodes.push({ kind: "waitScroll" });
+        i += 1;
+        break;
+      case 207: {
+        // Show Animation: [target (-1 player, 0 this event, >0 event id), animationId]
+        nodes.push({
+          kind: "animation",
+          animationId: Number(command.parameters[1] ?? 0),
+          onEvent: Number(command.parameters[0] ?? -1) !== -1
+        });
+        i += 1;
+        break;
+      }
+      case 223: {
+        // Change Screen Color Tone: [{red,green,blue,gray}, durationFrames].
+        // Only the darkening component maps to the client's overlay; colored
+        // tints approximate to how far below neutral the average channel sits.
+        const tone = command.parameters[0] as
+          | { red?: unknown; green?: unknown; blue?: unknown }
+          | undefined;
+        const average =
+          (Number(tone?.red ?? 0) + Number(tone?.green ?? 0) + Number(tone?.blue ?? 0)) / 3;
+        nodes.push({
+          kind: "screen",
+          effect: "tone",
+          darken: Math.min(1, Math.max(0, -average / 255)),
+          durationMs: Number(command.parameters[1] ?? 0) * 25
+        });
+        i += 1;
+        break;
+      }
+      case 224:
+        // Screen Flash: [color, durationFrames] — RMXP runs at 40fps.
+        nodes.push({
+          kind: "screen",
+          effect: "flash",
+          durationMs: Number(command.parameters[1] ?? 8) * 25
+        });
+        i += 1;
+        break;
+      case 225:
+        // Screen Shake: [power 1-9, speed, durationFrames] — the earthquake.
+        nodes.push({
+          kind: "screen",
+          effect: "shake",
+          power: Number(command.parameters[0] ?? 5),
+          durationMs: Number(command.parameters[2] ?? 8) * 25
+        });
         i += 1;
         break;
       default:
