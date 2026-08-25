@@ -1689,7 +1689,6 @@ export default class World {
         this.followerSimulation?.onOwnerStep(player);
         this.battleManager?.handlePlayerStep(player);
         this.battleManager?.handleEggStep(player);
-        this.battleManager?.handleRepelStep(player);
         void this.handleGroundItemPickup(player);
         this.handleTouchEventStep(player);
         this.handleTrainerSightCheck(player);

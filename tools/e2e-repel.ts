@@ -2,15 +2,21 @@
  * E2E: Baygon Azul / Baygon Verde (SUPERREPEL / MAXREPEL) against a REAL
  * server + redis.
  *
- *   USE      — Baygon Azul consumes one unit, arms a 200-step charge and
- *              persists it as `repel_steps` on the character hash.
+ *   USE      — Baygon Azul is usable BEFORE the world player exists (bag from
+ *              anywhere): consumes one unit, arms a 200-step charge, persists
+ *              it as `repel_steps`, pushes player:repel-state and
+ *              user.repelSteps on auth:session.
+ *   JOIN     — joining the world re-pushes the charge (HUD hydration).
  *   NO-STACK — a second repellent while one is active is refused and NOT
  *              consumed (Essentials behaviour).
- *   SUPPRESS — walking 100%-encounter grass starts no battle while the
- *              charge lasts; each walked tile spends exactly one step.
- *   PERSIST  — a reconnect keeps the remaining charge (redis-backed).
- *   WEAR-OFF — the last step emits "El repelente se ha agotado" and deletes
- *              the redis field.
+ *   SUPPRESS — walking A(grass 100%) <-> B(plain) starts no battle; a step is
+ *              spent only when an encounter tile is reached (never on B).
+ *   PERSIST  — a reconnect keeps the remaining charge (redis-backed). The
+ *              grass-cell dedupe is keyed by the stable per-user player id,
+ *              so the tile you rejoin on is still "seen": no step (and no
+ *              encounter roll) until a NEW encounter tile is reached.
+ *   WEAR-OFF — the last step emits "El repelente se ha agotado", pushes
+ *              steps=0 and deletes the redis field.
  *   VERDE    — Baygon Verde arms 250 steps.
  *   RESUME   — with no charge, the same grass immediately starts a battle.
  *
@@ -28,7 +34,8 @@ const PORT = 3996;
 const MAPS_KEY = "designer:section:maps";
 const PROBE_KEY = `${MAPS_KEY}:probe`;
 
-// Two adjacent open cells on map 043 (same pair e2e-field-skills stands on).
+// Two adjacent open cells on map 043 (same pair e2e-field-skills stands on):
+// A becomes 100%-encounter grass, B is stripped of any grass (plain floor).
 const TEST_MAP = "map-essentials-043";
 const CELL_A = { x: 1, y: 1 };
 const CELL_B = { x: 2, y: 1 };
@@ -89,6 +96,7 @@ async function main() {
   let infos: any[] = [];
   let authErrors: any[] = [];
   let battleStates: any[] = [];
+  let repelStates: number[] = [];
   let lastMove: any = null;
 
   const wireSocket = (s: Socket) => {
@@ -96,6 +104,7 @@ async function main() {
     s.on("auth:info", (d: any) => { infos.push(d); log("  info →", d?.message); });
     s.on("auth:error", (d: any) => { authErrors.push(d); log("  error →", d?.message); });
     s.on("battle:state", (d: any) => { battleStates.push(d); if (process.env.E2E_DEBUG) log("  battle:state →", d?.battle?.logs?.[0] ?? d?.logs?.[0] ?? "(state)"); });
+    s.on("player:repel-state", (d: any) => { repelStates.push(d?.steps); log("  repel-state →", d?.steps); });
     s.on("event:step", (d: any) => { if (process.env.E2E_DEBUG) log("  event:step →", JSON.stringify(d).slice(0, 160)); });
     s.onAny((event: string, data: any) => { if (event.startsWith("move")) { lastMove = data; if (process.env.E2E_DEBUG) log("  move →", JSON.stringify({ x: data?.x, y: data?.y, stopped: data?.stopped, teleported: data?.teleported })); } });
   };
@@ -107,7 +116,7 @@ async function main() {
     redis.on("error", () => {});
     await waitFor("redis PING", async () => { if (!redis!.isOpen) await redis!.connect(); return (await redis!.ping()) === "PONG"; });
 
-    // Inject two 100%-encounter grass cells (back up the maps blob first).
+    // Inject one 100%-encounter grass cell at A, plain floor at B (back up the maps blob first).
     const raw = await redis.get(MAPS_KEY);
     if (!raw) fail(`${MAPS_KEY} empty`);
     mapsBackup = raw!; probeBackup = await redis.get(PROBE_KEY);
@@ -117,15 +126,13 @@ async function main() {
     mapEd.grass = (mapEd.grass ?? []).filter(
       (g: any) => !((g.x === CELL_A.x && g.y === CELL_A.y) || (g.x === CELL_B.x && g.y === CELL_B.y))
     );
-    for (const cell of [CELL_A, CELL_B]) {
-      mapEd.grass.push({
-        id: `grass-e2e-repel-${cell.x}-${cell.y}`, x: cell.x, y: cell.y,
-        encounterRate: 100, minLevel: 2, maxLevel: 3, pokemonIds: ["pokemon-BULBASAUR"]
-      });
-    }
+    mapEd.grass.push({
+      id: `grass-e2e-repel-${CELL_A.x}-${CELL_A.y}`, x: CELL_A.x, y: CELL_A.y,
+      encounterRate: 100, minLevel: 2, maxLevel: 3, pokemonIds: ["pokemon-BULBASAUR"]
+    });
     await redis.set(MAPS_KEY, JSON.stringify(payload));
     await redis.set(PROBE_KEY, `e2e:${Date.now()}`);
-    log(`injected 100% grass at (${CELL_A.x},${CELL_A.y}) + (${CELL_B.x},${CELL_B.y}) on ${TEST_MAP}`);
+    log(`injected 100% grass at (${CELL_A.x},${CELL_A.y}), plain floor at (${CELL_B.x},${CELL_B.y}) on ${TEST_MAP}`);
 
     log(`starting server on :${PORT} …`);
     server = spawn(`${SERVER_DIR}/node_modules/.bin/ts-node`, ["index.ts"], { cwd: SERVER_DIR, env: { ...process.env, PORT: String(PORT), REDIS_URL, SMTP_ENABLED: "false", GIT_SHA: "e2e" }, stdio: ["ignore", "pipe", "pipe"] });
@@ -163,6 +170,7 @@ async function main() {
       socket!.emit("addPlayer", { token: session.token });
       await sleep(1200);
     };
+    const lastRepelState = () => (repelStates.length ? repelStates[repelStates.length - 1] : null);
     const rejoin = async () => {
       socket!.disconnect();
       await sleep(1200); // let the disconnect handler persist location
@@ -171,7 +179,6 @@ async function main() {
       await waitFor("reconnect", () => socket!.connected);
       await join();
     };
-    await join();
 
     const repelSteps = async () => Number.parseInt((await redis!.hGet(charKey, "repel_steps")) ?? "0", 10) || 0;
     const bagQty = async (id: string) => {
@@ -194,14 +201,24 @@ async function main() {
       await sleep(250);
     };
 
-    // ── USE: Baygon Azul arms 200 steps and consumes one unit ──
-    log("── USE Baygon Azul ──");
-    infos = [];
+    // ── USE (before joining the world): arms 200 steps, consumes one unit ──
+    log("── USE Baygon Azul (bag used before entering the world) ──");
+    infos = []; authErrors = []; repelStates = [];
     socket.emit("inventory:use-item", { itemId: "item-superrepel" });
     await waitFor("use confirmation", () => infos.find((i) => /200 pasos/.test(i?.message ?? "")) ?? null);
+    if (authErrors.length > 0) fail(`use refused without a world player: ${authErrors[0]?.message}`);
     if ((await repelSteps()) !== 200) fail(`repel_steps should be 200, got ${await repelSteps()}`);
     if ((await bagQty("item-superrepel")) !== 1) fail("Baygon Azul should have been consumed once");
-    log("  ✓ armed 200 steps, one unit consumed, persisted to redis");
+    if (lastRepelState() !== 200) fail(`expected player:repel-state 200, got ${lastRepelState()}`);
+    if (lastSession?.user?.repelSteps !== 200) fail(`auth:session user.repelSteps should be 200, got ${lastSession?.user?.repelSteps}`);
+    log("  ✓ usable anywhere: armed 200 steps, one unit consumed, persisted, HUD state pushed");
+
+    // ── JOIN: entering the world re-pushes the charge for the HUD ──
+    log("── JOIN ──");
+    repelStates = [];
+    await join();
+    await waitFor("join repel-state", () => (lastRepelState() === 200 ? true : null));
+    log("  ✓ join hydrated player:repel-state=200");
 
     // ── NO-STACK: a second repellent is refused and not consumed ──
     log("── NO-STACK ──");
@@ -212,43 +229,50 @@ async function main() {
     if ((await repelSteps()) !== 200) fail("refused repellent must not reset the charge");
     log("  ✓ refused while active, nothing consumed");
 
-    // ── SUPPRESS: 4 walked tiles over 100% grass, no battle, 4 steps spent ──
+    // ── SUPPRESS: A(grass)<->B(plain). Spent only when an encounter tile is
+    // reached: the first nudge inside A (standing on grass) + 2 re-entries of A
+    // = 3 steps for 4 walked tiles; the two B arrivals cost nothing. ──
     log("── SUPPRESS ──");
-    battleStates = [];
+    battleStates = []; repelStates = [];
     for (const cell of [CELL_B, CELL_A, CELL_B, CELL_A]) await walkTo(cell);
     if (battleStates.length > 0) fail("wild battle started while repel was active");
     const afterWalk = await repelSteps();
-    if (afterWalk !== 196) fail(`expected 196 steps after 4 tiles, got ${afterWalk}`);
-    log("  ✓ 4 tiles walked on 100% grass: no battle, charge 200→196");
+    if (afterWalk !== 197) fail(`expected 197 steps (3 grass arrivals), got ${afterWalk}`);
+    if (repelStates.length !== 3 || lastRepelState() !== 197) fail(`expected 3 repel-state pushes ending at 197, got ${JSON.stringify(repelStates)}`);
+    log("  ✓ no battle on 100% grass; 200→197 (plain-floor tiles cost nothing)");
 
     // ── PERSIST: reconnect keeps the charge running ──
     log("── PERSIST ──");
+    repelStates = [];
     await rejoin();
+    await waitFor("rejoin repel-state", () => (lastRepelState() === 197 ? true : null));
     battleStates = [];
     for (const cell of [CELL_B, CELL_A]) await walkTo(cell);
     if (battleStates.length > 0) fail("wild battle started after reconnect with repel active");
     const afterRejoin = await repelSteps();
-    if (afterRejoin !== 194) fail(`expected 194 steps after reconnect + 2 tiles, got ${afterRejoin}`);
-    log("  ✓ reconnect kept the charge: 196→194, still suppressed");
+    if (afterRejoin !== 196) fail(`expected 196 steps after reconnect + 1 grass re-entry, got ${afterRejoin}`);
+    log("  ✓ reconnect kept the charge: 197→196 (rejoin tile not re-charged), still suppressed");
 
     // ── WEAR-OFF: force 2 remaining steps, walk them off ──
     log("── WEAR-OFF ──");
     await redis.hSet(charKey, { repel_steps: "2" });
     await rejoin(); // reload the in-memory charge from redis
-    infos = []; battleStates = [];
-    for (const cell of [CELL_B, CELL_A]) await walkTo(cell);
+    infos = []; battleStates = []; repelStates = [];
+    for (const cell of [CELL_B, CELL_A, CELL_B, CELL_A]) await walkTo(cell); // two grass re-entries
     await waitFor("wear-off message", () => infos.find((i) => /repelente se ha agotado/i.test(i?.message ?? "")) ?? null);
     if (battleStates.length > 0) fail("battle started during the final repel steps");
+    if (lastRepelState() !== 0) fail(`expected repel-state 0 on wear-off, got ${lastRepelState()}`);
     if ((await redis.hGet(charKey, "repel_steps")) !== null) fail("repel_steps field should be deleted when depleted");
-    log("  ✓ wear-off message emitted, redis field deleted");
+    log("  ✓ wear-off message + repel-state 0, redis field deleted");
 
     // ── VERDE: Baygon Verde arms 250 steps ──
     log("── USE Baygon Verde ──");
-    infos = [];
+    infos = []; repelStates = [];
     socket.emit("inventory:use-item", { itemId: "item-maxrepel" });
     await waitFor("verde confirmation", () => infos.find((i) => /250 pasos/.test(i?.message ?? "")) ?? null);
     if ((await repelSteps()) !== 250) fail(`repel_steps should be 250, got ${await repelSteps()}`);
     if ((await bagQty("item-maxrepel")) !== 0) fail("Baygon Verde should have been consumed");
+    if (lastRepelState() !== 250) fail(`expected repel-state 250, got ${lastRepelState()}`);
     log("  ✓ Baygon Verde armed 250 steps");
 
     // ── RESUME: clear the charge, the same grass battles immediately ──
@@ -256,10 +280,12 @@ async function main() {
     await redis.hDel(charKey, "repel_steps");
     await rejoin(); // drop the in-memory charge too
     battleStates = [];
-    socket.emit("move", { x: CELL_B.x * 32, y: CELL_B.y * 32 });
+    await walkTo(CELL_B); // plain floor: nothing happens
+    if (battleStates.length > 0) fail("battle started on plain floor");
+    socket.emit("move", { x: CELL_A.x * 32, y: CELL_A.y * 32 }); // re-enter the grass
     await waitFor("wild battle", () => battleStates[0] ?? null, { timeoutMs: 10000 });
     socket.emit("stopMove");
-    log("  ✓ encounter fired on the very same grass without repel");
+    log("  ✓ encounter fired on re-entering the same grass without repel");
 
     log("\n✅ ALL REPEL ASSERTIONS PASSED");
   } finally {

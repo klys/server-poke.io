@@ -125,6 +125,8 @@ export interface AuthenticatedUser {
      * Hidden gameplay stat: not shown in regular UX, tunable from the admin
      * panel and intended for future item bonuses. */
     pushDepth:number;
+    /** Remaining repellent (Baygon) steps; 0 = no repellent active. */
+    repelSteps:number;
     role:UserRoleKey;
     permissions:RolePermission[];
 }
@@ -1394,7 +1396,12 @@ export default class Auth {
 
     /** Remaining repel steps persisted on the active character (0 = none). */
     public async getRepelSteps(userId:number):Promise<number> {
-        const raw = await this.redis.hGet(await this.activeCharacterKey(userId), "repel_steps");
+        return this.parseRepelSteps(
+            await this.redis.hGet(await this.activeCharacterKey(userId), "repel_steps")
+        );
+    }
+
+    private parseRepelSteps(raw:string | null | undefined):number {
         const parsed = Number.parseInt(raw ?? "", 10);
         return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
     }
@@ -3671,6 +3678,7 @@ export default class Auth {
                     battleHistory: DEFAULT_BATTLE_HISTORY,
                     followerEnabled: true,
                     pushDepth: DEFAULT_PUSH_DEPTH,
+                    repelSteps: 0,
                     role,
                     permissions: role === "admin"
                         ? [...ROLE_PERMISSIONS]
@@ -3959,6 +3967,7 @@ export default class Auth {
             battleHistory: this.parseBattleHistory(character.battle_history),
             followerEnabled: character.follower_enabled !== "0",
             pushDepth: this.parsePushDepth(character.push_depth),
+            repelSteps: this.parseRepelSteps(character.repel_steps),
             role: resolvedRole.role,
             permissions: resolvedRole.permissions,
             created_at: account.created_at
@@ -3994,6 +4003,7 @@ export default class Auth {
             battleHistory: user.battleHistory,
             followerEnabled: user.followerEnabled,
             pushDepth: user.pushDepth,
+            repelSteps: user.repelSteps,
             role: user.role,
             permissions: user.permissions
         };

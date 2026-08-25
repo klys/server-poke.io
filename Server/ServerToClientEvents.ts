@@ -325,6 +325,9 @@ export default interface ServerToClientEvents {
   // Surf started/ended. Sent to the surfer's own sockets AND broadcast to the
   // map (playerId identifies whose mount sprite to toggle).
   "player:surf-state": (data: { surfing: boolean; playerId?: string }) => void;
+  // Remaining repellent (Baygon) steps for THIS player: sent when a repellent
+  // is used, on every step it spends, when it wears off (0) and on join.
+  "player:repel-state": (data: { steps: number }) => void;
   // Public overworld pose of a player on the map (fishing cast); carries no
   // private data — just what nearby clients need to render the animation.
   "player:pose": (data: { playerId: string; pose: "fishing" | null }) => void;

@@ -3454,6 +3454,9 @@ function createConnectionHandler(
       if (result.clientAction) {
         socket.emit("inventory:action", result.clientAction);
       }
+      if (typeof result.repelSteps === "number") {
+        socket.emit("player:repel-state", { steps: result.repelSteps });
+      }
       socket.emit("auth:info", { message: result.message });
     });
 

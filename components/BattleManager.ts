@@ -1003,6 +1003,8 @@ export interface UseInventoryItemResult {
   clientAction?: UseInventoryItemClientAction;
   /** True when the action opened a wild battle (fishing bite / radar). */
   battleStarted?: boolean;
+  /** Set when a repellent was armed: the charge the HUD should show. */
+  repelSteps?: number;
 }
 
 export default class BattleManager {
@@ -1021,8 +1023,6 @@ export default class BattleManager {
   /** Remaining repel steps per userId (step encounters skipped while >0).
    * Mirrors the character hash's `repel_steps` so it survives reconnects. */
   private readonly repelStepsByUserId = new Map<number, number>();
-  /** Per-cell dedupe so a repel charge spends one step per walked tile. */
-  private readonly lastRepelStepCellByPlayerId = new Map<string, string>();
   /** Players with a cast in flight — blocks duplicate/spammed fishing casts. */
   private readonly activeFishingSocketIds = new Set<string>();
   /** Per-map encounter tables (designer:section:encounters), keyed by the
@@ -1199,9 +1199,8 @@ export default class BattleManager {
 
     // ----- Field / party-wide effects (no single Venomon target) -----------
     if (effect.kind === "repel") {
-      if (!player) {
-        return { ok: false, message: "Entra al mundo antes de usar un repelente." };
-      }
+      // Usable anywhere (no world player needed): the charge is keyed by
+      // user and persisted, and only spends while walking encounter tiles.
       const activeSteps = this.repelStepsByUserId.get(userId) ?? 0;
       if (activeSteps > 0) {
         // Essentials refuses to stack repellents: the running charge must
@@ -1216,7 +1215,8 @@ export default class BattleManager {
       return {
         ok: true,
         user: await this.consumeItem(userId, user, item),
-        message: `${item.name} mantendrá alejados a los Venomon salvajes durante ${effect.steps} pasos.`
+        message: `${item.name} mantendrá alejados a los Venomon salvajes durante ${effect.steps} pasos.`,
+        repelSteps: effect.steps
       };
     }
 
@@ -3340,10 +3340,23 @@ export default class BattleManager {
 
     this.lastGrassCellByPlayerId.set(player.socketId, step.key);
 
-    // Repel active: encounters stay suppressed while the charge lasts. The
-    // charge itself is spent per walked tile in handleRepelStep (EVERY tile,
-    // not just grass — the items promise "un recorrido de N pasos").
-    if ((this.repelStepsByUserId.get(player.userId) ?? 0) > 0) {
+    // Repel: a charge is spent only where an encounter could have happened
+    // (each NEW encounter tile the player reaches — grass, surf water,
+    // underwater floors); walking anywhere else costs nothing. While it
+    // lasts the encounter is suppressed.
+    const repelSteps = this.repelStepsByUserId.get(player.userId) ?? 0;
+    if (repelSteps > 0) {
+      const remaining = repelSteps - 1;
+      if (remaining > 0) {
+        this.repelStepsByUserId.set(player.userId, remaining);
+      } else {
+        this.repelStepsByUserId.delete(player.userId);
+        this.emitToPlayer(player, "auth:info", { message: "El repelente se ha agotado." });
+      }
+      this.emitToPlayer(player, "player:repel-state", { steps: remaining });
+      void this.auth.saveRepelSteps(player.userId, remaining).catch((error) => {
+        console.error("Unable to persist repel steps:", error);
+      });
       return;
     }
 
@@ -3514,48 +3527,7 @@ export default class BattleManager {
     } else {
       this.repelStepsByUserId.delete(player.userId);
     }
-  }
-
-  /**
-   * Spends one repel step per walked tile. Like egg steps this fires on EVERY
-   * tile (not just grass) with its own per-cell dedupe, because the items
-   * describe a travelled distance ("un recorrido de N pasos"). The countdown
-   * is persisted on the character hash so it survives reconnects.
-   */
-  public handleRepelStep(player: Player) {
-    if (player.userId === null || this.isPlayerBattling(player.socketId)) {
-      return;
-    }
-    const activeSteps = this.repelStepsByUserId.get(player.userId) ?? 0;
-    if (activeSteps <= 0) {
-      return;
-    }
-
-    const cellSize = 32;
-    const cellX = Math.floor((player.x + player.width / 2) / cellSize);
-    const cellY = Math.floor((player.y + player.height / 2) / cellSize);
-    const cellKey = `${player.currentMapId}:${cellX}:${cellY}`;
-    const lastCellKey = this.lastRepelStepCellByPlayerId.get(player.socketId);
-    if (lastCellKey === cellKey) {
-      return;
-    }
-    this.lastRepelStepCellByPlayerId.set(player.socketId, cellKey);
-    if (lastCellKey === undefined) {
-      // First observation just records the tile the player is standing on —
-      // a step is spent when a NEW tile is reached, not for standing still.
-      return;
-    }
-
-    const remaining = activeSteps - 1;
-    if (remaining > 0) {
-      this.repelStepsByUserId.set(player.userId, remaining);
-    } else {
-      this.repelStepsByUserId.delete(player.userId);
-      this.emitToPlayer(player, "auth:info", { message: "El repelente se ha agotado." });
-    }
-    void this.auth.saveRepelSteps(player.userId, remaining).catch((error) => {
-      console.error("Unable to persist repel steps:", error);
-    });
+    this.emitToPlayer(player, "player:repel-state", { steps });
   }
 
   public requestChallenge(socketId: string, payload: BattleChallengePayload) {
