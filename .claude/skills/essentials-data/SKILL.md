@@ -43,7 +43,17 @@ Audit and repair:
 
 - `essentialsMigrationReport.ts` (npm alias `report:migration`) — writes
   `migration-report.{json,md}`: what imported, what's unhandled.
-- `repairEssentialsEvents.ts` — fix broken imported events in place.
+- `repairEssentialsEvents.ts` — fix broken imported events in place. It
+  REWRITES every event page from the rxdata dump, so anything `convertPage`
+  fails to carry over is destroyed for the whole game. This already happened
+  once: it hardcoded `route: null`, and a repair run silently froze all 562
+  walking NPCs (NPC movement is driven entirely by `move.route`; see
+  `components/NpcActors.ts`). Recovery is re-running the fixed repair against
+  `migration-data/rxdata_json` — the rxdata is the source of truth, Redis is
+  not. Check the summary line's **"Move routes preserved: N"** (expect ~1199
+  pages / 562 walking NPCs for Venova); a sudden 0 means routes were stripped
+  again. Verify with `tools/e2e-npc-movement.ts`, which fails fast when no NPC
+  actors exist.
 - `inspectTerrainTags.ts`, `resetConsumedItemBalls.ts` — inspection/reset
   utilities. Prebuilt bundles of the report/repair tools sit in `dist-tools/`.
 

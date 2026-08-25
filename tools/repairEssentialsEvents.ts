@@ -54,6 +54,11 @@ type RawRxPage = {
   move_type?: number;
   move_speed?: number;
   move_frequency?: number;
+  move_route?: {
+    list?: Array<{ code: number; parameters?: unknown[] }>;
+    repeat?: boolean;
+    skippable?: boolean;
+  };
   direction_fix?: boolean;
   walk_anime?: boolean;
   step_anime?: boolean;
@@ -70,6 +75,46 @@ function fail(message: string): never {
 
 async function readJson<T>(filePath: string): Promise<T> {
   return JSON.parse(await fs.readFile(filePath, "utf8")) as T;
+}
+
+/** Pages whose move route survived this repair (reported in the summary, so a
+ * future regression that strips routes again is visible in the output). */
+let preservedMoveRoutes = 0;
+
+/**
+ * Carries the RMXP autonomous move route through the repair.
+ *
+ * This used to write `route: null`, which silently un-moved every walking NPC
+ * in the game the moment a repair ran: move_type 3 ("custom route") without a
+ * route has nothing to walk, so all 562 of Venova's pacing NPCs froze on their
+ * authored tiles. The route is the ONLY thing that makes them move, so it must
+ * survive a repair like every other page field.
+ */
+function convertMoveRoute(route: RawRxPage["move_route"]) {
+  const raw = Array.isArray(route?.list) ? route!.list! : null;
+
+  if (!raw) {
+    return null;
+  }
+
+  // RMXP terminates every move-route list with a code-0 command. Keeping it
+  // would give the 3547 stationary pages a route that does nothing, bloating
+  // the payload and making the simulation build no-op actors for them.
+  const list = raw
+    .filter((command) => command.code !== 0)
+    .map((command) => ({ code: command.code, parameters: command.parameters ?? [] }));
+
+  if (list.length === 0) {
+    return null;
+  }
+
+  preservedMoveRoutes += 1;
+
+  return {
+    list,
+    repeat: route!.repeat !== false,
+    skippable: route!.skippable === true
+  };
 }
 
 function convertPage(page: RawRxPage) {
@@ -103,7 +148,7 @@ function convertPage(page: RawRxPage) {
       type: page.move_type ?? 0,
       speed: page.move_speed ?? 3,
       frequency: page.move_frequency ?? 3,
-      route: null,
+      route: convertMoveRoute(page.move_route),
       directionFix: page.direction_fix === true,
       through: page.through === true,
       walkAnime: page.walk_anime !== false,
@@ -320,6 +365,7 @@ async function main() {
     console.log(
       `Placements added: ${addedPlacements}, event pages refreshed: ${refreshedPlacements} across ${mapsTouched} maps ` +
         `(rxdata missing for ${missingRxMaps} maps). ` +
+        `Move routes preserved: ${preservedMoveRoutes}. ` +
         `Essentials portals with page-aware owners: ${portalsNowGated}. ` +
         `Script switches: ${Object.keys(scriptSwitches).length}, ` +
         `named switches: ${Object.keys(switchNames).length}, ` +
