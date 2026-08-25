@@ -1,3 +1,5 @@
+import { berryProfile, RIPE_STAGE } from "../components/BerryPlots";
+import type Player from "../components/player";
 import type { RedisClientType } from "redis";
 import { type Server, type Socket } from "socket.io";
 import Auth, {
@@ -2867,6 +2869,198 @@ function createConnectionHandler(
       }
     });
 
+    // ── Global berry plots ────────────────────────────────────────────────
+    // Shared soil patches anybody may plant / harvest / clear; growth runs on
+    // the server clock (components/BerryPlots.ts). Every action re-validates
+    // adjacency and plot state here — the client menu is advisory only.
+    type BerryCheck =
+      | { ok: false; error: string }
+      | { ok: true; player: Player; site: { id: string; mapId: string; x: number; y: number }; userId: number };
+    const berryPlotForAction = (plotId: unknown): BerryCheck => {
+      const player = world.getPlayerBySocket(socket.id);
+      if (!player || typeof socket.data.userId !== "number") {
+        return { ok: false, error: "berry.reason.notInWorld" };
+      }
+      if (player.inBattle || eventRuntime.isRunning(socket.data.userId)) {
+        return { ok: false, error: "berry.reason.busy" };
+      }
+      if (typeof plotId !== "string" || !world.berryPlots.isPlot(plotId)) {
+        return { ok: false, error: "berry.reason.noPlot" };
+      }
+      const site = world.berryPlots.getSite(plotId)!;
+      if (site.mapId !== player.currentMapId) {
+        return { ok: false, error: "berry.reason.tooFar" };
+      }
+      const cellSize = world.getMapCellSize(player.currentMapId);
+      const current = player.getCurrentCell(cellSize);
+      const distance = Math.abs(current.x - site.x) + Math.abs(current.y - site.y);
+      if (distance > 1) {
+        return { ok: false, error: "berry.reason.tooFar" };
+      }
+      // Look at the soil you're working on (broadcasts the new facing).
+      player.faceCell(site, cellSize);
+      return { ok: true, player, site, userId: socket.data.userId };
+    };
+
+    const listPlantableBerries = async (userId: number) => {
+      const user = await auth.getUserForBattle(userId);
+      const berries: Array<{ itemId: string; berryId: string; name: string; quantity: number; hoursPerStage: number }> = [];
+      for (const item of user?.inventory ?? []) {
+        if (item.quantity <= 0) continue;
+        const definition = await battleManager.findEventItemDefinition({ symbol: item.id.replace(/^item-/, "") });
+        const profile = definition ? berryProfile(definition.essentialsId) : null;
+        if (!definition || !profile) continue;
+        berries.push({
+          itemId: item.id,
+          berryId: definition.essentialsId.toUpperCase(),
+          name: definition.name,
+          quantity: item.quantity,
+          hoursPerStage: profile.hoursPerStage
+        });
+      }
+      return berries;
+    };
+
+    const refreshBag = async (userId: number) => {
+      const user = await auth.getUserForBattle(userId);
+      if (user) {
+        socket.emit("auth:session", { authenticated: true, user });
+      }
+    };
+
+    socket.on("berry:actions", async (data) => {
+      const plotId = typeof data?.plotId === "string" ? data.plotId : "";
+      const check = berryPlotForAction(plotId);
+      const plot = plotId ? world.berryPlots.snapshot(plotId) : null;
+      if (!check.ok) {
+        socket.emit("berry:actions-result", {
+          plotId,
+          t: Date.now(),
+          plot,
+          berries: [],
+          canPlant: false,
+          canHarvest: false,
+          canClear: false,
+          reasonKey: check.error
+        });
+        return;
+      }
+      try {
+        const empty = !plot?.berryId;
+        const berries = empty ? await listPlantableBerries(check.userId) : [];
+        socket.emit("berry:actions-result", {
+          plotId,
+          t: Date.now(),
+          plot,
+          berries,
+          canPlant: empty && berries.length > 0,
+          canHarvest: Boolean(plot?.berryId) && (plot?.stage ?? 0) >= RIPE_STAGE,
+          canClear: Boolean(plot?.berryId),
+          reasonKey: empty && berries.length === 0 ? "berry.reason.noBerries" : undefined
+        });
+      } catch (error) {
+        console.error("Unable to resolve berry actions:", error);
+      }
+    });
+
+    socket.on("berry:plant", async (data) => {
+      const plotId = typeof data?.plotId === "string" ? data.plotId : "";
+      const check = berryPlotForAction(plotId);
+      if (!check.ok) {
+        socket.emit("berry:result", { action: "plant", ok: false, plotId, messageKey: check.error });
+        return;
+      }
+      if (world.berryPlots.snapshot(plotId)?.berryId) {
+        socket.emit("berry:result", { action: "plant", ok: false, plotId, messageKey: "berry.reason.occupied" });
+        return;
+      }
+      const itemId = typeof data?.itemId === "string" ? data.itemId : "";
+      const definition = itemId
+        ? await battleManager.findEventItemDefinition({ symbol: itemId.replace(/^item-/, "") })
+        : null;
+      const profile = definition ? berryProfile(definition.essentialsId) : null;
+      if (!definition || !profile) {
+        socket.emit("berry:result", { action: "plant", ok: false, plotId, messageKey: "berry.reason.notABerry" });
+        return;
+      }
+      const owned = (await auth.getUserForBattle(check.userId))?.inventory.find((item) => item.id === definition.id);
+      if (!owned || owned.quantity <= 0) {
+        socket.emit("berry:result", { action: "plant", ok: false, plotId, messageKey: "berry.reason.noBerries" });
+        return;
+      }
+      // Take the berry first: if a concurrent planter wins the plot the seed
+      // goes back to the bag.
+      const removed = await battleManager.removeEventItem(check.userId, { symbol: definition.essentialsId }, 1);
+      if (!removed.ok) {
+        socket.emit("berry:result", { action: "plant", ok: false, plotId, messageKey: "berry.reason.noBerries" });
+        return;
+      }
+      const planted = world.berryPlots.plant(plotId, definition.essentialsId, check.player.name || null);
+      if (!planted) {
+        await battleManager.grantEventItem(check.userId, { symbol: definition.essentialsId }, 1);
+        await refreshBag(check.userId);
+        socket.emit("berry:result", { action: "plant", ok: false, plotId, messageKey: "berry.reason.occupied" });
+        return;
+      }
+      await refreshBag(check.userId);
+      socket.emit("berry:result", {
+        action: "plant",
+        ok: true,
+        plotId,
+        messageKey: "berry.msg.planted",
+        params: { name: definition.name, hours: String(profile.hoursPerStage * 4) }
+      });
+    });
+
+    socket.on("berry:harvest", async (data) => {
+      const plotId = typeof data?.plotId === "string" ? data.plotId : "";
+      const check = berryPlotForAction(plotId);
+      if (!check.ok) {
+        socket.emit("berry:result", { action: "harvest", ok: false, plotId, messageKey: check.error });
+        return;
+      }
+      const plot = world.berryPlots.snapshot(plotId);
+      if (!plot?.berryId) {
+        socket.emit("berry:result", { action: "harvest", ok: false, plotId, messageKey: "berry.reason.empty" });
+        return;
+      }
+      if (plot.stage < RIPE_STAGE) {
+        socket.emit("berry:result", { action: "harvest", ok: false, plotId, messageKey: "berry.reason.notRipe" });
+        return;
+      }
+      const harvested = world.berryPlots.harvest(plotId);
+      if (!harvested) {
+        socket.emit("berry:result", { action: "harvest", ok: false, plotId, messageKey: "berry.reason.notRipe" });
+        return;
+      }
+      const granted = await battleManager.grantEventItem(check.userId, { symbol: harvested.berryId }, harvested.quantity);
+      await refreshBag(check.userId);
+      socket.emit("berry:result", {
+        action: "harvest",
+        ok: true,
+        plotId,
+        messageKey: "berry.msg.harvested",
+        params: {
+          name: granted.ok ? granted.itemName : harvested.berryId,
+          count: String(harvested.quantity)
+        }
+      });
+    });
+
+    socket.on("berry:clear", async (data) => {
+      const plotId = typeof data?.plotId === "string" ? data.plotId : "";
+      const check = berryPlotForAction(plotId);
+      if (!check.ok) {
+        socket.emit("berry:result", { action: "clear", ok: false, plotId, messageKey: check.error });
+        return;
+      }
+      if (!world.berryPlots.clear(plotId)) {
+        socket.emit("berry:result", { action: "clear", ok: false, plotId, messageKey: "berry.reason.empty" });
+        return;
+      }
+      socket.emit("berry:result", { action: "clear", ok: true, plotId, messageKey: "berry.msg.cleared" });
+    });
+
     socket.on("shotProjectil", (data) => {
       world.shotProjectil(data.mouse_x,data.mouse_y, socket.id);
     });
@@ -3570,6 +3764,17 @@ function createConnectionHandler(
     socket.on("event:interact", async (data) => {
       if (typeof socket.data.userId !== "number") {
         socket.emit("auth:error", { message: "Log in to talk with NPCs." });
+        return;
+      }
+
+      // Berry plots are global state, not event pages: never run the imported
+      // pbPickBerry/pbBerryPlant script (it would hand out per-player berries
+      // via self switches). Re-sync the plot so the client opens its menu.
+      if (typeof data?.npcPlacementId === "string" && world.berryPlots.isPlot(data.npcPlacementId)) {
+        const player = world.getPlayerBySocket(socket.id);
+        if (player) {
+          world.berryPlots.presentTo(socket.id, player.currentMapId);
+        }
         return;
       }
 

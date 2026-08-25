@@ -3,6 +3,7 @@ import Auth from "./components/Auth";
 import DBInit from "./components/DBInit";
 import DesignerSectionStore, { isDesignerSectionKey, type DesignerSectionKey } from "./components/DesignerSectionStore";
 import GroundItemStore from "./components/GroundItemStore";
+import { BerryPlotStore } from "./components/BerryPlots";
 import MailService from "./components/MailService";
 import MapAssetStore from "./components/MapAssetStore";
 import PlayableMapsStore from "./components/PlayableMapsStore";
@@ -401,6 +402,7 @@ async function bootstrap() {
   await auth.initialize();
   world.setSocketServer(io);
   await world.initializeGroundItems(groundItemStore);
+  await world.initializeBerryPlots(new BerryPlotStore(redis));
   const { tradeManager, maintenanceRunner } = registerSocketHandlers(io, world, auth, designerSectionStore, playableMapsStore, groundItemStore, redis, mapAssetStore, pokecraftApi, mailService);
   // Trades never survive a restart: drop any player claims and asset
   // reservations a previous run left behind before accepting connections.

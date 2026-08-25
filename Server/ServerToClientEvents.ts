@@ -37,6 +37,20 @@ import type {
 import type { ApiKeySummary } from "../components/PokecraftApiClient";
 import type { MaintenanceActionStatus } from "../components/MaintenanceRunner";
 
+export type BerryPlotSnapshotPayload = {
+  id: string;
+  mapId: string;
+  x: number;
+  y: number;
+  berryId: string | null;
+  itemId: string | null;
+  plantedAt: number | null;
+  plantedBy: string | null;
+  stageMs: number | null;
+  ripeAt: number | null;
+  stage: number;
+};
+
 export type EventStatePayload = {
   switches: Record<string, boolean>;
   variables: Record<string, number>;
@@ -503,6 +517,42 @@ export default interface ServerToClientEvents {
   /** The ball ran out of pushes (or a second ball spawned): play the deflate
    * animation, then remove it. */
   "ball:deflate": (data: { mapId: string; t: number; id: string }) => void;
+  /**
+   * Global berry plots (BerryPlots.ts). A plot is an authored soil patch;
+   * `berryId` null = empty soil. Growth is wall-clock: clients compute
+   * stage = min(5, 1 + floor((serverNow - plantedAt) / stageMs)) using the
+   * packet's `t` as the server clock (1 planted, 2 sprouted, 3 taller,
+   * 4 flowering, 5 ripe) and pick the charset row accordingly
+   * (berrytreeplanted / berrytree<BERRYID> rows 0..3).
+   */
+  "berry:sync": (data: { mapId: string; t: number; plots: BerryPlotSnapshotPayload[] }) => void;
+  /** One plot changed (planted / harvested / cleared) — broadcast to the map. */
+  "berry:update": (data: { mapId: string; t: number; plot: BerryPlotSnapshotPayload }) => void;
+  /** Answer to berry:actions: the plot now + the plantable berries in the bag. */
+  "berry:actions-result": (data: {
+    plotId: string;
+    t: number;
+    plot: BerryPlotSnapshotPayload | null;
+    /** Berries in the requester's bag that can be planted (empty plot only). */
+    berries: Array<{ itemId: string; berryId: string; name: string; quantity: number; hoursPerStage: number }>;
+    canPlant: boolean;
+    canHarvest: boolean;
+    canClear: boolean;
+    /** i18n key explaining a refusal (e.g. "berry.reason.tooFar"), if any. */
+    reasonKey?: string;
+  }) => void;
+  /**
+   * Outcome of berry:plant / berry:harvest / berry:clear for the actor. The
+   * message is an i18n key + params so the client renders it in its own
+   * language (`berry.msg.harvested` -> "{name} x{count}").
+   */
+  "berry:result": (data: {
+    action: "plant" | "harvest" | "clear";
+    ok: boolean;
+    plotId: string;
+    messageKey: string;
+    params?: Record<string, string>;
+  }) => void;
   // Teaching an MO/MT to a Venomon that already knows four moves: the client
   // must ask which move to replace, then re-send inventory:teach-move with it.
   "inventory:teach-replace-needed": (data: {

@@ -108,6 +108,17 @@ export default interface ClientToServerEvents {
   // Click-to-fish: cast at an adjacent water tile (cell coords) the player
   // tapped. rodItemId (optional) picks a specific owned rod; default best.
   "fishing:cast": (data: { x: number; y: number; rodItemId?: string }) => void;
+  // Global berry plots (BerryPlots.ts). berry:actions asks what the player
+  // may do with a plot right now (answered with berry:actions-result, purely
+  // advisory — every action re-validates). Plot ids are the placement ids of
+  // the imported "BerryPlant" events; the plot must be adjacent to the player.
+  "berry:actions": (data: { plotId: string }) => void;
+  // Plant one `itemId` berry from the bag into an empty plot.
+  "berry:plant": (data: { plotId: string; itemId: string }) => void;
+  // Pick a ripe plot: yields minYield..maxYield berries (PBS berryplants.txt).
+  "berry:harvest": (data: { plotId: string }) => void;
+  // Clear whatever grows in the plot without collecting anything.
+  "berry:clear": (data: { plotId: string }) => void;
   move: (data: { x: number; y: number }) => void;
   stopMove: () => void;
   shotProjectil: (data: { mouse_x: number; mouse_y: number }) => void;

@@ -25,6 +25,7 @@ import { logUnsupportedScript } from "./essentialsScriptAdapters";
 import NpcActorSimulation from "./NpcActors";
 import FollowerActorSimulation from "./FollowerActors";
 import BeachBalls from "./BeachBalls";
+import BerryPlots, { type BerryPlotStore } from "./BerryPlots";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -95,6 +96,8 @@ export default class World {
     followerSimulation: FollowerActorSimulation | null = null;
     /** Pushable /pelota beach balls (see BeachBalls.ts). */
     beachBalls: BeachBalls;
+    /** Global, server-timed berry plots (see BerryPlots.ts). */
+    berryPlots: BerryPlots;
     /** Short-lived overlay of live NPC positions; see `npcBlockersLive`. */
     private liveNpcBlockerCache = new Map<string, { at:number; blockers:Array<NpcBlocker> }>();
     private static readonly LIVE_NPC_BLOCKER_TTL_MS = 25;
@@ -151,6 +154,11 @@ export default class World {
         this.followerSimulation.start();
 
         this.beachBalls = new BeachBalls(this);
+        this.berryPlots = new BerryPlots(this);
+    }
+
+    async initializeBerryPlots(store: BerryPlotStore) {
+        await this.berryPlots.initialize(store);
     }
 
     async initializeGroundItems(groundItemStore: GroundItemStore) {
@@ -1675,6 +1683,9 @@ export default class World {
         // and the live-position overlay so both rebuild from the new payload.
         this.npcSimulation?.reset();
         this.liveNpcBlockerCache.clear();
+        // Plot sites live in the placements; new/removed soil patches must
+        // show up (and seed) without a restart.
+        this.berryPlots.rescan();
     }
 
     setBattleManager(battleManager: BattleManager) {
@@ -2064,6 +2075,7 @@ export default class World {
         this.presentNpcActorsTo(socketId, mapId);
         this.presentFollowersTo(socketId, mapId);
         this.presentBeachBallsTo(socketId, mapId);
+        this.berryPlots.presentTo(socketId, mapId);
     }
 
     /** Sends the full follower state of a map to one socket. */
@@ -2150,6 +2162,7 @@ export default class World {
         });
         this.presentFollowersTo(socketId, mapId);
         this.presentBeachBallsTo(socketId, mapId);
+        this.berryPlots.presentTo(socketId, mapId);
     }
 
     /**
