@@ -121,6 +121,8 @@ export interface AuthenticatedUser {
     battleHistory:BattleHistoryEntry[];
     /** Whether the party leader walks behind the player on the map. */
     followerEnabled:boolean;
+    /** Party venomon ids allowed to roam free inside houses (Housing). */
+    houseRoamIds:string[];
     /** How many bodies in a row this player can shove (see World.shovePastObstacle).
      * Hidden gameplay stat: not shown in regular UX, tunable from the admin
      * panel and intended for future item bonuses. */
@@ -304,7 +306,7 @@ export interface RoleDefinitionWithCount extends RoleDefinition {
 export interface InventoryItem {
     id:string;
     name:string;
-    category:"usable" | "berries" | "moves" | "quest";
+    category:"usable" | "berries" | "moves" | "quest" | "furniture";
     quantity:number;
     description:string;
     // Read-only enrichment for admin/UX surfaces. Never persisted (the storage
@@ -696,6 +698,7 @@ const CHARACTER_GAMEPLAY_FIELDS = [
     "event_self_switches",
     "egg_cooldowns",
     "follower_enabled",
+    "house_roam_ids",
     "push_depth",
     "repel_steps"
 ] as const;
@@ -1255,7 +1258,7 @@ export default class Auth {
                 "inventory", "pokemon_party", "battle_history", "visited_towns",
                 "last_map_id", "last_x", "last_y", "last_surfing", "respawn_point",
                 "event_switches", "event_variables", "event_self_switches",
-                "egg_cooldowns", "money", "follower_enabled", "push_depth",
+                "egg_cooldowns", "money", "follower_enabled", "house_roam_ids", "push_depth",
                 "repel_steps"
             ]);
             await this.redis.hSet(this.characterKey(characterId), {
@@ -1392,6 +1395,47 @@ export default class Auth {
         await this.redis.hSet(await this.activeCharacterKey(userId), {
             follower_enabled: enabled ? "1" : "0"
         });
+    }
+
+    private parseHouseRoamIds(value:string | undefined):string[] {
+        if (!value) return [];
+        try {
+            const parsed = JSON.parse(value);
+            return Array.isArray(parsed)
+                ? parsed.filter((id): id is string => typeof id === "string" && id.length > 0).slice(0, 6)
+                : [];
+        } catch {
+            return [];
+        }
+    }
+
+    /** Persists which party venomons roam free inside houses (Housing). */
+    public async saveHouseRoamIds(userId:number, ids:string[]) {
+        await this.redis.hSet(await this.activeCharacterKey(userId), {
+            house_roam_ids: JSON.stringify(ids.slice(0, 6))
+        });
+    }
+
+    /** Display info of ANY character by id (house owners may be offline or
+     * playing another character of the same account). */
+    public async getCharacterDisplayInfo(characterId:number):Promise<{ name:string; money:number } | null> {
+        const [name, money, deletedAt] = await this.redis.hmGet(this.characterKey(characterId), ["name", "money", "deleted_at"]);
+        if (typeof name !== "string" || deletedAt) {
+            return null;
+        }
+        return { name, money: this.parseMoney(money ?? undefined) };
+    }
+
+    /**
+     * Adds (or removes, negative delta) money on a specific character — the
+     * seller of a house is paid even while offline. Never goes below zero.
+     */
+    public async adjustCharacterMoney(characterId:number, delta:number):Promise<number> {
+        const key = this.characterKey(characterId);
+        const current = this.parseMoney((await this.redis.hGet(key, "money")) ?? undefined);
+        const next = Math.max(0, Math.min(MAX_MONEY_BALANCE, Math.round(current + delta)));
+        await this.redis.hSet(key, { money: String(next) });
+        return next;
     }
 
     /** Remaining repel steps persisted on the active character (0 = none). */
@@ -3677,6 +3721,7 @@ export default class Auth {
                     money: startingMoney,
                     battleHistory: DEFAULT_BATTLE_HISTORY,
                     followerEnabled: true,
+                    houseRoamIds: [],
                     pushDepth: DEFAULT_PUSH_DEPTH,
                     repelSteps: 0,
                     role,
@@ -3966,6 +4011,7 @@ export default class Auth {
             trainerCardColor: character.trainer_card_color ?? "",
             battleHistory: this.parseBattleHistory(character.battle_history),
             followerEnabled: character.follower_enabled !== "0",
+            houseRoamIds: this.parseHouseRoamIds(character.house_roam_ids),
             pushDepth: this.parsePushDepth(character.push_depth),
             repelSteps: this.parseRepelSteps(character.repel_steps),
             role: resolvedRole.role,
@@ -4002,6 +4048,7 @@ export default class Auth {
             trainerCardColor: user.trainerCardColor,
             battleHistory: user.battleHistory,
             followerEnabled: user.followerEnabled,
+            houseRoamIds: user.houseRoamIds ?? [],
             pushDepth: user.pushDepth,
             repelSteps: user.repelSteps,
             role: user.role,
@@ -4137,6 +4184,8 @@ export default class Auth {
                 return "moves";
             case "quest item":
                 return "quest";
+            case "furniture":
+                return "furniture";
             case "usable":
             case "medicine":
             case "battle item":
@@ -4318,7 +4367,7 @@ export default class Auth {
             .filter((item): item is InventoryItem =>
                 typeof item?.id === "string" &&
                 typeof item?.name === "string" &&
-                ["usable", "berries", "moves", "quest"].includes(item?.category) &&
+                ["usable", "berries", "moves", "quest", "furniture"].includes(item?.category) &&
                 typeof item?.quantity === "number" &&
                 Number.isFinite(item.quantity) &&
                 typeof item?.description === "string"

@@ -1,4 +1,5 @@
 import type { Server } from "socket.io";
+import { templateMapIdFor } from "./Housing";
 import type Auth from "./Auth";
 import type BattleManager from "./BattleManager";
 import type World from "./world";
@@ -390,7 +391,7 @@ export default class EventRuntime {
       return { ok: false as const, message: "Enter the world before talking to NPCs." };
     }
     const snapshot = this.world.getPlayableMapsState();
-    const placement = snapshot?.editorDataByMapId[player.currentMapId]?.npcs.find(
+    const placement = snapshot?.editorDataByMapId[templateMapIdFor(player.currentMapId)]?.npcs.find(
       (candidate) => candidate.id === npcPlacementId
     ) as (Record<string, unknown> & { name?: string; previewImageSrc?: string; x?: number; y?: number; interactionDistanceSquares?: number; essentialsEvent?: EssentialsEvent }) | undefined;
 
@@ -558,7 +559,7 @@ export default class EventRuntime {
         // resume can retry instead of silently skipping the intro autorun.
         return { ready: false, ran: ranAny };
       }
-      const placements = (snapshot.editorDataByMapId[player.currentMapId]?.npcs ?? []) as Array<
+      const placements = (snapshot.editorDataByMapId[templateMapIdFor(player.currentMapId)]?.npcs ?? []) as Array<
         Record<string, unknown> & { name?: string; previewImageSrc?: string; x?: number; y?: number; essentialsEvent?: EssentialsEvent }
       >;
       const eventPlacements = placements.filter((placement) => placement.essentialsEvent);
@@ -1884,7 +1885,7 @@ export default class EventRuntime {
       // regular store overlay on the client.
       const placement = this.world
         .getPlayableMapsState()
-        ?.editorDataByMapId[session.player.currentMapId]?.npcs.find(
+        ?.editorDataByMapId[templateMapIdFor(session.player.currentMapId)]?.npcs.find(
           (candidate) => candidate.id === session.placementId
         ) as
         | {
@@ -1930,7 +1931,7 @@ export default class EventRuntime {
       // this computer's cell so walking away closes it (same as marts).
       const placement = this.world
         .getPlayableMapsState()
-        ?.editorDataByMapId[session.player.currentMapId]?.npcs.find(
+        ?.editorDataByMapId[templateMapIdFor(session.player.currentMapId)]?.npcs.find(
           (candidate) => candidate.id === session.placementId
         ) as { x?: number; y?: number; interactionDistanceSquares?: number } | undefined;
       this.emitStep(session, {

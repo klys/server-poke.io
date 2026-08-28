@@ -37,6 +37,54 @@ import type {
 import type { ApiKeySummary } from "../components/PokecraftApiClient";
 import type { MaintenanceActionStatus } from "../components/MaintenanceRunner";
 
+export type HouseFurniturePayload = {
+  id: string;
+  itemId: string;
+  itemName: string;
+  iconSrc: string;
+  x: number;
+  y: number;
+  placedAt: number;
+};
+
+export type HouseApartmentSummaryPayload = {
+  id: string;
+  index: number;
+  name: string;
+  templateMapId: string;
+  price: number;
+  owned: boolean;
+  ownerName: string | null;
+  isOwner: boolean;
+  locked: boolean;
+  keyCodeSet: boolean;
+  forSale: boolean;
+  available: boolean;
+};
+
+export type HouseDoorSummaryPayload = {
+  doorId: string;
+  mapId: string;
+  x: number;
+  y: number;
+  name: string;
+  apartments: HouseApartmentSummaryPayload[];
+};
+
+export type HouseInstanceInfoPayload = {
+  mapId: string;
+  apartmentId: string;
+  doorId: string;
+  templateMapId: string;
+  name: string;
+  ownerCharacterId: number | null;
+  ownerName: string | null;
+  isOwner: boolean;
+  keyCodeSet: boolean;
+  salePrice: number | null;
+  furniture: HouseFurniturePayload[];
+};
+
 export type BerryPlotSnapshotPayload = {
   id: string;
   mapId: string;
@@ -239,6 +287,8 @@ interface AuthUserData {
   trainerCardColor: string;
   /** Whether the party leader walks behind the player on the map. */
   followerEnabled: boolean;
+  /** Party venomon ids allowed to roam free inside houses. */
+  houseRoamIds: string[];
   /** Secret push-chain depth (bodies-in-a-row one bump can displace). */
   pushDepth: number;
   role: "admin" | "designer" | "moderator" | "user";
@@ -246,7 +296,7 @@ interface AuthUserData {
   inventory: Array<{
     id: string;
     name: string;
-    category: "usable" | "berries" | "moves" | "quest";
+    category: "usable" | "berries" | "moves" | "quest" | "furniture";
     quantity: number;
     description: string;
   }>;
@@ -526,6 +576,30 @@ export default interface ServerToClientEvents {
    * (berrytreeplanted / berrytree<BERRYID> rows 0..3).
    */
   "berry:sync": (data: { mapId: string; t: number; plots: BerryPlotSnapshotPayload[] }) => void;
+  /**
+   * Housing (Housing.ts). `house:door-info` answers house:door-info with the
+   * apartments behind a door as seen by THIS player (owner / locked / for
+   * sale / price). `house:sync` is sent on arrival inside a house instance
+   * (and whenever its owner/lock/sale changes); `house:furniture-update`
+   * broadcasts one placed/picked piece to everyone inside. `house:result`
+   * reports the outcome of an action to the actor (i18n key + params).
+   */
+  "house:door-info": (data: { t: number; door: HouseDoorSummaryPayload }) => void;
+  "house:sync": (data: { t: number; house: HouseInstanceInfoPayload }) => void;
+  "house:furniture-update": (data: {
+    mapId: string;
+    t: number;
+    placed: HouseFurniturePayload | null;
+    removedId: string | null;
+  }) => void;
+  "house:result": (data: {
+    action: "enter" | "buy" | "key" | "sale" | "leave" | "place" | "pick" | "roam" | "door-info";
+    ok: boolean;
+    messageKey: string;
+    params?: Record<string, string>;
+    /** Set on a successful enter/leave: the map the player now stands on. */
+    mapId?: string;
+  }) => void;
   /** One plot changed (planted / harvested / cleared) — broadcast to the map. */
   "berry:update": (data: { mapId: string; t: number; plot: BerryPlotSnapshotPayload }) => void;
   /** Answer to berry:actions: the plot now + the plantable berries in the bag. */

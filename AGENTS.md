@@ -79,6 +79,13 @@ Copy values from `.env.example` when setting up a local environment. Important v
 - `components/player.ts`: player state and movement/pathfinding logic
 - `components/projectil.ts`: projectile behavior
 - `components/gameMath.ts`: geometry and collision helpers
+- `components/Housing.ts` + `components/HouseRoamers.ts` + `Server/registerHousingHandlers.ts`:
+  player housing — apartment doors (`editorData.houseDoors`), HOUSE template
+  maps (`playableMapConfig.isHouse`), per-owner house INSTANCES with map id
+  `<template>--house-<apartmentId>` (resolve with `templateMapIdFor` before any
+  geometry/editor-data lookup), key codes, resale, furniture (`furniture`
+  inventory category, solid), party venomons roaming on the follower channel.
+  State in Redis `world:houses`; E2E `tools/e2e-housing.ts`.
 - `components/TradeManager.ts` + `components/trade/`: player-to-player trading
   (state machine, asset reservations, atomic Lua exchange, audit) — see `TRADING.md`
 - `Server/registerSocketHandlers.ts`: main Socket.IO event registration

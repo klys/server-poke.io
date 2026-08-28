@@ -173,6 +173,24 @@ export default interface ClientToServerEvents {
   "follower:set-enabled": (data: { enabled: boolean }) => void;
 
   /**
+   * Housing (Housing.ts). Doors are editor cells; the player must stand on
+   * or next to one. Buying charges the catalog price (unowned) or the
+   * listed sale price (owned + for sale, the seller is paid). Key codes are
+   * 4-8 digits; null clears them. Furniture actions require standing inside
+   * one's own house instance. `house:set-roam` lists the party venomon ids
+   * that roam free inside houses.
+   */
+  "house:door-info": (data: { doorId: string }) => void;
+  "house:enter": (data: { apartmentId: string; keyCode?: string }) => void;
+  "house:buy": (data: { apartmentId: string }) => void;
+  "house:set-key": (data: { apartmentId: string; keyCode: string | null }) => void;
+  "house:set-sale": (data: { apartmentId: string; price: number | null }) => void;
+  "house:leave": () => void;
+  "house:furniture-place": (data: { itemId: string; x: number; y: number }) => void;
+  "house:furniture-pick": (data: { furnitureId: string }) => void;
+  "house:set-roam": (data: { pokemonIds: string[] }) => void;
+
+  /**
    * Stats-window move management (outside battles): learn a move available at
    * the venomon's current level (learnset or a missed battle prompt),
    * optionally replacing a known move, or forget a known move.

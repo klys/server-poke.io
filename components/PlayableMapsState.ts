@@ -29,6 +29,9 @@ type DesignerPlayableMapConfig = {
   width: number;
   height: number;
   isInitialMap: boolean;
+  /** True when the map is a HOUSE template: apartments (see MapEditorHouseDoor)
+   * spawn per-owner instances of it (Housing.ts). */
+  isHouse?: boolean;
   initialPositionX: number | null;
   initialPositionY: number | null;
   regionName: string;
@@ -234,6 +237,54 @@ export type MapEditorBoulder = {
   y: number;
 };
 
+/** One purchasable apartment behind a house door: its price and the HOUSE
+ * template map (`playableMapConfig.isHouse`) that instances it. */
+export type MapEditorHouseApartment = {
+  price: number;
+  mapId: string;
+};
+
+/**
+ * A cell players right-click / tap / face to enter a building's apartments.
+ * `apartments.length` is the building's apartment count; every apartment is
+ * an independently owned house instance (Housing.ts).
+ */
+export type MapEditorHouseDoor = {
+  id: string;
+  x: number;
+  y: number;
+  name?: string;
+  apartments: MapEditorHouseApartment[];
+};
+
+export function sanitizeHouseDoors(value: unknown): MapEditorHouseDoor[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter(
+      (item): item is MapEditorHouseDoor =>
+        typeof item?.id === "string" &&
+        typeof item?.x === "number" &&
+        typeof item?.y === "number"
+    )
+    .map((item) => ({
+      id: item.id,
+      x: Math.max(0, clampInteger(item.x)),
+      y: Math.max(0, clampInteger(item.y)),
+      name: typeof item.name === "string" && item.name.trim() ? item.name.trim().slice(0, 60) : undefined,
+      apartments: (Array.isArray(item.apartments) ? item.apartments : [])
+        .slice(0, 50)
+        .map((apartment) => ({
+          price:
+            typeof apartment?.price === "number" && Number.isFinite(apartment.price)
+              ? Math.max(0, Math.round(apartment.price))
+              : 0,
+          mapId: typeof apartment?.mapId === "string" ? apartment.mapId : ""
+        }))
+    }));
+}
+
 export type PlayableMapEditorData = {
   version: 1;
   objects: MapEditorObjectPlacement[];
@@ -241,6 +292,8 @@ export type PlayableMapEditorData = {
   grass: MapEditorGrassPlacement[];
   fishingSpots?: MapEditorFishingSpot[];
   boulders?: MapEditorBoulder[];
+  /** Apartment-building doors (housing system). */
+  houseDoors?: MapEditorHouseDoor[];
   npcs: MapEditorNpcPlacement[];
   tileMap?: PlayableMapTileMapProfile;
   essentials?: {
@@ -338,6 +391,7 @@ function sanitizePlayableMapConfig(value: unknown): DesignerPlayableMapConfig | 
     width: clampPositiveInteger(candidate.width, DEFAULT_MAP_WIDTH),
     height: clampPositiveInteger(candidate.height, DEFAULT_MAP_HEIGHT),
     isInitialMap: candidate.isInitialMap === true,
+    isHouse: candidate.isHouse === true ? true : undefined,
     initialPositionX:
       typeof candidate.initialPositionX === "number" && Number.isFinite(candidate.initialPositionX)
         ? Math.round(candidate.initialPositionX)
@@ -624,6 +678,7 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
       grass: [],
       fishingSpots: [],
       boulders: [],
+      houseDoors: [],
       npcs: [],
       essentials: undefined,
     };
@@ -756,6 +811,7 @@ function sanitizePlayableMapEditorData(value: unknown): PlayableMapEditorData {
             y: Math.max(0, clampInteger(item.y)),
           }))
       : [],
+    houseDoors: sanitizeHouseDoors(candidate.houseDoors),
     npcs: Array.isArray(candidate.npcs)
       ? candidate.npcs
           .filter(

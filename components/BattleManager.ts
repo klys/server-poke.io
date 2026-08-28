@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { templateMapIdFor } from "./Housing";
 import type { Server } from "socket.io";
 import type { AuthenticatedUser, InventoryItem, PokemonSummary } from "./Auth";
 import Auth from "./Auth";
@@ -684,6 +685,8 @@ function toInventoryCategory(value: string): InventoryItem["category"] {
       return "moves";
     case "quest item":
       return "quest";
+    case "furniture":
+      return "furniture";
     case "usable":
     case "medicine":
     case "battle item":
@@ -1737,7 +1740,7 @@ export default class BattleManager {
     if (!mapsState) {
       return null;
     }
-    const currentMap = mapsState.items.find((item) => item.id === player.currentMapId);
+    const currentMap = mapsState.items.find((item) => item.id === templateMapIdFor(player.currentMapId));
     const healingSpot = currentMap?.playableMapConfig?.healingSpot;
     if (healingSpot) {
       const targetMap =
@@ -1869,7 +1872,7 @@ export default class BattleManager {
       return; // ~25% like Essentials rock-smash encounters
     }
     const snapshot = this.world.getPlayableMapsState();
-    const editorData = snapshot?.editorDataByMapId[player.currentMapId];
+    const editorData = snapshot?.editorDataByMapId[templateMapIdFor(player.currentMapId)];
     const table = this.getMapEncounterTable(player.currentMapId, editorData);
     if (!table || (table.pokemonIds.length === 0 && !table.encounterRows?.length)) {
       return;
@@ -2055,8 +2058,8 @@ export default class BattleManager {
       await this.loadCatalogs();
 
       const snapshot = this.world.getPlayableMapsState();
-      const map = snapshot?.items.find((candidate) => candidate.id === player.currentMapId);
-      const editorData = snapshot?.editorDataByMapId[player.currentMapId];
+      const map = snapshot?.items.find((candidate) => candidate.id === templateMapIdFor(player.currentMapId));
+      const editorData = snapshot?.editorDataByMapId[templateMapIdFor(player.currentMapId)];
       const cellSize = map?.playableMapConfig?.cellSize ?? 32;
       const facing = player.getFacingCell(cellSize);
       const rodOrder: Record<FishingRodTier, number> = { old: 0, good: 1, super: 2 };
@@ -2245,7 +2248,7 @@ export default class BattleManager {
     const current = player.getCurrentCell(cellSize);
     const distance = Math.abs(current.x - target.x) + Math.abs(current.y - target.y);
     const targetIsWater = this.world.isOpenWaterCell(player.currentMapId, target.x, target.y);
-    const editorData = this.world.getPlayableMapsState()?.editorDataByMapId[player.currentMapId];
+    const editorData = this.world.getPlayableMapsState()?.editorDataByMapId[templateMapIdFor(player.currentMapId)];
     const spot = (editorData?.fishingSpots ?? []).find(
       (candidate) => candidate.x === target.x && candidate.y === target.y
     );
@@ -2319,7 +2322,7 @@ export default class BattleManager {
    */
   private useDowsing(player: Player, item: InventoryItem): UseInventoryItemResult {
     const snapshot = this.world.getPlayableMapsState();
-    const map = snapshot?.items.find((candidate) => candidate.id === player.currentMapId);
+    const map = snapshot?.items.find((candidate) => candidate.id === templateMapIdFor(player.currentMapId));
     const cellSize = map?.playableMapConfig?.cellSize ?? 32;
     const nearest = this.world.findNearestHiddenGroundItem(player, cellSize);
 
@@ -3735,8 +3738,8 @@ export default class BattleManager {
 
   private getGrassCellForPlayer(player: Player) {
     const snapshot = this.world.getPlayableMapsState();
-    const map = snapshot?.items.find((item) => item.id === player.currentMapId);
-    const editorData = snapshot?.editorDataByMapId[player.currentMapId];
+    const map = snapshot?.items.find((item) => item.id === templateMapIdFor(player.currentMapId));
+    const editorData = snapshot?.editorDataByMapId[templateMapIdFor(player.currentMapId)];
     const cellSize = map?.playableMapConfig?.cellSize ?? 32;
 
     if (!editorData || editorData.grass.length === 0) {
@@ -4269,7 +4272,7 @@ export default class BattleManager {
     }
 
     const snapshot = this.world.getPlayableMapsState();
-    const map = snapshot?.items.find((item) => item.id === player.currentMapId);
+    const map = snapshot?.items.find((item) => item.id === templateMapIdFor(player.currentMapId));
     const config = map?.playableMapConfig as { battleBack?: unknown } | undefined;
     const base =
       typeof config?.battleBack === "string" && config.battleBack.trim().length > 0
@@ -6495,6 +6498,12 @@ export default class BattleManager {
     | null = null;
   private cachedNpcDefinitions = new Map<string, NpcDefinition>();
 
+  /** Catalog definition of an inventory item id (housing furniture checks). */
+  public async findItemDefinitionById(itemId: string, itemName = ""): Promise<ItemDefinition | null> {
+    await this.loadCatalogs();
+    return this.getCachedItemDefinition(itemId, itemName) ?? null;
+  }
+
   private getCachedItemDefinition(itemId: string, itemName: string) {
     const normalizedName = itemName.toLowerCase();
     return this.cachedItemDefinitions.find((item) =>
@@ -6568,7 +6577,7 @@ export default class BattleManager {
       return { ok: false, message: "The world map is still loading." };
     }
 
-    const mapEditorData = playableMapsState.editorDataByMapId[player.currentMapId];
+    const mapEditorData = playableMapsState.editorDataByMapId[templateMapIdFor(player.currentMapId)];
     const placement =
       mapEditorData?.npcs.find((candidate) => candidate.id === npcPlacementId) ?? null;
 
@@ -6577,7 +6586,7 @@ export default class BattleManager {
     }
 
     const mapDefinition =
-      playableMapsState.items.find((candidate) => candidate.id === player.currentMapId) ?? null;
+      playableMapsState.items.find((candidate) => candidate.id === templateMapIdFor(player.currentMapId)) ?? null;
     const cellSize = mapDefinition?.playableMapConfig?.cellSize ?? 32;
     const interactionDistanceSquares =
       typeof placement.interactionDistanceSquares === "number" &&

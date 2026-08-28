@@ -26,6 +26,8 @@ import NpcActorSimulation from "./NpcActors";
 import FollowerActorSimulation from "./FollowerActors";
 import BeachBalls from "./BeachBalls";
 import BerryPlots, { type BerryPlotStore } from "./BerryPlots";
+import Housing, { templateMapIdFor, type HouseStore } from "./Housing";
+import HouseRoamerSimulation from "./HouseRoamers";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -98,6 +100,10 @@ export default class World {
     beachBalls: BeachBalls;
     /** Global, server-timed berry plots (see BerryPlots.ts). */
     berryPlots: BerryPlots;
+    /** Apartments, house instances and furniture (see Housing.ts). */
+    housing: Housing;
+    /** Party venomons roaming inside houses (see HouseRoamers.ts). */
+    houseRoamers: HouseRoamerSimulation;
     /** Short-lived overlay of live NPC positions; see `npcBlockersLive`. */
     private liveNpcBlockerCache = new Map<string, { at:number; blockers:Array<NpcBlocker> }>();
     private static readonly LIVE_NPC_BLOCKER_TTL_MS = 25;
@@ -155,10 +161,29 @@ export default class World {
 
         this.beachBalls = new BeachBalls(this);
         this.berryPlots = new BerryPlots(this);
+        this.housing = new Housing(this);
+        this.houseRoamers = new HouseRoamerSimulation(this);
+        this.houseRoamers.start();
+        this.followerSimulation.setExtraSnapshotProvider((mapId) => this.houseRoamers.snapshotForMap(mapId));
     }
 
     async initializeBerryPlots(store: BerryPlotStore) {
         await this.berryPlots.initialize(store);
+    }
+
+    async initializeHousing(store: HouseStore) {
+        await this.housing.initialize(store);
+    }
+
+    /** Editor data of a map, resolving house instances to their template. */
+    getEditorData(mapId: string) {
+        return this.playableMapsState?.editorDataByMapId?.[templateMapIdFor(mapId)] ?? null;
+    }
+
+    /** Designer map item (config, name) of a map or of an instance's template. */
+    getMapItem(mapId: string) {
+        const templateId = templateMapIdFor(mapId);
+        return this.playableMapsState?.items.find((item) => item.id === templateId) ?? null;
     }
 
     async initializeGroundItems(groundItemStore: GroundItemStore) {
@@ -340,17 +365,18 @@ export default class World {
     }
 
     getMapObjects(mapId:string) {
-        return this.objectsByMapId.get(mapId) ?? [];
+        return this.objectsByMapId.get(templateMapIdFor(mapId)) ?? [];
     }
 
     getMapCollisionGrid(mapId:string) {
-        return this.collisionGridsByMapId.get(mapId) ?? null;
+        return this.collisionGridsByMapId.get(templateMapIdFor(mapId)) ?? null;
     }
 
     /** Decoded terrain-tag grid for a map (lazy; cached; null when unavailable).
      * `passageTags` (when baked) carries the tag of the collision-DECIDING tile,
      * which tells plain water apart from obstacles drawn over water. */
-    private getTerrainGrid(mapId: string) {
+    private getTerrainGrid(rawMapId: string) {
+        const mapId = templateMapIdFor(rawMapId);
         if (this.terrainGridsByMapId.has(mapId)) {
             return this.terrainGridsByMapId.get(mapId) ?? null;
         }
@@ -410,7 +436,7 @@ export default class World {
 
     /** The map's collision-cell size (px), defaulting to 32. */
     getMapCellSize(mapId: string): number {
-        return this.collisionGridsByMapId.get(mapId)?.cellSize ?? 32;
+        return this.collisionGridsByMapId.get(templateMapIdFor(mapId))?.cellSize ?? 32;
     }
 
     /** Place a player at an exact cell and broadcast, bypassing the open-position
@@ -574,7 +600,7 @@ export default class World {
         const cellSize = this.getMapCellSize(player.currentMapId);
         const start = player.getCurrentCell(cellSize);
         const facing = player.getFacingCell(cellSize);
-        const editorData = this.playableMapsState?.editorDataByMapId?.[player.currentMapId];
+        const editorData = this.playableMapsState?.editorDataByMapId?.[templateMapIdFor(player.currentMapId)];
         const boulder = (editorData?.boulders ?? []).find(
             (candidate) => candidate.x === facing.x && candidate.y === facing.y
         );
@@ -607,7 +633,7 @@ export default class World {
         height:number,
         passThroughWater = false
     ) {
-        const grid = this.collisionGridsByMapId.get(mapId);
+        const grid = this.collisionGridsByMapId.get(templateMapIdFor(mapId));
         if (!grid) {
             return false;
         }
@@ -654,6 +680,9 @@ export default class World {
         if (this.getMapObjects(mapId).some((object) => this.checkCollision(bounds, object))) {
             return true;
         }
+        if (this.housing.isFurnitureBlocked(mapId, bounds)) {
+            return true;
+        }
 
         return this.isRectBlockedByCollisionGrid(mapId, x, y, width, height);
     }
@@ -677,6 +706,9 @@ export default class World {
         // Legacy obstacle rectangles + static grid, but let a surfing player
         // cross water-tagged solids (Surf). Real walls always block.
         if (this.getMapObjects(player.currentMapId).some((object) => this.checkCollision({ x, y, width, height }, object))) {
+            return true;
+        }
+        if (this.housing.isFurnitureBlocked(player.currentMapId, { x, y, width, height })) {
             return true;
         }
         if (this.isRectBlockedByCollisionGrid(player.currentMapId, x, y, width, height, player.isSurfing)) {
@@ -1240,7 +1272,7 @@ export default class World {
      * (messages, toasts) only exists in the browser.
      */
     private firePortalIfPresent(player:Player, cellX:number, cellY:number) {
-        const editorData = this.playableMapsState?.editorDataByMapId[player.currentMapId];
+        const editorData = this.playableMapsState?.editorDataByMapId[templateMapIdFor(player.currentMapId)];
         const portal = (editorData?.portals ?? []).find(
             (candidate) => candidate.x === cellX && candidate.y === cellY
         );
@@ -1283,7 +1315,7 @@ export default class World {
         // tile, so detect by AABB overlap; the axis ACROSS the movement must
         // overlap at least half a tile (same alignment rule as event doors).
         const portals =
-            this.playableMapsState?.editorDataByMapId[player.currentMapId]?.portals ?? [];
+            this.playableMapsState?.editorDataByMapId[templateMapIdFor(player.currentMapId)]?.portals ?? [];
         for (const portal of portals) {
             const portalX = portal.x * 32;
             const portalY = portal.y * 32;
@@ -1367,7 +1399,7 @@ export default class World {
             return;
         }
 
-        const editorData = this.playableMapsState?.editorDataByMapId[player.currentMapId];
+        const editorData = this.playableMapsState?.editorDataByMapId[templateMapIdFor(player.currentMapId)];
         if (!editorData) {
             return;
         }
@@ -1643,7 +1675,7 @@ export default class World {
         let blockers = byMap.get(mapId);
         if (!blockers) {
             blockers = [];
-            const npcs = state.editorDataByMapId[mapId]?.npcs ?? [];
+            const npcs = state.editorDataByMapId[templateMapIdFor(mapId)]?.npcs ?? [];
             for (const npc of npcs) {
                 const placement = npc as typeof npc & { essentialsEvent?: EssentialsEventRecord; name?: string };
                 if (
@@ -1686,6 +1718,8 @@ export default class World {
         // Plot sites live in the placements; new/removed soil patches must
         // show up (and seed) without a restart.
         this.berryPlots.rescan();
+        // Doors/apartments live in the placements + map configs.
+        this.housing.rescan();
     }
 
     setBattleManager(battleManager: BattleManager) {
@@ -1710,7 +1744,7 @@ export default class World {
     }
 
     getMapBounds(mapId:string) {
-        return this.mapBoundsByMapId.get(mapId) ?? {
+        return this.mapBoundsByMapId.get(templateMapIdFor(mapId)) ?? {
             width: this.width,
             height: this.height
         };
@@ -1862,7 +1896,7 @@ export default class World {
         playerHeight = 32
     ) {
         const config = this.playableMapsState?.items.find(
-            (item) => item.id === mapId
+            (item) => item.id === templateMapIdFor(mapId)
         )?.playableMapConfig;
 
         let seedX:number;
@@ -2076,6 +2110,7 @@ export default class World {
         this.presentFollowersTo(socketId, mapId);
         this.presentBeachBallsTo(socketId, mapId);
         this.berryPlots.presentTo(socketId, mapId);
+        this.housing.presentTo(socketId, mapId, this.getPlayerBySocket(socketId)?.characterId ?? null);
     }
 
     /** Sends the full follower state of a map to one socket. */
@@ -2163,6 +2198,7 @@ export default class World {
         this.presentFollowersTo(socketId, mapId);
         this.presentBeachBallsTo(socketId, mapId);
         this.berryPlots.presentTo(socketId, mapId);
+        this.housing.presentTo(socketId, mapId, this.getPlayerBySocket(socketId)?.characterId ?? null);
     }
 
     /**
@@ -2278,6 +2314,7 @@ export default class World {
         World.socketServer.emit("removePlayer", { playerId: player.socketId, id: player.id });
         this.players.delete(player.socketId);
         this.followerSimulation?.removeFor(player.socketId);
+        this.houseRoamers.removeFor(player.socketId);
         return true;
     }
 
@@ -2303,6 +2340,7 @@ export default class World {
         World.socketServer.emit("removePlayer", {playerId: player.socketId, id:player.id})
         this.players.delete(playerId);
         this.followerSimulation?.removeFor(playerId);
+        this.houseRoamers.removeFor(playerId);
 
         return { player, removed: true };
     }

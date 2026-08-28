@@ -141,6 +141,13 @@ export default class FollowerActorSimulation {
         this.leaderResolver = resolver;
     }
 
+    /** Extra follower-shaped actors (house roamers) merged into map syncs. */
+    private extraSnapshots: ((mapId: string) => FollowerSnapshot[]) | null = null;
+
+    setExtraSnapshotProvider(provider: (mapId: string) => FollowerSnapshot[]) {
+        this.extraSnapshots = provider;
+    }
+
     /** Live followers on a map, for collision and hydration. */
     snapshotForMap(mapId: string): FollowerSnapshot[] {
         const snapshots: FollowerSnapshot[] = [];
@@ -151,6 +158,10 @@ export default class FollowerActorSimulation {
                 snapshots.push(this.snapshot(actor, now));
             }
         });
+
+        if (this.extraSnapshots) {
+            snapshots.push(...this.extraSnapshots(mapId));
+        }
 
         return snapshots;
     }

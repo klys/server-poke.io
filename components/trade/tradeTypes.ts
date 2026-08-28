@@ -568,7 +568,10 @@ export type TradeMutationSource =
   | "npc:store-buy"
   | "npc:store-sell"
   | "battle:start"
-  | "event:script";
+  | "event:script"
+  | "house:buy"
+  | "house:furniture-place"
+  | "house:furniture-pick";
 
 // ---------------------------------------------------------------------------
 // Audit

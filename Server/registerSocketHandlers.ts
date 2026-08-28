@@ -1,4 +1,6 @@
 import { berryProfile, RIPE_STAGE } from "../components/BerryPlots";
+import { isHouseInstanceMapId, templateMapIdFor } from "../components/Housing";
+import { registerHousingHandlers } from "./registerHousingHandlers";
 import type Player from "../components/player";
 import type { RedisClientType } from "redis";
 import { type Server, type Socket } from "socket.io";
@@ -291,10 +293,15 @@ export function isAllowedClientTeleport(
     return false;
   }
   if (
-    !snapshot.items.some((item) => item.id === data.mapId) &&
-    !snapshot.editorDataByMapId[data.mapId]
+    !snapshot.items.some((item) => item.id === templateMapIdFor(data.mapId)) &&
+    !snapshot.editorDataByMapId[templateMapIdFor(data.mapId)]
   ) {
     return false;
+  }
+  // House instances are only ever entered/left server-side; the one thing a
+  // client may do there is the same-map correction nudge.
+  if (isHouseInstanceMapId(data.mapId) || isHouseInstanceMapId(player.currentMapId)) {
+    return data.mapId === player.currentMapId && Math.hypot(data.x - player.x, data.y - player.y) <= 320;
   }
 
   // 1) Same-map correction nudge.
@@ -304,7 +311,7 @@ export function isAllowedClientTeleport(
 
   // 2) Edge crossing along an imported map connection.
   const configOf = (mapId:string) =>
-    snapshot.items.find((item) => item.id === mapId)?.playableMapConfig;
+    snapshot.items.find((item) => item.id === templateMapIdFor(mapId))?.playableMapConfig;
   const fromConfig = configOf(player.currentMapId);
   const toConfig = configOf(data.mapId);
   const crossingDirections = [
@@ -337,7 +344,7 @@ export function isAllowedClientTeleport(
   }
 
   // 3) Standing next to an event-script portal on the current map.
-  const portals = snapshot.editorDataByMapId[player.currentMapId]?.portals ?? [];
+  const portals = snapshot.editorDataByMapId[templateMapIdFor(player.currentMapId)]?.portals ?? [];
   const centerX = player.x + player.width / 2;
   const centerY = player.y + player.height / 2;
   return portals.some(
@@ -645,6 +652,8 @@ function toInventoryCategory(value: string) {
     case "skill item":
     case "machines":
       return "moves" as const;
+    case "furniture":
+      return "furniture" as const;
     case "usable":
     case "medicine":
     case "battle item":
@@ -2495,10 +2504,16 @@ function createConnectionHandler(
         auth,
         designerSectionStore
       );
-      const savedLocation =
+      let savedLocation =
         typeof socket.data.userId === "number"
           ? await auth.getSavedPlayerLocation(socket.data.userId)
           : null;
+      if (savedLocation && isHouseInstanceMapId(savedLocation.mapId) && !world.housing.isValidInstance(savedLocation.mapId)) {
+        // Logged out inside a house whose apartment/door no longer exists:
+        // land on its door if the door survived, else on the shared spawn.
+        const exit = world.housing.exitDestination(savedLocation.mapId);
+        savedLocation = exit ? { mapId: exit.mapId, x: exit.x, y: exit.y, surfing: false } : null;
+      }
       const authoritativePlayableMapsState = world.getPlayableMapsState();
       const sharedSpawnState = authoritativePlayableMapsState
         ? resolveInitialSpawnFromPlayableMapsState(authoritativePlayableMapsState)
@@ -2868,6 +2883,9 @@ function createConnectionHandler(
         console.error("Unable to resolve field actions:", error);
       }
     });
+
+    // ── Housing (apartments, house instances, furniture) ─────────────────
+    registerHousingHandlers({ io, socket, world, auth, battleManager, eventRuntime, guardTradedAssets });
 
     // ── Global berry plots ────────────────────────────────────────────────
     // Shared soil patches anybody may plant / harvest / clear; growth runs on
@@ -4363,16 +4381,36 @@ export default function registerSocketHandlers(
     if (!leader || leader.isEgg) {
       return null;
     }
+    if (isHouseInstanceMapId(player.currentMapId) && (user?.houseRoamIds ?? []).includes(leader.id)) {
+      return null; // it is roaming the house instead (HouseRoamers)
+    }
     const internalName = (leader.sourcePokemonId ?? "")
       .replace(/^pokemon-/, "")
       .toUpperCase();
     const charset = internalName ? speciesCharsetName(internalName) : null;
     return charset ? { charset } : null;
   });
+  // Party venomons let out inside a house (house:set-roam) wander the room.
+  world.houseRoamers.setResolver(async (player) => {
+    if (typeof player.userId !== "number") {
+      return [];
+    }
+    const user = await auth.getUserForBattle(player.userId);
+    const allowed = new Set(user?.houseRoamIds ?? []);
+    const roamers: Array<{ pokemonId: string; charset: string }> = [];
+    for (const mon of user?.pokemonParty ?? []) {
+      if (!allowed.has(mon.id) || mon.isEgg) continue;
+      const internalName = (mon.sourcePokemonId ?? "").replace(/^pokemon-/, "").toUpperCase();
+      const charset = internalName ? speciesCharsetName(internalName) : null;
+      if (charset) roamers.push({ pokemonId: mon.id, charset });
+    }
+    return roamers;
+  });
   auth.setPartyChangedListener((userId) => {
     const player = world.getPlayerByUserId(userId);
     if (player) {
       world.followerSimulation?.refreshFor(player);
+      void world.houseRoamers.refreshFor(player);
     }
   });
   const tradeManager = new TradeManager(
@@ -4403,7 +4441,12 @@ export default function registerSocketHandlers(
   world.setPortalHandler((player, portal) => {
     const snapshot = world.getPlayableMapsState();
     if (!snapshot) return;
-    const destination = resolvePlayableMapPortalDestination(snapshot, player.currentMapId, portal);
+    // Any portal authored on a HOUSE template leads back to the apartment's
+    // door when walked inside an instance (the exit mat).
+    const houseExit = isHouseInstanceMapId(player.currentMapId)
+      ? world.housing.exitDestination(player.currentMapId)
+      : null;
+    const destination = houseExit ?? resolvePlayableMapPortalDestination(snapshot, player.currentMapId, portal);
     if (!destination) return;
 
     player.stopMovement();
