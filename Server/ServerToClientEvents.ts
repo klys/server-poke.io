@@ -42,9 +42,18 @@ export type HouseFurniturePayload = {
   itemId: string;
   itemName: string;
   iconSrc: string;
+  /** Anchor cell (top-left), like an authored map object. */
   x: number;
   y: number;
   placedAt: number;
+  /** Linked designer map object drawn at `width`×`height` px from the anchor;
+   * absent = the item icon on one tile. */
+  objectId?: string;
+  imageSrc?: string;
+  width?: number;
+  height?: number;
+  /** Solid pieces block walking over their rect. */
+  solid: boolean;
 };
 
 export type HouseApartmentSummaryPayload = {

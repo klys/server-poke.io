@@ -187,6 +187,8 @@ export interface DesignerGameItemProfile {
   price?: number;
   fieldUse?: string;
   flags?: string[];
+  /** Furniture: designer map object (objects section) drawn when placed. */
+  furnitureObjectId?: string;
   pokemonDbCategory: string;
   effectText: string;
   effectKind: string;

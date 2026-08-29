@@ -522,6 +522,8 @@ type ItemDefinition = {
   category: InventoryItem["category"];
   description: string;
   iconSrc: string;
+  /** Furniture: id of the designer map object drawn when placed ("" = icon). */
+  furnitureObjectId: string;
   skillId: string;
   skillName: string;
   /** For MO/MT machines: the Essentials move internal (e.g. "CUT"), used as the
@@ -564,6 +566,7 @@ const RUNNING_SHOES_DEFINITION: ItemDefinition = {
   description:
     "Los zapatos deportivos que te regaló mamá. Mantén pulsada la tecla de correr para ir más rápido.",
   iconSrc: "",
+  furnitureObjectId: "",
   skillId: "",
   skillName: "",
   moveInternal: "",
@@ -6504,6 +6507,35 @@ export default class BattleManager {
     return this.getCachedItemDefinition(itemId, itemName) ?? null;
   }
 
+  /**
+   * A designer map object (designer:section:objects) by id — what furniture
+   * items draw when placed in a house. Read through the section store's
+   * probe cache, so it is cheap and follows designer edits.
+   */
+  public async findMapObjectAssetById(
+    objectId: string
+  ): Promise<{ id: string; name: string; imageSrc: string; width: number; height: number; objectType: string } | null> {
+    if (!objectId) {
+      return null;
+    }
+    const payload = await this.designerSectionStore.read("objects");
+    const item = (payload?.state.items ?? []).find((candidate) => candidate.id === objectId);
+    const asset = item?.mapObjectAsset as
+      | { imageSrc?: unknown; width?: unknown; height?: unknown; objectType?: unknown }
+      | undefined;
+    if (!item || !asset || typeof asset.imageSrc !== "string" || !asset.imageSrc) {
+      return null;
+    }
+    return {
+      id: item.id,
+      name: item.name,
+      imageSrc: asset.imageSrc,
+      width: Math.max(1, Math.round(parseNumber(asset.width, 32))),
+      height: Math.max(1, Math.round(parseNumber(asset.height, 32))),
+      objectType: normalizeText(asset.objectType) || "obstacle"
+    };
+  }
+
   private getCachedItemDefinition(itemId: string, itemName: string) {
     const normalizedName = itemName.toLowerCase();
     return this.cachedItemDefinitions.find((item) =>
@@ -10509,6 +10541,7 @@ export default class BattleManager {
       pocket?: unknown;
       description?: unknown;
       iconSrc?: unknown;
+      furnitureObjectId?: unknown;
       skillId?: unknown;
       skillName?: unknown;
       effectKind?: unknown;
@@ -10562,6 +10595,7 @@ export default class BattleManager {
       category: toInventoryCategory(normalizeText(profile.type)),
       description: typeof profile.description === "string" ? profile.description : "",
       iconSrc: typeof profile.iconSrc === "string" ? profile.iconSrc : "",
+      furnitureObjectId: normalizeText(profile.furnitureObjectId),
       skillId: typeof profile.skillId === "string" ? profile.skillId : "",
       skillName: typeof profile.skillName === "string" ? profile.skillName : "",
       moveInternal:

@@ -341,11 +341,23 @@ export function registerHousingHandlers({
         emitResult("place", false, "house.reason.notFurniture");
         return;
       }
+      // A furniture item may be linked to a designer map object; that is what
+      // gets drawn (and collides) in the house. No link = the icon on a tile.
+      const asset = definition?.furnitureObjectId
+        ? await battleManager.findMapObjectAssetById(definition.furnitureObjectId)
+        : null;
       // Take the item first so a failed placement can never duplicate it.
       await auth.saveInventory(actor.userId, removeInventory(user.inventory, itemId, 1));
       const placed = housing.placeFurniture(
         mapId,
-        { itemId, itemName: definition?.name ?? stack.name, iconSrc: definition?.iconSrc ?? "" },
+        {
+          itemId,
+          itemName: definition?.name ?? stack.name,
+          iconSrc: definition?.iconSrc ?? "",
+          object: asset
+            ? { objectId: asset.id, imageSrc: asset.imageSrc, width: asset.width, height: asset.height, objectType: asset.objectType }
+            : null
+        },
         x,
         y
       );

@@ -80,10 +80,58 @@ export type FurnitureState = {
     itemId: string;
     itemName: string;
     iconSrc: string;
+    /** Anchor cell = the object's top-left, exactly like an authored map object. */
     x: number;
     y: number;
     placedAt: number;
+    /**
+     * Linked designer map object (items section `furnitureObjectId`). Captured
+     * at placement so the piece keeps drawing even if the catalog changes.
+     * Absent = legacy furniture: the item icon on one tile.
+     */
+    objectId?: string;
+    imageSrc?: string;
+    /** Object size in px, drawn from the anchor cell's top-left. */
+    width?: number;
+    height?: number;
+    /** Solid pieces block walking over their rect ("obstacle" objects, icons). */
+    solid: boolean;
 };
+
+/** Furniture linked to a map object; `null` = draw the item icon. */
+export type FurnitureObjectAsset = {
+    objectId: string;
+    imageSrc: string;
+    width: number;
+    height: number;
+    objectType: string;
+};
+
+/** The px rect a piece covers (icon furniture = its single cell). */
+export function furnitureRect(item: FurnitureState, cellSize: number) {
+    return {
+        x: item.x * cellSize,
+        y: item.y * cellSize,
+        width: item.width && item.width > 0 ? item.width : cellSize,
+        height: item.height && item.height > 0 ? item.height : cellSize
+    };
+}
+
+/** Inclusive cell range a piece covers (a 48px object on 32px tiles spans 2). */
+export function furnitureCells(item: FurnitureState, cellSize: number) {
+    const rect = furnitureRect(item, cellSize);
+    return {
+        x0: item.x,
+        y0: item.y,
+        x1: item.x + Math.max(1, Math.ceil(rect.width / cellSize - 0.01)) - 1,
+        y1: item.y + Math.max(1, Math.ceil(rect.height / cellSize - 0.01)) - 1
+    };
+}
+
+export function furnitureCovers(item: FurnitureState, cellSize: number, x: number, y: number) {
+    const cells = furnitureCells(item, cellSize);
+    return x >= cells.x0 && x <= cells.x1 && y >= cells.y0 && y <= cells.y1;
+}
 
 /** Authored door (from the map editor) with its resolved apartments. */
 type HouseDoorSite = {
@@ -166,7 +214,17 @@ function sanitizeFurniture(value: unknown): FurnitureState | null {
         iconSrc: typeof raw.iconSrc === "string" ? raw.iconSrc : "",
         x: Math.max(0, Math.round(raw.x)),
         y: Math.max(0, Math.round(raw.y)),
-        placedAt: typeof raw.placedAt === "number" && Number.isFinite(raw.placedAt) ? raw.placedAt : 0
+        placedAt: typeof raw.placedAt === "number" && Number.isFinite(raw.placedAt) ? raw.placedAt : 0,
+        ...(typeof raw.objectId === "string" && raw.objectId && typeof raw.imageSrc === "string" && raw.imageSrc
+            ? {
+                  objectId: raw.objectId,
+                  imageSrc: raw.imageSrc,
+                  width: typeof raw.width === "number" && raw.width > 0 ? Math.round(raw.width) : undefined,
+                  height: typeof raw.height === "number" && raw.height > 0 ? Math.round(raw.height) : undefined
+              }
+            : {}),
+        // Pieces persisted before linked objects existed were all solid icons.
+        solid: raw.solid !== false
     };
 }
 
@@ -577,10 +635,11 @@ export default class Housing {
     furnitureAt(mapId: string, x: number, y: number): FurnitureState | null {
         const apartmentId = this.apartmentOfInstance(mapId);
         if (!apartmentId) return null;
-        return this.stateOf(apartmentId).furniture.find((item) => item.x === x && item.y === y) ?? null;
+        const cellSize = this.world.getMapCellSize(mapId);
+        return this.stateOf(apartmentId).furniture.find((item) => furnitureCovers(item, cellSize, x, y)) ?? null;
     }
 
-    /** Furniture is solid: used by the world's collision checks. */
+    /** Solid furniture blocks its rect: used by the world's collision checks. */
     isFurnitureBlocked(mapId: string, rect: { x: number; y: number; width: number; height: number }): boolean {
         if (!isHouseInstanceMapId(mapId)) return false;
         const apartmentId = this.apartmentOfInstance(mapId);
@@ -595,9 +654,9 @@ export default class Housing {
         const right = rect.x + rect.width - inset;
         const bottom = rect.y + rect.height - inset;
         for (const item of state.furniture) {
-            const fx = item.x * cellSize;
-            const fy = item.y * cellSize;
-            if (left < fx + cellSize && right > fx && top < fy + cellSize && bottom > fy) {
+            if (!item.solid) continue;
+            const f = furnitureRect(item, cellSize);
+            if (left < f.x + f.width && right > f.x && top < f.y + f.height && bottom > f.y) {
                 return true;
             }
         }
@@ -606,7 +665,7 @@ export default class Housing {
 
     placeFurniture(
         mapId: string,
-        item: { itemId: string; itemName: string; iconSrc: string },
+        item: { itemId: string; itemName: string; iconSrc: string; object: FurnitureObjectAsset | null },
         x: number,
         y: number
     ): { ok: true; furniture: FurnitureState } | { ok: false; error: string } {
@@ -618,19 +677,6 @@ export default class Housing {
         }
         const cellSize = this.world.getMapCellSize(mapId);
         const bounds = this.world.getMapBounds(mapId);
-        if (x < 0 || y < 0 || (x + 1) * cellSize > bounds.width || (y + 1) * cellSize > bounds.height) {
-            return { ok: false, error: "house.reason.outOfBounds" };
-        }
-        if (state.furniture.some((existing) => existing.x === x && existing.y === y)) {
-            return { ok: false, error: "house.reason.cellTaken" };
-        }
-        // The cell must be walkable floor (walls/objects) and empty of bodies.
-        if (this.world.isRectBlocked(mapId, x * cellSize, y * cellSize, cellSize, cellSize)) {
-            return { ok: false, error: "house.reason.cellBlocked" };
-        }
-        if (this.world.isCellOccupiedByBody(mapId, x, y, null)) {
-            return { ok: false, error: "house.reason.cellOccupied" };
-        }
         const furniture: FurnitureState = {
             id: `furniture-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
             itemId: item.itemId,
@@ -638,8 +684,43 @@ export default class Housing {
             iconSrc: item.iconSrc,
             x,
             y,
-            placedAt: Date.now()
+            placedAt: Date.now(),
+            ...(item.object
+                ? {
+                      objectId: item.object.objectId,
+                      imageSrc: item.object.imageSrc,
+                      width: item.object.width,
+                      height: item.object.height
+                  }
+                : {}),
+            // Same rule as authored map objects: only "obstacle" collides.
+            solid: item.object ? item.object.objectType === "obstacle" : true
         };
+        const rect = furnitureRect(furniture, cellSize);
+        const cells = furnitureCells(furniture, cellSize);
+        if (x < 0 || y < 0 || rect.x + rect.width > bounds.width || rect.y + rect.height > bounds.height) {
+            return { ok: false, error: "house.reason.outOfBounds" };
+        }
+        for (const existing of state.furniture) {
+            const other = furnitureCells(existing, cellSize);
+            if (cells.x0 <= other.x1 && cells.x1 >= other.x0 && cells.y0 <= other.y1 && cells.y1 >= other.y0) {
+                return { ok: false, error: "house.reason.cellTaken" };
+            }
+        }
+        // The whole footprint must be walkable floor (walls/objects); solid
+        // pieces also need it empty of bodies (a rug can go under someone).
+        if (this.world.isRectBlocked(mapId, rect.x, rect.y, rect.width, rect.height)) {
+            return { ok: false, error: "house.reason.cellBlocked" };
+        }
+        if (furniture.solid) {
+            for (let cy = cells.y0; cy <= cells.y1; cy += 1) {
+                for (let cx = cells.x0; cx <= cells.x1; cx += 1) {
+                    if (this.world.isCellOccupiedByBody(mapId, cx, cy, null)) {
+                        return { ok: false, error: "house.reason.cellOccupied" };
+                    }
+                }
+            }
+        }
         state.furniture.push(furniture);
         this.persist();
         this.world.emitToMap(mapId, "house:furniture-update", {

@@ -45,12 +45,16 @@ const MAPS_KEY = "designer:section:maps";
 const MAPS_PROBE_KEY = "designer:section:maps:probe";
 const ITEMS_KEY = "designer:section:items";
 const ITEMS_PROBE_KEY = "designer:section:items:probe";
+const OBJECTS_KEY = "designer:section:objects";
+const OBJECTS_PROBE_KEY = "designer:section:objects:probe";
 
 const TEST_MAP = "map-essentials-020"; // Ruta1
 const DOOR = { id: "housedoor-e2e", x: 33, y: 36 };
 const START = { x: 33, y: 37 }; // adjacent to the door
 const FAR = { x: 33, y: 40 };
 const SOFA = { id: "item-e2esofa", name: "Sofá E2E", category: "furniture", quantity: 2, description: "Un sofá de prueba" };
+// Map object the sofa is linked to: 2 tiles wide, solid (objectType obstacle).
+const OBJ = { id: "object-e2esofa", name: "Sofá objeto E2E", imageSrc: "/objects/Rock.png", width: 64, height: 32, objectType: "obstacle" };
 const INSTANCE_MARKER = "--house-";
 
 const stamp = () => new Date().toISOString().slice(11, 23);
@@ -123,6 +127,8 @@ async function main() {
   let probeBackup: string | null = null;
   let itemsBackup: string | null = null;
   let itemsProbeBackup: string | null = null;
+  let objectsBackup: string | null = null;
+  let objectsProbeBackup: string | null = null;
   const clients: Client[] = [];
 
   const startServer = async () => {
@@ -154,6 +160,8 @@ async function main() {
       if (probeBackup !== null) await redis.set(MAPS_PROBE_KEY, probeBackup); else await redis.del(MAPS_PROBE_KEY);
       if (itemsBackup !== null) await redis.set(ITEMS_KEY, itemsBackup);
       if (itemsProbeBackup !== null) await redis.set(ITEMS_PROBE_KEY, itemsProbeBackup); else await redis.del(ITEMS_PROBE_KEY);
+      if (objectsBackup !== null) await redis.set(OBJECTS_KEY, objectsBackup);
+      if (objectsProbeBackup !== null) await redis.set(OBJECTS_PROBE_KEY, objectsProbeBackup); else await redis.del(OBJECTS_PROBE_KEY);
       for (const c of clients) {
         try { await redis.del(`auth:user:${c.userId}`); await redis.del(`auth:character:${c.characterId}`); } catch {}
       }
@@ -270,7 +278,7 @@ async function main() {
       id: SOFA.id, name: SOFA.name, category: "furniture", details: [],
       itemProfile: {
         essentialsId: "E2ESOFA", iconSrc: "/objects/Rock.png", description: SOFA.description, price: 100,
-        pokemonDbCategory: "furniture", effectText: "", effectKind: "none", useCondition: "none", type: "furniture",
+        pokemonDbCategory: "furniture", effectText: "", effectKind: "none", useCondition: "none", type: "furniture", furnitureObjectId: OBJ.id,
         statModifiers: { hp: 0, attack: 0, defense: 0, specialAttack: 0, specialDefense: 0, speed: 0 },
         skillId: "", skillName: "", pokeballBonusElements: [], pokeballBonusRatio: 0
       }
@@ -280,6 +288,21 @@ async function main() {
     itemsPayload.updatedAt = new Date().toISOString();
     await redis.set(ITEMS_KEY, JSON.stringify(itemsPayload));
     await redis.del(ITEMS_PROBE_KEY);
+    // The map object the sofa draws (objects section, restored on exit).
+    objectsBackup = await redis.get(OBJECTS_KEY);
+    objectsProbeBackup = await redis.get(OBJECTS_PROBE_KEY);
+    const objectsPayload = objectsBackup ? JSON.parse(objectsBackup) : { state: { categories: ["E2E"], items: [] } };
+    const objectsState = objectsPayload.state ?? objectsPayload;
+    objectsState.items = (objectsState.items as any[]).filter((item) => item.id !== OBJ.id);
+    objectsState.items.push({
+      id: OBJ.id, name: OBJ.name, category: "E2E", details: [],
+      mapObjectAsset: { imageSrc: OBJ.imageSrc, width: OBJ.width, height: OBJ.height, objectType: OBJ.objectType }
+    });
+    if (Array.isArray(objectsState.categories) && !objectsState.categories.includes("E2E")) objectsState.categories.push("E2E");
+    objectsPayload.version = (objectsPayload.version ?? 0) + 1;
+    objectsPayload.updatedAt = new Date().toISOString();
+    await redis.set(OBJECTS_KEY, JSON.stringify(objectsPayload));
+    await redis.del(OBJECTS_PROBE_KEY);
     if (!mapsBackup) fail("designer:section:maps missing — import maps first");
     const payload = JSON.parse(mapsBackup!);
     const state = payload.state ?? payload;
@@ -396,6 +419,20 @@ async function main() {
     const aptWithSofa = await redisApartment(APT0);
     if (!aptWithSofa?.furniture?.some((f: any) => f.itemId === SOFA.id)) fail("sofa not persisted");
     pass(`sofa placed at ${placedAt!.x},${placedAt!.y} (bag 2→1, B notified, persisted)`);
+    const piece = upd.placed;
+    if (piece.objectId !== OBJ.id || piece.imageSrc !== OBJ.imageSrc || piece.width !== OBJ.width || piece.height !== OBJ.height || piece.solid !== true) {
+      fail(`placed piece should carry the linked map object: ${JSON.stringify(piece)}`);
+    }
+    pass("placed piece carries the linked map object (image, 64x32 px, solid)");
+    // 64px wide on 32px tiles = the cell to the right is part of the footprint.
+    const secondCell = { x: placedAt!.x + 1, y: placedAt!.y };
+    r = await act(A, "house:furniture-place", { itemId: SOFA.id, x: secondCell.x, y: secondCell.y }, "place");
+    if (r.ok || r.messageKey !== "house.reason.cellTaken") fail(`placing on the footprint's 2nd cell: ${JSON.stringify(r)}`);
+    if ((await bagQty(A, SOFA.id)) !== 1) fail(`bag after refused place: ${await bagQty(A, SOFA.id)}`);
+    const reached2 = await tryWalkTo(A, secondCell);
+    const afterWalk2 = lastMove(A);
+    if (reached2 && Math.round(afterWalk2.x / 32) === secondCell.x && Math.round(afterWalk2.y / 32) === secondCell.y) fail("player ended on the sofa's 2nd cell");
+    pass("2-tile footprint: 2nd cell is taken and solid");
     r = await act(B, "house:furniture-place", { itemId: SOFA.id, x: placedAt!.x, y: placedAt!.y }, "place");
     if (r.ok || r.messageKey !== "house.reason.notOwner") fail(`visitor placing: ${JSON.stringify(r)}`);
     pass("visitor cannot place furniture");
