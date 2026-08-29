@@ -12,7 +12,7 @@ import type Auth from "../components/Auth";
 import type { InventoryItem } from "../components/Auth";
 import type BattleManager from "../components/BattleManager";
 import type EventRuntime from "../components/EventRuntime";
-import { isHouseInstanceMapId, isValidKeyCode, MAX_SALE_PRICE } from "../components/Housing";
+import { isHouseInstanceMapId, isValidKeyCode, MAX_SALE_PRICE, sanitizeHouseName } from "../components/Housing";
 import type { TradeMutationSource } from "../components/trade/tradeTypes";
 import type ClientToServerEvents from "./ClientToServerEvents";
 import type ServerToClientEvents from "./ServerToClientEvents";
@@ -22,7 +22,7 @@ import type { SocketData } from "./registerSocketHandlers";
 type HousingSocket = Socket<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>;
 type HousingServer = Server<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>;
 
-type HouseAction = "enter" | "buy" | "key" | "sale" | "leave" | "place" | "pick" | "roam" | "door-info";
+type HouseAction = "enter" | "buy" | "key" | "sale" | "leave" | "place" | "pick" | "roam" | "door-info" | "name" | "music";
 
 interface HousingHandlerContext {
   io: HousingServer;
@@ -416,9 +416,61 @@ export function registerHousingHandlers({
     }
   });
 
-  socket.on("house:set-roam", async (data) => {
-    const actor = resolveActor("roam");
+  socket.on("house:music-list", () => {
+    socket.emit("house:music-list", { bgms: housing.availableMusic() });
+  });
+
+  socket.on("house:set-name", (data) => {
+    const actor = resolveActor("name");
     if (!actor) return;
+    const apartmentId = typeof data?.apartmentId === "string" ? data.apartmentId : "";
+    if (!housing.isOwnerOf(apartmentId, actor.characterId)) {
+      emitResult("name", false, "house.reason.notOwner");
+      return;
+    }
+    const name = data?.name === null || data?.name === undefined ? null : sanitizeHouseName(data.name);
+    if (data?.name !== null && data?.name !== undefined && name === null) {
+      emitResult("name", false, "house.reason.badName");
+      return;
+    }
+    if (!housing.setName(apartmentId, name)) {
+      emitResult("name", false, "house.reason.failed");
+      return;
+    }
+    emitResult("name", true, name === null ? "house.msg.nameCleared" : "house.msg.nameSet", { name: name ?? "" });
+  });
+
+  socket.on("house:set-music", (data) => {
+    const actor = resolveActor("music");
+    if (!actor) return;
+    const apartmentId = typeof data?.apartmentId === "string" ? data.apartmentId : "";
+    if (!housing.isOwnerOf(apartmentId, actor.characterId)) {
+      emitResult("music", false, "house.reason.notOwner");
+      return;
+    }
+    const bgm = data?.bgm === null || data?.bgm === undefined || data?.bgm === "" ? null : typeof data.bgm === "string" ? data.bgm.trim() : "";
+    if (bgm !== null && (!bgm || !housing.availableMusic().includes(bgm))) {
+      emitResult("music", false, "house.reason.badMusic");
+      return;
+    }
+    if (!housing.setMusic(apartmentId, bgm)) {
+      emitResult("music", false, "house.reason.failed");
+      return;
+    }
+    emitResult("music", true, bgm === null ? "house.msg.musicCleared" : "house.msg.musicSet", { name: bgm ?? "" });
+  });
+
+  socket.on("house:set-roam", async (data) => {
+    // Sent from the party window over the shared auth socket (authContext),
+    // which never joined the world — resolve the player by account instead
+    // of by socket id like the other handlers do.
+    const userId = socket.data.userId;
+    const player = typeof userId === "number" ? world.getPlayerByUserId(userId) : null;
+    if (!player || typeof userId !== "number" || player.characterId === null) {
+      emitResult("roam", false, "house.reason.notInWorld");
+      return;
+    }
+    const actor: Actor = { player, userId, characterId: player.characterId };
     const requested = Array.isArray(data?.pokemonIds)
       ? data.pokemonIds.filter((id): id is string => typeof id === "string" && id.length > 0)
       : [];

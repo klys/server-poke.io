@@ -16,9 +16,14 @@
  *   FURNITURE — A places a sofa from the bag (bag -1, house:furniture-update
  *               reaches B inside, redis persisted); the cell is now solid
  *               (A cannot walk onto it); picking it up returns it to the bag.
- *   ROAM      — house:set-roam lets a party member out: it shows up on the
- *               follower channel (follower:update ownerId roam:<char>:<mon>)
- *               and walks (follower:steps); clearing removes it.
+ *   ROAM      — house:set-roam (sent over a SECOND, auth-only socket like the
+ *               party window does) lets a party member out: it shows up on
+ *               the follower channel (follower:update ownerId
+ *               roam:<char>:<mon>) and walks (follower:steps); clearing
+ *               removes it.
+ *   CUSTOM    — the owner renames the house (banner/door name follow, 30 char
+ *               cap) and picks a BGM from house:music-list (unknown tracks and
+ *               visitors are refused); house:sync carries both.
  *   SALE      — A lists the house for $800; B sees "for sale" and buys it:
  *               B pays 800, A's character is credited 800 even while A is
  *               outside; the key code is cleared and B is the owner in redis.
@@ -408,8 +413,17 @@ async function main() {
     // ── ROAM ───────────────────────────────────────────────────────────
     log("── ROAM ──");
     const roamId = `roam:${A.characterId}:Ana-m2`;
-    r = await act(A, "house:set-roam", { pokemonIds: ["Ana-m2", "not-mine"] }, "roam");
-    if (!r.ok || r.params?.count !== "1") fail(`set-roam: ${JSON.stringify(r)}`);
+    // The party window talks over the shared auth socket (handshake token,
+    // never addPlayer) — the handler must resolve the player by account.
+    const authSocket = io(`http://localhost:${PORT}`, { transports: ["websocket"], forceNew: true, auth: { token: A.token } });
+    const authResults: any[] = [];
+    authSocket.on("house:result", (d: any) => authResults.push(d));
+    await waitFor("auth socket connect", () => authSocket.connected);
+    await sleep(400);
+    authSocket.emit("house:set-roam", { pokemonIds: ["Ana-m2", "not-mine"] });
+    r = await waitFor("roam result (auth socket)", () => authResults.find((d) => d.action === "roam") ?? null);
+    if (!r.ok || r.params?.count !== "1") fail(`set-roam over auth socket: ${JSON.stringify(r)}`);
+    authSocket.disconnect();
     await waitFor("roamer appears (A)", () => A.followerUpdates.find((u) => u.follower?.ownerId === roamId) ?? null);
     await waitFor("roamer appears (B)", () => B.followerUpdates.find((u) => u.follower?.ownerId === roamId) ?? null);
     if ((await charField(A, "house_roam_ids")) !== JSON.stringify(["Ana-m2"])) fail("house_roam_ids not persisted");
@@ -419,6 +433,35 @@ async function main() {
     if (!r.ok) fail(`clear roam: ${JSON.stringify(r)}`);
     await waitFor("roamer removed", () => B.followerRemoves.find((u) => u.ownerId === roamId) ?? null);
     pass("roamer removed when called back");
+
+    // ── CUSTOM ─────────────────────────────────────────────────────────
+    log("── CUSTOM ──");
+    r = await act(B, "house:set-name", { apartmentId: APT0, name: "Casa de Beto" }, "name");
+    if (r.ok || r.messageKey !== "house.reason.notOwner") fail(`visitor rename: ${JSON.stringify(r)}`);
+    r = await act(A, "house:set-name", { apartmentId: APT0, name: "  La Cabaña de Ana   " + "x".repeat(40) }, "name");
+    if (!r.ok || r.params?.name?.length !== 30) fail(`rename (30 cap): ${JSON.stringify(r)}`);
+    r = await act(A, "house:set-name", { apartmentId: APT0, name: "La Cabaña de Ana" }, "name");
+    if (!r.ok) fail(`rename: ${JSON.stringify(r)}`);
+    await waitFor("A sync with name", () => A.houseSyncs.some((s) => s.house?.name === "La Cabaña de Ana" && s.house.customName === true));
+    await waitFor("B sync with name", () => B.houseSyncs.some((s) => s.house?.name === "La Cabaña de Ana"));
+    if ((await redisApartment(APT0))?.name !== "La Cabaña de Ana") fail("name not persisted");
+    pass("owner renamed the house (visitor refused, 30-char cap, synced to everyone, persisted)");
+    const musicBefore = A.results.length;
+    const bgms: string[] = await new Promise((resolveList) => {
+      A.socket.once("house:music-list", (d: any) => resolveList(d?.bgms ?? []));
+      A.socket.emit("house:music-list");
+    });
+    void musicBefore;
+    if (bgms.length === 0) fail("no BGM offered");
+    r = await act(A, "house:set-music", { apartmentId: APT0, bgm: "definitely-not-a-track" }, "music");
+    if (r.ok || r.messageKey !== "house.reason.badMusic") fail(`unknown track: ${JSON.stringify(r)}`);
+    r = await act(A, "house:set-music", { apartmentId: APT0, bgm: bgms[0] }, "music");
+    if (!r.ok) fail(`set music: ${JSON.stringify(r)}`);
+    await waitFor("sync with bgm", () => B.houseSyncs.some((s) => s.house?.bgm === bgms[0]));
+    if ((await redisApartment(APT0))?.bgm !== bgms[0]) fail("bgm not persisted");
+    r = await act(A, "house:set-music", { apartmentId: APT0, bgm: null }, "music");
+    if (!r.ok) fail(`clear music: ${JSON.stringify(r)}`);
+    pass(`owner picked house music "${bgms[0]}" of ${bgms.length} tracks (unknown refused, synced, persisted, cleared)`);
 
     // ── SALE ───────────────────────────────────────────────────────────
     log("── SALE ──");
@@ -438,6 +481,7 @@ async function main() {
     if ((await charField(A, "money")) !== "1300") fail(`A money (seller credited): ${await charField(A, "money")}`);
     const sold = await redisApartment(APT0);
     if (sold?.ownerCharacterId !== B.characterId || sold.keyCode !== null || sold.salePrice !== null) fail(`after sale: ${JSON.stringify(sold)}`);
+    if (sold.name !== null) fail("custom name should reset on sale");
     r = await act(A, "house:enter", { apartmentId: APT0 }, "enter");
     if (!r.ok) fail(`A enters B's unlocked house: ${JSON.stringify(r)}`);
     await act(A, "house:leave", {}, "leave");

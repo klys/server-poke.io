@@ -83,6 +83,8 @@ export type HouseInstanceInfoPayload = {
   keyCodeSet: boolean;
   salePrice: number | null;
   furniture: HouseFurniturePayload[];
+  bgm: string | null;
+  customName: boolean;
 };
 
 export type BerryPlotSnapshotPayload = {
@@ -585,6 +587,8 @@ export default interface ServerToClientEvents {
    * reports the outcome of an action to the actor (i18n key + params).
    */
   "house:door-info": (data: { t: number; door: HouseDoorSummaryPayload }) => void;
+  /** Answer to house:music-list: the BGM names an owner may pick for a house. */
+  "house:music-list": (data: { bgms: string[] }) => void;
   "house:sync": (data: { t: number; house: HouseInstanceInfoPayload }) => void;
   "house:furniture-update": (data: {
     mapId: string;
@@ -593,7 +597,7 @@ export default interface ServerToClientEvents {
     removedId: string | null;
   }) => void;
   "house:result": (data: {
-    action: "enter" | "buy" | "key" | "sale" | "leave" | "place" | "pick" | "roam" | "door-info";
+    action: "enter" | "buy" | "key" | "sale" | "leave" | "place" | "pick" | "roam" | "door-info" | "name" | "music";
     ok: boolean;
     messageKey: string;
     params?: Record<string, string>;

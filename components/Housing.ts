@@ -69,6 +69,10 @@ export type ApartmentState = {
     salePrice: number | null;
     purchasedAt: number | null;
     furniture: FurnitureState[];
+    /** Owner-chosen house name (shown on entering); null = default. */
+    name: string | null;
+    /** Owner-chosen BGM (one of the game's map tracks); null = template's. */
+    bgm: string | null;
 };
 
 export type FurnitureState = {
@@ -142,6 +146,10 @@ export type HouseInstanceInfo = {
     keyCodeSet: boolean;
     salePrice: number | null;
     furniture: FurnitureState[];
+    /** Owner-chosen BGM name, null = the template map's music. */
+    bgm: string | null;
+    /** True when `name` is the owner's custom name. */
+    customName: boolean;
 };
 
 function sanitizeFurniture(value: unknown): FurnitureState | null {
@@ -187,8 +195,18 @@ export function sanitizeApartmentState(value: unknown): ApartmentState | null {
                 : null,
         furniture: Array.isArray(raw.furniture)
             ? raw.furniture.map(sanitizeFurniture).filter((item): item is FurnitureState => Boolean(item))
-            : []
+            : [],
+        name: ownerCharacterId !== null ? sanitizeHouseName(raw.name) : null,
+        bgm: ownerCharacterId !== null && typeof raw.bgm === "string" && raw.bgm.trim() ? raw.bgm.trim().slice(0, 80) : null
     };
+}
+
+export const MAX_HOUSE_NAME_LENGTH = 30;
+
+export function sanitizeHouseName(value: unknown): string | null {
+    if (typeof value !== "string") return null;
+    const trimmed = value.replace(/\s+/g, " ").trim().slice(0, MAX_HOUSE_NAME_LENGTH);
+    return trimmed.length > 0 ? trimmed : null;
 }
 
 export function isValidKeyCode(value: unknown): value is string {
@@ -297,7 +315,9 @@ export default class Housing {
                 keyCode: null,
                 salePrice: null,
                 purchasedAt: null,
-                furniture: []
+                furniture: [],
+                name: null,
+                bgm: null
             };
             this.states.set(apartmentId, state);
         }
@@ -332,6 +352,8 @@ export default class Housing {
     }
 
     private apartmentName(site: ApartmentSite, snapshot: PlayableMapsStateSnapshot | null): string {
+        const custom = this.states.get(site.id)?.name;
+        if (custom) return custom;
         const template = snapshot?.items.find((item) => item.id === site.templateMapId);
         const base = site.door.name ?? template?.name ?? "Apartamento";
         return site.door.apartments.length > 1 ? `${base} ${site.index + 1}` : base;
@@ -413,7 +435,9 @@ export default class Housing {
             isOwner,
             keyCodeSet: state.keyCode !== null,
             salePrice: state.salePrice,
-            furniture: state.furniture.map((item) => ({ ...item }))
+            furniture: state.furniture.map((item) => ({ ...item })),
+            bgm: state.bgm,
+            customName: state.name !== null
         };
     }
 
@@ -484,6 +508,9 @@ export default class Housing {
         state.keyCode = null;
         state.salePrice = null;
         state.purchasedAt = Date.now();
+        // The new owner starts with the default name/music.
+        state.name = null;
+        state.bgm = null;
         if (!keepFurniture) state.furniture = [];
         this.persist();
         this.broadcastInfo(apartmentId);
@@ -504,6 +531,36 @@ export default class Housing {
         if (state.ownerCharacterId === null) return false;
         if (price !== null && (!Number.isFinite(price) || price <= 0)) return false;
         state.salePrice = price === null ? null : Math.min(MAX_SALE_PRICE, Math.round(price));
+        this.persist();
+        this.broadcastInfo(apartmentId);
+        return true;
+    }
+
+    setName(apartmentId: string, name: string | null): boolean {
+        const state = this.stateOf(apartmentId);
+        if (state.ownerCharacterId === null) return false;
+        state.name = name === null ? null : sanitizeHouseName(name);
+        this.persist();
+        this.broadcastInfo(apartmentId);
+        return true;
+    }
+
+    /** BGM names the game knows: every track a playable map is scored with. */
+    availableMusic(): string[] {
+        const snapshot = this.world.getPlayableMapsState();
+        const names = new Set<string>();
+        for (const item of snapshot?.items ?? []) {
+            const bgm = item.playableMapConfig?.bgm?.trim();
+            if (bgm) names.add(bgm);
+        }
+        return Array.from(names).sort((a, b) => a.localeCompare(b));
+    }
+
+    setMusic(apartmentId: string, bgm: string | null): boolean {
+        const state = this.stateOf(apartmentId);
+        if (state.ownerCharacterId === null) return false;
+        if (bgm !== null && !this.availableMusic().includes(bgm)) return false;
+        state.bgm = bgm;
         this.persist();
         this.broadcastInfo(apartmentId);
         return true;

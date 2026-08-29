@@ -189,6 +189,11 @@ export default interface ClientToServerEvents {
   "house:furniture-place": (data: { itemId: string; x: number; y: number }) => void;
   "house:furniture-pick": (data: { furnitureId: string }) => void;
   "house:set-roam": (data: { pokemonIds: string[] }) => void;
+  /** Owner-only house customization: display name (null = default) and BGM
+   * (one of the names answered by house:music-list; null = template's). */
+  "house:set-name": (data: { apartmentId: string; name: string | null }) => void;
+  "house:set-music": (data: { apartmentId: string; bgm: string | null }) => void;
+  "house:music-list": () => void;
 
   /**
    * Stats-window move management (outside battles): learn a move available at
