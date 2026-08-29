@@ -43,6 +43,7 @@ function buildCorsHeaders(requestOrigin:string | undefined) {
 
 async function bootstrap() {
   const mapAssetStore = new MapAssetStore();
+  console.log(mapAssetStore.describeTarget());
 
   // The playable-maps payload is tens of MB. Streaming it through Socket.IO
   // starved the websocket (heartbeats queue behind the transfer → "ping

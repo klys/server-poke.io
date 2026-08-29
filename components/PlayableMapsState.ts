@@ -194,6 +194,11 @@ export type PlayableMapTileMapProfile = {
    * `terrainTags` cannot: it takes the first non-zero tag, letting the water
    * tag show through the rock. Derived by tools/derivePassageTerrainTags.ts. */
   passageTerrainTags?: string;
+  /** u8rle-base64, optional: map-editor passability overrides per cell
+   * (0 inherit / 1 force passable / 2 force solid). Already folded into
+   * `collision` by the editor — runtimes keep reading `collision` only; this
+   * is passed through so the editor can show and re-apply them. */
+  collisionOverrides?: string;
   baked?: {
     chunkCells: number;
     background: PlayableMapBakedChunk[];
@@ -600,6 +605,10 @@ function sanitizeTileMapProfile(value: unknown): PlayableMapTileMapProfile | und
     passageTerrainTags:
       typeof candidate.passageTerrainTags === "string"
         ? candidate.passageTerrainTags
+        : undefined,
+    collisionOverrides:
+      typeof candidate.collisionOverrides === "string" && candidate.collisionOverrides.length > 0
+        ? candidate.collisionOverrides
         : undefined,
     baked:
       candidate.baked && typeof candidate.baked === "object"
