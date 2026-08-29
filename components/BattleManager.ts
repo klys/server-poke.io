@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { templateMapIdFor } from "./Housing";
+import { deriveGender, isPokemonGender, parseFemaleRatio, type PokemonGender } from "./pokemonGender";
 import type { Server } from "socket.io";
 import type { AuthenticatedUser, InventoryItem, PokemonSummary } from "./Auth";
 import Auth from "./Auth";
@@ -174,6 +175,8 @@ export type BattlePublicPokemon = {
   id: string;
   name: string;
   nickname?: string;
+  /** ♂ / ♀ shown in the databox; absent = genderless. */
+  gender?: PokemonGender;
   level: number;
   types: string[];
   hp: number;
@@ -329,7 +332,7 @@ type BattleVolatileState = {
   waterSport: boolean;
 };
 
-type BattleGender = "male" | "female" | "genderless";
+type BattleGender = PokemonGender;
 
 type BattlePokemon = {
   id: string;
@@ -873,6 +876,7 @@ function getPublicPokemon(pokemon: BattlePokemon): BattlePublicPokemon {
     id: pokemon.id,
     name: pokemon.name,
     nickname: pokemon.nickname,
+    gender: pokemon.gender,
     level: pokemon.level,
     types: pokemon.types,
     hp: pokemon.hp,
@@ -916,49 +920,6 @@ function parseNumber(value: unknown, fallback: number) {
 
 function parseFloatNumber(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-/** Essentials GenderRate names -> female fraction (-1 = genderless). */
-function parseFemaleRatio(raw: unknown): number {
-  switch (typeof raw === "string" ? raw.trim().toLowerCase() : "") {
-    case "alwaysmale":
-      return 0;
-    case "alwaysfemale":
-      return 1;
-    case "genderless":
-      return -1;
-    case "femaleoneeighth":
-      return 1 / 8;
-    case "female25percent":
-      return 0.25;
-    case "female75percent":
-      return 0.75;
-    case "femaleseveneighths":
-      return 7 / 8;
-    default:
-      return 0.5;
-  }
-}
-
-/**
- * Stable per-individual gender: summaries don't persist one, so derive it
- * from the pokemon's id so the same mon is always the same gender.
- */
-function deriveGender(id: string, femaleRatio: number): BattleGender {
-  if (femaleRatio < 0) {
-    return "genderless";
-  }
-  if (femaleRatio <= 0) {
-    return "male";
-  }
-  if (femaleRatio >= 1) {
-    return "female";
-  }
-  let hash = 0;
-  for (let index = 0; index < id.length; index += 1) {
-    hash = (hash * 31 + id.charCodeAt(index)) >>> 0;
-  }
-  return (hash % 1000) / 1000 < femaleRatio ? "female" : "male";
 }
 
 function normalizeStatKey(raw: string): BattleStatKey | null {
@@ -6446,6 +6407,7 @@ export default class BattleManager {
     const caughtSummary: PokemonSummary = {
       id: crypto.randomUUID(),
       sourcePokemonId: wildPokemon.sourcePokemonId,
+      gender: wildPokemon.gender,
       name: wildPokemon.name,
       level: wildPokemon.level,
       types: wildPokemon.types,
@@ -10860,7 +10822,7 @@ export default class BattleManager {
       stages: createEmptyStages(),
       status: sanitizeStatusState(pokemon.status),
       volatile: createEmptyVolatile(),
-      gender: deriveGender(pokemon.id, definition?.femaleRatio ?? 0.5),
+      gender: isPokemonGender(pokemon.gender) ? pokemon.gender : deriveGender(pokemon.id, definition?.femaleRatio ?? 0.5),
       baseHappiness: definition?.baseHappiness ?? 70,
       weightKg: definition?.weightKg ?? 50,
       consumedItem: null,

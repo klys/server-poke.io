@@ -80,6 +80,57 @@ export type HouseDoorSummaryPayload = {
   apartments: HouseApartmentSummaryPayload[];
 };
 
+export interface PetViewPayload {
+  id: string;
+  /** Follower-channel owner id (`roam:<char>:<petId>`). */
+  ownerId: string;
+  apartmentId: string;
+  mapId: string;
+  ownerCharacterId: number;
+  ownerName: string;
+  name: string;
+  species: string;
+  level: number;
+  gender: "male" | "female" | "genderless";
+  charset: string;
+  iconImageSrc?: string;
+  /** Needs 0-100 (100 = desperate) and overall mood 0-100 (100 = happy). */
+  hunger: number;
+  boredom: number;
+  loneliness: number;
+  mood: number;
+  sick: boolean;
+  courting: boolean;
+  eggDueAt: number | null;
+  leftAt: number;
+}
+
+export interface PetGroundPayload {
+  id: string;
+  apartmentId: string;
+  mapId: string;
+  kind: "egg" | "mess";
+  x: number;
+  y: number;
+  /** Egg: the only character allowed to collect it. */
+  ownerCharacterId: number;
+  byPetName: string;
+  speciesName?: string;
+  createdAt: number;
+}
+
+export interface PetNotificationPayload {
+  id: string;
+  kind: string;
+  petId: string;
+  petName: string;
+  apartmentId: string;
+  houseName: string;
+  mapId: string;
+  text: string;
+  at: number;
+}
+
 export type HouseInstanceInfoPayload = {
   mapId: string;
   apartmentId: string;
@@ -316,6 +367,8 @@ interface AuthUserData {
     sourcePokemonId?: string;
     name: string;
     nickname?: string;
+    /** ♂ / ♀ / genderless — persisted per individual (see pokemonGender.ts). */
+    gender?: "male" | "female" | "genderless";
     level: number;
     types: string[];
     hp: number;
@@ -606,13 +659,44 @@ export default interface ServerToClientEvents {
     removedId: string | null;
   }) => void;
   "house:result": (data: {
-    action: "enter" | "buy" | "key" | "sale" | "leave" | "place" | "pick" | "roam" | "door-info" | "name" | "music";
+    action: "enter" | "buy" | "key" | "sale" | "leave" | "place" | "pick" | "door-info" | "name" | "music";
     ok: boolean;
     messageKey: string;
     params?: Record<string, string>;
     /** Set on a successful enter/leave: the map the player now stands on. */
     mapId?: string;
   }) => void;
+
+  /**
+   * House pets (HousePets.ts + HouseRoamers.ts): venomons left living in a
+   * house. They walk on the FOLLOWER channel (owner id `roam:<char>:<petId>`);
+   * these events carry what the follower channel does not: who they are,
+   * how they feel, what lies on the floor, and their emotion bubbles.
+   * `pet:sync` is sent on arrival inside a house instance; `pet:update`
+   * broadcasts one pet / floor change to everyone inside.
+   */
+  "pet:sync": (data: { mapId: string; t: number; pets: PetViewPayload[]; ground: PetGroundPayload[] }) => void;
+  "pet:update": (data: {
+    mapId: string;
+    t: number;
+    pet?: PetViewPayload;
+    removedPetId?: string;
+    ground?: PetGroundPayload;
+    removedGroundId?: string;
+  }) => void;
+  /** Emotion bubble over a pet (or any follower-channel actor) for `ms`. */
+  "pet:emote": (data: { mapId: string; t: number; ownerId: string; emoji: string; ms: number }) => void;
+  /** Outcome of a house:pet-* action for the actor (i18n key + params). */
+  "pet:result": (data: {
+    action: "leave" | "take" | "feed" | "play" | "caress" | "clean" | "egg";
+    ok: boolean;
+    messageKey: string;
+    params?: Record<string, string>;
+  }) => void;
+  /** A pet of yours needs attention (also persisted until dismissed). */
+  "pet:notification": (data: { notification: PetNotificationPayload }) => void;
+  /** Your pending pet alerts, sent when you join the world. */
+  "pet:notifications": (data: { notifications: PetNotificationPayload[] }) => void;
   /** One plot changed (planted / harvested / cleared) — broadcast to the map. */
   "berry:update": (data: { mapId: string; t: number; plot: BerryPlotSnapshotPayload }) => void;
   /** Answer to berry:actions: the plot now + the plantable berries in the bag. */

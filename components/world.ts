@@ -28,6 +28,7 @@ import BeachBalls from "./BeachBalls";
 import BerryPlots, { type BerryPlotStore } from "./BerryPlots";
 import Housing, { templateMapIdFor, type HouseStore } from "./Housing";
 import HouseRoamerSimulation from "./HouseRoamers";
+import HousePets, { type HousePetStore } from "./HousePets";
 
 const DEFAULT_PLAYER_MAP_ID = "default-world";
 const DEFAULT_PLAYER_X = 100;
@@ -102,8 +103,10 @@ export default class World {
     berryPlots: BerryPlots;
     /** Apartments, house instances and furniture (see Housing.ts). */
     housing: Housing;
-    /** Party venomons roaming inside houses (see HouseRoamers.ts). */
+    /** Venomons left at home, walking their house (see HouseRoamers.ts). */
     houseRoamers: HouseRoamerSimulation;
+    /** Persistent pet state — hunger, mating, eggs, alerts (see HousePets.ts). */
+    housePets: HousePets;
     /** Short-lived overlay of live NPC positions; see `npcBlockersLive`. */
     private liveNpcBlockerCache = new Map<string, { at:number; blockers:Array<NpcBlocker> }>();
     private static readonly LIVE_NPC_BLOCKER_TTL_MS = 25;
@@ -162,6 +165,7 @@ export default class World {
         this.beachBalls = new BeachBalls(this);
         this.berryPlots = new BerryPlots(this);
         this.housing = new Housing(this);
+        this.housePets = new HousePets(this);
         this.houseRoamers = new HouseRoamerSimulation(this);
         this.houseRoamers.start();
         this.followerSimulation.setExtraSnapshotProvider((mapId) => this.houseRoamers.snapshotForMap(mapId));
@@ -173,6 +177,10 @@ export default class World {
 
     async initializeHousing(store: HouseStore) {
         await this.housing.initialize(store);
+    }
+
+    async initializeHousePets(store: HousePetStore) {
+        await this.housePets.initialize(store);
     }
 
     /** Editor data of a map, resolving house instances to their template. */
@@ -762,6 +770,7 @@ export default class World {
         // anti-trap rule as players so overlaps can always separate.
         const softBodies = [
             ...(this.followerSimulation?.blockersOnMap(player.currentMapId) ?? []),
+            ...this.houseRoamers.blockersOnMap(player.currentMapId),
             ...this.beachBalls.blockersOnMap(player.currentMapId)
         ];
         for (const body of softBodies) {
@@ -959,6 +968,14 @@ export default class World {
             return { kind: "follower", ownerId: follower.ownerId };
         }
 
+        // House pets ride the follower channel (owner id `roam:…`) and are
+        // pushed exactly like followers.
+        const roamer = this.houseRoamers.findAt(mapId, bounds);
+
+        if (roamer && !excludeKeys.has(`follower:${roamer.id}`)) {
+            return { kind: "follower", ownerId: roamer.id };
+        }
+
         const ball = this.beachBalls.findAt(mapId, bounds);
 
         if (ball && !excludeKeys.has(`ball:${ball.id}`)) {
@@ -1035,7 +1052,10 @@ export default class World {
                 case "npc":
                     return this.npcSimulation?.shove(mapId, body.id, dx, dy) ?? false;
                 case "follower":
-                    return this.followerSimulation?.shove(mapId, body.ownerId, dx, dy) ?? false;
+                    return (
+                        (this.followerSimulation?.shove(mapId, body.ownerId, dx, dy) ?? false) ||
+                        this.houseRoamers.shove(mapId, body.ownerId, dx, dy)
+                    );
                 case "ball":
                     return this.beachBalls.shove(mapId, body.id, dx, dy);
             }
@@ -1089,7 +1109,10 @@ export default class World {
                 return this.npcSimulation?.cellOf(mapId, body.id) ?? null;
             case "follower": {
                 const actor = this.followerSimulation?.getActor(body.ownerId);
-                return actor ? { x: actor.moving ? actor.toX : actor.cellX, y: actor.moving ? actor.toY : actor.cellY } : null;
+                if (actor) {
+                    return { x: actor.moving ? actor.toX : actor.cellX, y: actor.moving ? actor.toY : actor.cellY };
+                }
+                return this.houseRoamers.cellOf(body.ownerId);
             }
             case "ball": {
                 const ball = this.beachBalls.getBall(body.id);
@@ -2111,6 +2134,7 @@ export default class World {
         this.presentBeachBallsTo(socketId, mapId);
         this.berryPlots.presentTo(socketId, mapId);
         this.housing.presentTo(socketId, mapId, this.getPlayerBySocket(socketId)?.characterId ?? null);
+        this.housePets.presentTo(socketId, mapId, this.getPlayerBySocket(socketId)?.characterId ?? null);
     }
 
     /** Sends the full follower state of a map to one socket. */
@@ -2199,6 +2223,7 @@ export default class World {
         this.presentBeachBallsTo(socketId, mapId);
         this.berryPlots.presentTo(socketId, mapId);
         this.housing.presentTo(socketId, mapId, this.getPlayerBySocket(socketId)?.characterId ?? null);
+        this.housePets.presentTo(socketId, mapId, this.getPlayerBySocket(socketId)?.characterId ?? null);
     }
 
     /**
@@ -2314,7 +2339,6 @@ export default class World {
         World.socketServer.emit("removePlayer", { playerId: player.socketId, id: player.id });
         this.players.delete(player.socketId);
         this.followerSimulation?.removeFor(player.socketId);
-        this.houseRoamers.removeFor(player.socketId);
         return true;
     }
 
@@ -2340,7 +2364,6 @@ export default class World {
         World.socketServer.emit("removePlayer", {playerId: player.socketId, id:player.id})
         this.players.delete(playerId);
         this.followerSimulation?.removeFor(playerId);
-        this.houseRoamers.removeFor(playerId);
 
         return { player, removed: true };
     }

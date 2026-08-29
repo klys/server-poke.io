@@ -132,6 +132,28 @@ export default class MailService {
     }
 
     /**
+     * House-pet alert (a venomon left at home is hungry / sick / laid an egg).
+     * Sent only when the owner is away from that house; rate-limited by the
+     * caller. A disabled SMTP setup silently skips it like the account mails.
+     */
+    public async sendPetAlertEmail(options:{ to:string; name:string; petName:string; houseName:string; message:string }) {
+        const template = await this.renderTemplate("pet-alert.html", {
+            NAME: options.name,
+            PET: options.petName,
+            HOUSE: options.houseName,
+            MESSAGE: options.message,
+            APP_URL: this.appPublicUrl
+        });
+
+        await this.sendMail({
+            to: options.to,
+            subject: `${options.petName} te necesita en ${options.houseName}`,
+            text: this.convertHtmlToText(template),
+            html: template
+        });
+    }
+
+    /**
      * Admin-panel maintenance reports: pre-rendered HTML/text with the raw
      * report files (md/json/console log) attached. Unlike the account emails
      * above, a disabled SMTP setup is an error here — the admin explicitly

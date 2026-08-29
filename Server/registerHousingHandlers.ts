@@ -22,7 +22,8 @@ import type { SocketData } from "./registerSocketHandlers";
 type HousingSocket = Socket<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>;
 type HousingServer = Server<ClientToServerEvents, ServerToClientEvents, InterServerEvents, SocketData>;
 
-type HouseAction = "enter" | "buy" | "key" | "sale" | "leave" | "place" | "pick" | "roam" | "door-info" | "name" | "music";
+type HouseAction = "enter" | "buy" | "key" | "sale" | "leave" | "place" | "pick" | "door-info" | "name" | "music";
+type PetAction = "leave" | "take" | "feed" | "play" | "caress" | "clean" | "egg";
 
 interface HousingHandlerContext {
   io: HousingServer;
@@ -472,33 +473,95 @@ export function registerHousingHandlers({
     emitResult("music", true, bgm === null ? "house.msg.musicCleared" : "house.msg.musicSet", { name: bgm ?? "" });
   });
 
-  socket.on("house:set-roam", async (data) => {
-    // Sent from the party window over the shared auth socket (authContext),
-    // which never joined the world — resolve the player by account instead
-    // of by socket id like the other handlers do.
+  // ── House pets ──────────────────────────────────────────────────────
+  const emitPetResult = (action: PetAction, result: { ok: boolean; messageKey: string; params?: Record<string, string> }) => {
+    socket.emit("pet:result", { action, ok: result.ok, messageKey: result.messageKey, params: result.params });
+  };
+  /** Pet actions may come over the shared auth socket (party window), which
+   * never joined the world: resolve the player by account, like set-roam did. */
+  const resolvePetActor = (action: PetAction): Actor | null => {
     const userId = socket.data.userId;
-    const player = typeof userId === "number" ? world.getPlayerByUserId(userId) : null;
+    const player =
+      world.getPlayerBySocket(socket.id) ?? (typeof userId === "number" ? world.getPlayerByUserId(userId) : null);
     if (!player || typeof userId !== "number" || player.characterId === null) {
-      emitResult("roam", false, "house.reason.notInWorld");
-      return;
+      emitPetResult(action, { ok: false, messageKey: "house.reason.notInWorld" });
+      return null;
     }
-    const actor: Actor = { player, userId, characterId: player.characterId };
-    const requested = Array.isArray(data?.pokemonIds)
-      ? data.pokemonIds.filter((id): id is string => typeof id === "string" && id.length > 0)
-      : [];
+    if (player.inBattle || eventRuntime.isRunning(userId)) {
+      emitPetResult(action, { ok: false, messageKey: "house.reason.busy" });
+      return null;
+    }
+    return { player, userId, characterId: player.characterId };
+  };
+  const petAction = async (action: PetAction, run: (actor: Actor) => Promise<{ ok: boolean; messageKey: string; params?: Record<string, string> }>) => {
+    const actor = resolvePetActor(action);
+    if (!actor) return;
     try {
-      const user = await auth.getUserForBattle(actor.userId);
-      const partyIds = new Set((user?.pokemonParty ?? []).filter((mon) => !mon.isEgg).map((mon) => mon.id));
-      const ids = Array.from(new Set(requested.filter((id) => partyIds.has(id)))).slice(0, 6);
-      await auth.saveHouseRoamIds(actor.userId, ids);
-      await refreshSession(actor.userId);
-      await world.houseRoamers.refreshFor(actor.player);
-      emitResult("roam", true, ids.length > 0 ? "house.msg.roamSet" : "house.msg.roamCleared", {
-        count: String(ids.length)
-      });
+      const result = await run(actor);
+      if (result.ok && (action === "leave" || action === "take" || action === "feed" || action === "egg")) {
+        // Party / bag changed: every client of the account gets the fresh session.
+        const user = await auth.getUserForBattle(actor.userId);
+        if (user) {
+          actor.player.socketConnections.forEach((socketId) => {
+            io.to(socketId).emit("auth:session", { authenticated: true, user });
+          });
+          if (!actor.player.socketConnections.has(socket.id)) {
+            socket.emit("auth:session", { authenticated: true, user });
+          }
+        }
+      }
+      emitPetResult(action, result);
     } catch (error) {
-      console.error("house:set-roam failed:", error);
-      emitResult("roam", false, "house.reason.failed");
+      console.error(`house:pet-${action} failed:`, error);
+      emitPetResult(action, { ok: false, messageKey: "house.reason.failed" });
     }
+  };
+
+  socket.on("house:pet-leave", (data) => {
+    const pokemonId = typeof data?.pokemonId === "string" ? data.pokemonId : "";
+    void petAction("leave", async (actor) => {
+      if (!guardTradedAssets("house:pet-leave", { venomonIds: [pokemonId] })) {
+        return { ok: false, messageKey: "house.reason.busy" };
+      }
+      return world.housePets.leavePet(actor.player, pokemonId);
+    });
+  });
+  socket.on("house:pet-take", (data) => {
+    const petId = typeof data?.petId === "string" ? data.petId : "";
+    void petAction("take", (actor) => world.housePets.takePet(actor.player, petId));
+  });
+  socket.on("house:pet-feed", (data) => {
+    const petId = typeof data?.petId === "string" ? data.petId : "";
+    const itemId = typeof data?.itemId === "string" ? data.itemId : "";
+    void petAction("feed", async (actor) => {
+      if (!guardTradedAssets("house:pet-feed", { itemIds: [itemId] })) {
+        return { ok: false, messageKey: "house.reason.busy" };
+      }
+      return world.housePets.feedPet(actor.player, petId, itemId);
+    });
+  });
+  socket.on("house:pet-play", (data) => {
+    const petId = typeof data?.petId === "string" ? data.petId : "";
+    void petAction("play", (actor) => world.housePets.playWithPet(actor.player, petId));
+  });
+  socket.on("house:pet-caress", (data) => {
+    const petId = typeof data?.petId === "string" ? data.petId : "";
+    void petAction("caress", async (actor) => world.housePets.caressPet(actor.player, petId));
+  });
+  socket.on("house:pet-clean", (data) => {
+    const groundId = typeof data?.groundId === "string" ? data.groundId : "";
+    void petAction("clean", async (actor) => world.housePets.cleanGround(actor.player, groundId));
+  });
+  socket.on("house:pet-collect-egg", (data) => {
+    const groundId = typeof data?.groundId === "string" ? data.groundId : "";
+    void petAction("egg", (actor) => world.housePets.collectEgg(actor.player, groundId));
+  });
+  socket.on("pet:notification-dismiss", (data) => {
+    const id = typeof data?.id === "string" ? data.id : "";
+    const characterId = socket.data.characterId;
+    if (!id || typeof characterId !== "number") return;
+    void world.housePets.dismissNotification(characterId, id).catch((error) => {
+      console.error("pet:notification-dismiss failed:", error);
+    });
   });
 }

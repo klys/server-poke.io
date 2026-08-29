@@ -486,9 +486,6 @@ export default class Player {
 
         // The follower rides along: re-park it behind the player on the new map.
         this.world.followerSimulation?.onOwnerTeleport(this);
-        // House roamers only exist inside house instances: entering
-        // materializes them, leaving removes them.
-        void this.world.houseRoamers?.refreshFor(this);
     }
 
     public stopMovement() {

@@ -79,13 +79,25 @@ Copy values from `.env.example` when setting up a local environment. Important v
 - `components/player.ts`: player state and movement/pathfinding logic
 - `components/projectil.ts`: projectile behavior
 - `components/gameMath.ts`: geometry and collision helpers
-- `components/Housing.ts` + `components/HouseRoamers.ts` + `Server/registerHousingHandlers.ts`:
+- `components/Housing.ts` + `Server/registerHousingHandlers.ts`:
   player housing — apartment doors (`editorData.houseDoors`), HOUSE template
   maps (`playableMapConfig.isHouse`), per-owner house INSTANCES with map id
   `<template>--house-<apartmentId>` (resolve with `templateMapIdFor` before any
   geometry/editor-data lookup), key codes, resale, furniture (`furniture`
-  inventory category, solid), party venomons roaming on the follower channel.
-  State in Redis `world:houses`; E2E `tools/e2e-housing.ts`.
+  inventory category, solid). State in Redis `world:houses`; E2E
+  `tools/e2e-housing.ts`.
+- `components/HousePets.ts` + `components/HouseRoamers.ts`: house PETS —
+  venomons left living in a house (they LEAVE the party). `HousePets` is the
+  persistent life (Redis `world:house-pets`: hunger/boredom/loneliness on the
+  wall clock, puking → floor messes, courtship → the female lays an egg on the
+  floor, owner alerts persisted on the character `pet_notifications` + email
+  when the owner is away; slow tick runs for EVERY house, populated or not).
+  `HouseRoamers` is the actor sim (A* multi-cell wandering, chatting, ball
+  kicking, courtship dance, pushable bodies) on the FOLLOWER wire protocol
+  with owner id `roam:<char>:<petId>`; emotes go out as `pet:emote`. Test
+  knobs `PET_TIME_SCALE` / `PET_SLOW_TICK_MS`; E2E `tools/e2e-house-pets.ts`.
+- `components/pokemonGender.ts`: venomon gender (persisted on every
+  `PokemonSummary.gender`, lazily assigned from the id hash for old data).
 - `components/TradeManager.ts` + `components/trade/`: player-to-player trading
   (state machine, asset reservations, atomic Lua exchange, audit) — see `TRADING.md`
 - `Server/registerSocketHandlers.ts`: main Socket.IO event registration

@@ -177,8 +177,7 @@ export default interface ClientToServerEvents {
    * or next to one. Buying charges the catalog price (unowned) or the
    * listed sale price (owned + for sale, the seller is paid). Key codes are
    * 4-8 digits; null clears them. Furniture actions require standing inside
-   * one's own house instance. `house:set-roam` lists the party venomon ids
-   * that roam free inside houses.
+   * one's own house instance.
    */
   "house:door-info": (data: { doorId: string }) => void;
   "house:enter": (data: { apartmentId: string; keyCode?: string }) => void;
@@ -188,7 +187,25 @@ export default interface ClientToServerEvents {
   "house:leave": () => void;
   "house:furniture-place": (data: { itemId: string; x: number; y: number }) => void;
   "house:furniture-pick": (data: { furnitureId: string }) => void;
-  "house:set-roam": (data: { pokemonIds: string[] }) => void;
+  /**
+   * House pets (HousePets.ts). All require standing inside a house instance
+   * (any house — pets may be left in other players' homes). `pet-leave`
+   * moves a party venomon (never the last non-egg one) into the house;
+   * `pet-take` returns one of YOUR pets to the party (free slot needed);
+   * `pet-feed` spends a berry from the bag; `pet-play` drops a beach ball
+   * for it; `pet-caress` pats it; `pet-clean` wipes a mess; `pet-collect-egg`
+   * puts an egg laid by your pet in your party. Answered with `pet:result`.
+   * `pet-leave` may arrive over the auth socket (party window).
+   */
+  "house:pet-leave": (data: { pokemonId: string }) => void;
+  "house:pet-take": (data: { petId: string }) => void;
+  "house:pet-feed": (data: { petId: string; itemId: string }) => void;
+  "house:pet-play": (data: { petId: string }) => void;
+  "house:pet-caress": (data: { petId: string }) => void;
+  "house:pet-clean": (data: { groundId: string }) => void;
+  "house:pet-collect-egg": (data: { groundId: string }) => void;
+  /** Dismisses one persisted pet alert ("*" = all). */
+  "pet:notification-dismiss": (data: { id: string }) => void;
   /** Owner-only house customization: display name (null = default) and BGM
    * (one of the names answered by house:music-list; null = template's). */
   "house:set-name": (data: { apartmentId: string; name: string | null }) => void;

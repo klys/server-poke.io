@@ -403,6 +403,18 @@ export default class Housing {
         return site ? { id: site.door.id, mapId: site.door.mapId, x: site.door.x, y: site.door.y } : null;
     }
 
+    /** Template map id of an apartment (null when the door/apartment is gone). */
+    templateOfApartment(apartmentId: string): string | null {
+        const site = this.apartments.get(apartmentId);
+        return site && site.valid ? site.templateMapId : null;
+    }
+
+    /** Display name of an apartment (custom name or "<door> N"). */
+    apartmentDisplayName(apartmentId: string): string | null {
+        const site = this.apartments.get(apartmentId);
+        return site ? this.apartmentName(site, this.world.getPlayableMapsState()) : null;
+    }
+
     doorsForMap(mapId: string): Array<{ id: string; x: number; y: number; name: string | null }> {
         return Array.from(this.doors.values())
             .filter((door) => door.mapId === mapId)

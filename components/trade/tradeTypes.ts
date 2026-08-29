@@ -571,7 +571,9 @@ export type TradeMutationSource =
   | "event:script"
   | "house:buy"
   | "house:furniture-place"
-  | "house:furniture-pick";
+  | "house:furniture-pick"
+  | "house:pet-leave"
+  | "house:pet-feed";
 
 // ---------------------------------------------------------------------------
 // Audit

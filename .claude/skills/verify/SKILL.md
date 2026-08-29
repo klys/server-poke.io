@@ -38,7 +38,9 @@ in `world.ts`, or `Player.stepAlongPath`. Takes ~25s (it waits on real timers).
 
 Drivers in `tools/`: `e2e-trade.ts`, `e2e-field-skills.ts`,
 `e2e-water-actions.ts`, `e2e-teach-machines.ts`, `e2e-hidden-venomon-gift.ts`,
-`e2e-account-character.ts`, `e2e-chat.ts`, `e2e-npc-movement.ts`.
+`e2e-account-character.ts`, `e2e-chat.ts`, `e2e-npc-movement.ts`,
+`e2e-housing.ts` (port 3994), `e2e-house-pets.ts` (port 3995; runs the server
+with `PET_TIME_SCALE=2400` so hunger/mating/eggs play out in seconds).
 Each spawns its OWN server process on a custom port (e.g. 3997) and asserts
 against authoritative Redis state, not socket payloads.
 
@@ -69,6 +71,7 @@ Before running, check the constants block at the top of the driver:
 | Field moves / water / TMs / gift events | build + the matching `e2e-*.ts` |
 | Chat / friends / blocks / accounts | build + `e2e-chat.ts` + `e2e-account-character.ts` |
 | NPC movement / pathfinding / pushing | build + `npm run test:npc-movement` + `e2e-npc-movement.ts` |
+| Housing / house pets / gender | build + `e2e-housing.ts` + `e2e-house-pets.ts` |
 | Socket contract shape | build here AND `npm run build` in the client repo (see root `contract-sync` skill) |
 | Client-visible behavior | `client-poke.io:verify` skill (headless Chrome) |
 

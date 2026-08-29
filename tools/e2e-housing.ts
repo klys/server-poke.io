@@ -16,11 +16,11 @@
  *   FURNITURE — A places a sofa from the bag (bag -1, house:furniture-update
  *               reaches B inside, redis persisted); the cell is now solid
  *               (A cannot walk onto it); picking it up returns it to the bag.
- *   ROAM      — house:set-roam (sent over a SECOND, auth-only socket like the
- *               party window does) lets a party member out: it shows up on
- *               the follower channel (follower:update ownerId
- *               roam:<char>:<mon>) and walks (follower:steps); clearing
- *               removes it.
+ *   PETS      — house:pet-leave (sent over a SECOND, auth-only socket like the
+ *               party window does) moves a party member into the house: it
+ *               leaves the party, shows up on the follower channel
+ *               (follower:update ownerId roam:<char>:<mon>) and walks;
+ *               house:pet-take brings it back. Full pet life: e2e-house-pets.
  *   CUSTOM    — the owner renames the house (banner/door name follow, 30 char
  *               cap) and picks a BGM from house:music-list (unknown tracks and
  *               visitors are refused); house:sync carries both.
@@ -447,29 +447,36 @@ async function main() {
     await waitFor("B removal update", () => B.furnitureUpdates.find((u) => u.removedId === upd.placed.id) ?? null);
     pass("sofa picked up (bag back to 2, B notified)");
 
-    // ── ROAM ───────────────────────────────────────────────────────────
-    log("── ROAM ──");
+    // ── PETS ───────────────────────────────────────────────────────────
+    // The full pet life-cycle lives in tools/e2e-house-pets.ts; here only
+    // the party <-> house hand-off that replaced house:set-roam.
+    log("── PETS ──");
     const roamId = `roam:${A.characterId}:Ana-m2`;
     // The party window talks over the shared auth socket (handshake token,
     // never addPlayer) — the handler must resolve the player by account.
     const authSocket = io(`http://localhost:${PORT}`, { transports: ["websocket"], forceNew: true, auth: { token: A.token } });
-    const authResults: any[] = [];
-    authSocket.on("house:result", (d: any) => authResults.push(d));
+    const petResults: any[] = [];
+    authSocket.on("pet:result", (d: any) => petResults.push(d));
     await waitFor("auth socket connect", () => authSocket.connected);
     await sleep(400);
-    authSocket.emit("house:set-roam", { pokemonIds: ["Ana-m2", "not-mine"] });
-    r = await waitFor("roam result (auth socket)", () => authResults.find((d) => d.action === "roam") ?? null);
-    if (!r.ok || r.params?.count !== "1") fail(`set-roam over auth socket: ${JSON.stringify(r)}`);
+    authSocket.emit("house:pet-leave", { pokemonId: "Ana-m2" });
+    r = await waitFor("pet-leave result (auth socket)", () => petResults.find((d) => d.action === "leave") ?? null);
+    if (!r.ok) fail(`pet-leave over auth socket: ${JSON.stringify(r)}`);
     authSocket.disconnect();
-    await waitFor("roamer appears (A)", () => A.followerUpdates.find((u) => u.follower?.ownerId === roamId) ?? null);
-    await waitFor("roamer appears (B)", () => B.followerUpdates.find((u) => u.follower?.ownerId === roamId) ?? null);
-    if ((await charField(A, "house_roam_ids")) !== JSON.stringify(["Ana-m2"])) fail("house_roam_ids not persisted");
-    await waitFor("roamer walks", () => B.followerSteps.some((p) => p.steps?.some((s: any) => s.ownerId === roamId)), { timeoutMs: 12000 });
-    pass("party venomon roams the house (follower channel, persisted, walks)");
-    r = await act(A, "house:set-roam", { pokemonIds: [] }, "roam");
-    if (!r.ok) fail(`clear roam: ${JSON.stringify(r)}`);
-    await waitFor("roamer removed", () => B.followerRemoves.find((u) => u.ownerId === roamId) ?? null);
-    pass("roamer removed when called back");
+    await waitFor("pet appears (A)", () => A.followerUpdates.find((u) => u.follower?.ownerId === roamId) ?? null);
+    await waitFor("pet appears (B)", () => B.followerUpdates.find((u) => u.follower?.ownerId === roamId) ?? null);
+    const partyAfterLeave = JSON.parse(await charField(A, "pokemon_party"));
+    if (partyAfterLeave.length !== 1 || partyAfterLeave[0].id !== "Ana-m1") fail(`party after pet-leave: ${JSON.stringify(partyAfterLeave.map((p: any) => p.id))}`);
+    await waitFor("pet walks", () => B.followerSteps.some((p) => p.steps?.some((s: any) => s.ownerId === roamId)), { timeoutMs: 12000 });
+    pass("party venomon left in the house (follower channel, out of the party, walks)");
+    const takeResults: any[] = [];
+    A.socket.on("pet:result", (d: any) => takeResults.push(d));
+    A.socket.emit("house:pet-take", { petId: "Ana-m2" });
+    r = await waitFor("pet-take result", () => takeResults.find((d) => d.action === "take") ?? null);
+    if (!r.ok) fail(`pet-take: ${JSON.stringify(r)}`);
+    await waitFor("pet removed", () => B.followerRemoves.find((u) => u.ownerId === roamId) ?? null);
+    if (JSON.parse(await charField(A, "pokemon_party")).length !== 2) fail("party after pet-take");
+    pass("pet taken back into the party");
 
     // ── CUSTOM ─────────────────────────────────────────────────────────
     log("── CUSTOM ──");

@@ -2563,6 +2563,12 @@ function createConnectionHandler(
           broadcastAdminPresence(io, world);
           // Push their friends snapshot and tell online friends they arrived.
           void socialManager.handlePlayerJoined(socket.data.userId);
+          // Pet alerts that piled up while away (hungry / egg laid / …).
+          if (typeof socket.data.characterId === "number") {
+            void world.housePets.sendPendingNotifications(socket.data.characterId, socket.id).catch((error) => {
+              console.error("Unable to send pending pet alerts:", error);
+            });
+          }
           // Re-entering the world resumes a trade paused by a disconnect.
           tradeManager.handleUserReconnected(socket.data.userId);
           // Spawning inside a town counts as visiting it (initial spawn and
@@ -4381,36 +4387,19 @@ export default function registerSocketHandlers(
     if (!leader || leader.isEgg) {
       return null;
     }
-    if (isHouseInstanceMapId(player.currentMapId) && (user?.houseRoamIds ?? []).includes(leader.id)) {
-      return null; // it is roaming the house instead (HouseRoamers)
-    }
     const internalName = (leader.sourcePokemonId ?? "")
       .replace(/^pokemon-/, "")
       .toUpperCase();
     const charset = internalName ? speciesCharsetName(internalName) : null;
     return charset ? { charset } : null;
   });
-  // Party venomons let out inside a house (house:set-roam) wander the room.
-  world.houseRoamers.setResolver(async (player) => {
-    if (typeof player.userId !== "number") {
-      return [];
-    }
-    const user = await auth.getUserForBattle(player.userId);
-    const allowed = new Set(user?.houseRoamIds ?? []);
-    const roamers: Array<{ pokemonId: string; charset: string }> = [];
-    for (const mon of user?.pokemonParty ?? []) {
-      if (!allowed.has(mon.id) || mon.isEgg) continue;
-      const internalName = (mon.sourcePokemonId ?? "").replace(/^pokemon-/, "").toUpperCase();
-      const charset = internalName ? speciesCharsetName(internalName) : null;
-      if (charset) roamers.push({ pokemonId: mon.id, charset });
-    }
-    return roamers;
-  });
+  // House pets: alerts persist on the character and are emailed to owners
+  // who are away (HousePets.ts).
+  world.housePets.setServices({ auth, mail: mailService ?? null });
   auth.setPartyChangedListener((userId) => {
     const player = world.getPlayerByUserId(userId);
     if (player) {
       world.followerSimulation?.refreshFor(player);
-      void world.houseRoamers.refreshFor(player);
     }
   });
   const tradeManager = new TradeManager(

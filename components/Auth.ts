@@ -9,6 +9,7 @@ import {
     type PokemonStatBonuses
 } from "./LevelingCurve";
 import MailService from "./MailService";
+import { deriveGender, isPokemonGender, parseFemaleRatio, rollGender, type PokemonGender } from "./pokemonGender";
 import {
     applyAppearanceToSpritePath,
     classifyEquipmentSlot,
@@ -373,6 +374,8 @@ export interface PokemonSummary {
      * it, exactly like the original games.
      */
     foreignOt?:string;
+    /** Persisted gender (assigned lazily for venomons created before it existed). */
+    gender?:PokemonGender;
     // Read-only enrichment for admin/UX surfaces (see InventoryItem.iconSrc).
     iconImageSrc?:string;
     frontImageSrc?:string;
@@ -380,6 +383,19 @@ export interface PokemonSummary {
     ownerCharacterId?:number;
     storedByCharacterId?:number;
     storedAt?:string;
+}
+
+/** One pet alert persisted on the owner's character until dismissed. */
+export interface PetNotificationRecord {
+    id:string;
+    kind:string;
+    petId:string;
+    petName:string;
+    apartmentId:string;
+    houseName:string;
+    mapId:string;
+    text:string;
+    at:number;
 }
 
 /** Item ids follow "item-<essentialsid>"; recover the Essentials internal id. */
@@ -699,6 +715,7 @@ const CHARACTER_GAMEPLAY_FIELDS = [
     "egg_cooldowns",
     "follower_enabled",
     "house_roam_ids",
+    "pet_notifications",
     "push_depth",
     "repel_steps"
 ] as const;
@@ -1258,7 +1275,7 @@ export default class Auth {
                 "inventory", "pokemon_party", "battle_history", "visited_towns",
                 "last_map_id", "last_x", "last_y", "last_surfing", "respawn_point",
                 "event_switches", "event_variables", "event_self_switches",
-                "egg_cooldowns", "money", "follower_enabled", "house_roam_ids", "push_depth",
+                "egg_cooldowns", "money", "follower_enabled", "house_roam_ids", "pet_notifications", "push_depth",
                 "repel_steps"
             ]);
             await this.redis.hSet(this.characterKey(characterId), {
@@ -1414,6 +1431,151 @@ export default class Auth {
         await this.redis.hSet(await this.activeCharacterKey(userId), {
             house_roam_ids: JSON.stringify(ids.slice(0, 6))
         });
+    }
+
+    // ---- venomon gender (persisted lazily) ----
+
+    private femaleRatioCache:{ at:number; bySpecies:Map<string, number> } | null = null;
+    private static readonly FEMALE_RATIO_CACHE_MS = 10 * 60 * 1000;
+
+    /** Species id (`pokemon-NAME`) -> female fraction (-1 genderless), cached. */
+    public async speciesFemaleRatio(sourcePokemonId:string | undefined):Promise<number> {
+        if (!sourcePokemonId) return 0.5;
+        const now = Date.now();
+        if (!this.femaleRatioCache || now - this.femaleRatioCache.at > Auth.FEMALE_RATIO_CACHE_MS) {
+            const bySpecies = new Map<string, number>();
+            try {
+                const raw = await this.redis.get("designer:section:pokemons");
+                const items = raw ? JSON.parse(raw)?.state?.items : null;
+                if (Array.isArray(items)) {
+                    for (const item of items) {
+                        if (item && typeof item.id === "string") {
+                            bySpecies.set(item.id, parseFemaleRatio(item.pokemonProfile?.genderRatio));
+                        }
+                    }
+                }
+            } catch {
+                // Unreadable catalog: every species falls back to 50/50.
+            }
+            this.femaleRatioCache = { at: now, bySpecies };
+        }
+        return this.femaleRatioCache.bySpecies.get(sourcePokemonId) ?? 0.5;
+    }
+
+    /**
+     * Assigns (and persists) a gender to every party member that predates
+     * persisted genders, using the same id hash the battle engine derived
+     * genders from — so nobody's venomon changes sex on migration.
+     */
+    private async ensurePartyGenders(characterId:number, party:PokemonSummary[]) {
+        if (!party.some((pokemon) => !isPokemonGender(pokemon.gender))) return;
+        for (const pokemon of party) {
+            if (isPokemonGender(pokemon.gender)) continue;
+            pokemon.gender = deriveGender(pokemon.id, await this.speciesFemaleRatio(pokemon.sourcePokemonId));
+        }
+        try {
+            await this.redis.hSet(this.characterKey(characterId), {
+                pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
+            });
+        } catch (error) {
+            console.error("Unable to persist venomon genders:", error);
+        }
+    }
+
+    /** Gender for a summary, deriving one when it was never persisted. */
+    public async genderOf(pokemon:PokemonSummary):Promise<PokemonGender> {
+        if (isPokemonGender(pokemon.gender)) return pokemon.gender;
+        return deriveGender(pokemon.id, await this.speciesFemaleRatio(pokemon.sourcePokemonId));
+    }
+
+    // ---- house pets (HousePets.ts): any character, online or not ----
+
+    /** Account + contact info behind a character (pet alerts reach offline owners). */
+    public async getCharacterOwnerInfo(characterId:number):Promise<{ accountId:number; name:string; email:string; emailVerified:boolean } | null> {
+        const [accountId, name, deletedAt] = await this.redis.hmGet(this.characterKey(characterId), ["account_id", "name", "deleted_at"]);
+        const parsedAccount = Number(accountId);
+        if (!Number.isInteger(parsedAccount) || parsedAccount <= 0 || deletedAt) {
+            return null;
+        }
+        const [email, emailVerified] = await this.redis.hmGet(this.userKey(parsedAccount), ["email", "email_verified"]);
+        return {
+            accountId: parsedAccount,
+            name: typeof name === "string" && name ? name : "Trainer",
+            email: typeof email === "string" ? email : "",
+            emailVerified: emailVerified === "1"
+        };
+    }
+
+    /** The party of ANY character (the owner may be offline). */
+    public async getCharacterParty(characterId:number):Promise<PokemonSummary[]> {
+        const raw = await this.redis.hGet(this.characterKey(characterId), "pokemon_party");
+        return this.parsePokemonParty(raw ?? undefined);
+    }
+
+    /** Writes a character's party and wakes the party-changed listeners of its account. */
+    public async saveCharacterParty(characterId:number, party:PokemonSummary[]) {
+        await this.redis.hSet(this.characterKey(characterId), {
+            pokemon_party: JSON.stringify(this.sanitizePokemonPartyForStorage(party))
+        });
+        const accountId = Number(await this.redis.hGet(this.characterKey(characterId), "account_id"));
+        if (Number.isInteger(accountId) && accountId > 0) {
+            this.markPartyChanged(accountId);
+        }
+    }
+
+    /**
+     * An egg of a species, as laid by a house pet: a rolled level-1 summary
+     * with isEgg set. Bred eggs hatch faster than species defaults (capped at
+     * `maxHatchSteps`).
+     */
+    public async buildEggForSpecies(internalName:string, maxHatchSteps = 1500):Promise<PokemonSummary | null> {
+        const built = await this.buildSpeciesSummary(internalName, 1);
+        if (!built) return null;
+        return {
+            ...built.summary,
+            level: 1,
+            isEgg: true,
+            eggStepsToHatch: Math.max(MIN_EGG_HATCH_STEPS, Math.min(maxHatchSteps, built.hatchSteps))
+        };
+    }
+
+    private static readonly MAX_PET_NOTIFICATIONS = 40;
+
+    private parsePetNotifications(raw:string | null | undefined):PetNotificationRecord[] {
+        if (!raw) return [];
+        try {
+            const parsed = JSON.parse(raw);
+            return Array.isArray(parsed)
+                ? parsed.filter((entry):entry is PetNotificationRecord =>
+                    Boolean(entry) && typeof entry === "object" && typeof entry.id === "string" && typeof entry.text === "string")
+                : [];
+        } catch {
+            return [];
+        }
+    }
+
+    /** Pending pet alerts of a character (shown in the notification center until dismissed). */
+    public async getPetNotifications(characterId:number):Promise<PetNotificationRecord[]> {
+        return this.parsePetNotifications(await this.redis.hGet(this.characterKey(characterId), "pet_notifications"));
+    }
+
+    public async pushPetNotification(characterId:number, notification:PetNotificationRecord) {
+        const key = this.characterKey(characterId);
+        const current = this.parsePetNotifications(await this.redis.hGet(key, "pet_notifications"))
+            .filter((entry) => entry.id !== notification.id);
+        current.push(notification);
+        await this.redis.hSet(key, {
+            pet_notifications: JSON.stringify(current.slice(-Auth.MAX_PET_NOTIFICATIONS))
+        });
+    }
+
+    public async dismissPetNotification(characterId:number, notificationId:string) {
+        const key = this.characterKey(characterId);
+        const current = this.parsePetNotifications(await this.redis.hGet(key, "pet_notifications"));
+        const next = notificationId === "*" ? [] : current.filter((entry) => entry.id !== notificationId);
+        if (next.length !== current.length) {
+            await this.redis.hSet(key, { pet_notifications: JSON.stringify(next) });
+        }
     }
 
     /** Display info of ANY character by id (house owners may be offline or
@@ -3161,6 +3323,7 @@ export default class Auth {
             hp?:unknown;
             elements?:unknown;
             hatchSteps?:unknown;
+            genderRatio?:unknown;
             skills?:Array<{ skillName?:unknown; level?:unknown }>;
         };
         const lvl = Math.max(1, Math.min(100, Math.round(level)));
@@ -3199,7 +3362,8 @@ export default class Auth {
             experience: 0,
             experienceCurve: "medium",
             nextLevelExperience: getExperienceForNextLevel(lvl, levelingCurveConfig),
-            statBonuses: createEmptyPokemonStatBonuses()
+            statBonuses: createEmptyPokemonStatBonuses(),
+            gender: rollGender(parseFemaleRatio(profile.genderRatio))
         };
 
         const rawHatchSteps = Number(profile.hatchSteps);
@@ -3971,7 +4135,7 @@ export default class Auth {
         );
         const characterName = character.name ?? account.username ?? "";
 
-        return {
+        const stored = {
             id: accountId,
             name: characterName,
             username: account.username,
@@ -4018,6 +4182,8 @@ export default class Auth {
             permissions: resolvedRole.permissions,
             created_at: account.created_at
         } satisfies StoredUser;
+        await this.ensurePartyGenders(characterId, stored.pokemonParty);
+        return stored;
     }
 
     private toAuthenticatedUser(user:StoredUser):AuthenticatedUser {
@@ -4461,6 +4627,7 @@ export default class Auth {
                             ? Math.max(0, Math.round(pokemon.nextLevelExperience))
                             : 100,
                     statBonuses: sanitizePokemonStatBonuses(pokemon.statBonuses),
+                    gender: isPokemonGender(pokemon.gender) ? pokemon.gender : undefined,
                     // Preserve egg state. A non-egg drops both fields so stale
                     // egg data can never linger on a hatched Pokemon.
                     isEgg: pokemon.isEgg === true ? true : undefined,
