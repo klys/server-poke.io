@@ -627,6 +627,9 @@ export default interface ServerToClientEvents {
     toY: number;
     stepMs: number;
     pushesLeft: number;
+    /** True for a wall/edge rebound: a 2-cell arc back over the pusher —
+     * clients draw the hop instead of a flat roll. */
+    bounced?: boolean;
   }) => void;
   /** The ball ran out of pushes (or a second ball spawned): play the deflate
    * animation, then remove it. */

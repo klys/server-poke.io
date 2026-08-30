@@ -14,6 +14,8 @@ const BALL_SIZE = 32;
 const BALL_MAX_PUSHES = 30;
 /** Duration of one rolled cell — brisk, it's being kicked. */
 const BALL_STEP_MS = 180;
+/** Duration of a wall bounce (a 2-cell arc over the pusher's head). */
+const BALL_BOUNCE_STEP_MS = 340;
 /** How long clients get to play the deflate animation before removal. */
 const DEFLATE_LINGER_MS = 2500;
 
@@ -196,34 +198,94 @@ export default class BeachBalls {
         const destY = ball.cellY + dy;
 
         if (!this.isCellFree(ball, destX, destY)) {
+            // Kicked into a map edge, wall or corner: the ball bounces back
+            // over the pusher instead of pinning against the geometry. A cell
+            // blocked only by another BODY is not a bounce — the push chain
+            // (World.shoveBody) owns that case and shoves the body along.
+            if (this.isStaticallyBlocked(ball.mapId, destX, destY)) {
+                return this.bounceBack(ball, dx, dy, now);
+            }
             return false;
         }
 
+        return this.roll(ball, destX, destY, BALL_STEP_MS, false, now);
+    }
+
+    /**
+     * The bounce: the ball flies back past the pusher (who stands one cell
+     * behind it), landing on the cell behind them — or a diagonal neighbor of
+     * that cell when it is taken (typically by the pusher's own follower).
+     */
+    private bounceBack(ball: BeachBall, dx: number, dy: number, now: number): boolean {
+        // Perpendicular axis, for the diagonal fallback landings.
+        const px = dx === 0 ? 1 : 0;
+        const py = dx === 0 ? 0 : 1;
+        const candidates = [
+            { x: ball.cellX - dx * 2, y: ball.cellY - dy * 2 },
+            { x: ball.cellX - dx * 2 + px, y: ball.cellY - dy * 2 + py },
+            { x: ball.cellX - dx * 2 - px, y: ball.cellY - dy * 2 - py }
+        ];
+
+        for (const cell of candidates) {
+            if (this.isCellFree(ball, cell.x, cell.y)) {
+                return this.roll(ball, cell.x, cell.y, BALL_BOUNCE_STEP_MS, true, now);
+            }
+        }
+
+        return false;
+    }
+
+    /** Starts a roll (or bounce arc) and broadcasts it. Consumes one push. */
+    private roll(
+        ball: BeachBall,
+        destX: number,
+        destY: number,
+        stepMs: number,
+        bounced: boolean,
+        now: number
+    ): boolean {
         ball.toX = destX;
         ball.toY = destY;
         ball.moving = true;
         ball.stepStartedAt = now;
-        ball.stepMs = BALL_STEP_MS;
+        ball.stepMs = stepMs;
         ball.pushesLeft = Math.max(0, ball.pushesLeft - 1);
 
-        this.world.emitToMap(mapId, "ball:step", {
-            mapId,
+        this.world.emitToMap(ball.mapId, "ball:step", {
+            mapId: ball.mapId,
             t: now,
             id: ball.id,
             fromX: ball.cellX,
             fromY: ball.cellY,
             toX: destX,
             toY: destY,
-            stepMs: BALL_STEP_MS,
-            pushesLeft: ball.pushesLeft
+            stepMs,
+            pushesLeft: ball.pushesLeft,
+            bounced
         });
 
         if (ball.pushesLeft === 0) {
             // Let the last roll play out before the pop.
-            setTimeout(() => this.deflate(ball), BALL_STEP_MS);
+            setTimeout(() => this.deflate(ball), stepMs);
         }
 
         return true;
+    }
+
+    /** Map bounds / collision-grid blockage only — bodies don't count. */
+    private isStaticallyBlocked(mapId: string, cellX: number, cellY: number): boolean {
+        const bounds = this.world.getMapBounds(mapId);
+
+        if (
+            cellX < 0 ||
+            cellY < 0 ||
+            (cellX + 1) * BALL_SIZE > bounds.width ||
+            (cellY + 1) * BALL_SIZE > bounds.height
+        ) {
+            return true;
+        }
+
+        return this.world.isRectBlocked(mapId, cellX * BALL_SIZE, cellY * BALL_SIZE, BALL_SIZE, BALL_SIZE);
     }
 
     private deflate(ball: BeachBall) {
